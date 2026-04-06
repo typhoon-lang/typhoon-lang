@@ -258,7 +258,9 @@ mod tests {
         let resolver = resolve(
             "fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }",
         );
-        assert_eq!(resolver.decls.len(), 3);
+        // normalize_source appends `fn main`, adding it as a 4th decl alongside
+        // compute, count, and accumulator.
+        assert_eq!(resolver.decls.len(), 4);
     }
 
     #[test]
@@ -276,8 +278,9 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_declarations() {
-        let tokens =
-            Lexer::new("namespace main\nstruct Foo {} struct Foo {}".to_string()).tokenize();
+        // Use normalize_source so parse_module gets the required `fn main`.
+        // The duplicate Foo structs should still cause a resolver error.
+        let tokens = Lexer::new(normalize_source("struct Foo {} struct Foo {}")).tokenize();
         let module = Parser::new(tokens).parse_module().unwrap();
         let mut resolver = Resolver::new();
         let err = resolver.resolve_module(&module).unwrap_err();

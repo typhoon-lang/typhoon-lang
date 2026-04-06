@@ -29,10 +29,7 @@ impl Parser {
         if module_name.as_deref() != Some("main") {
             return Err("Missing 'namespace main' declaration".to_string());
         }
-        if !declarations
-            .iter()
-            .any(|decl| matches!(decl, Declaration::Function { name, .. } if name.name == "main"))
-        {
+        if !declarations.iter().any(|decl| matches!(decl, Declaration::Function { name, .. } if name.name == "main")) {
             return Err("Namespace main must define fn main".to_string());
         }
         Ok(Module {
@@ -260,9 +257,7 @@ impl Parser {
                 let mut else_branch = None;
                 if self.match_token(TokenType::Else) {
                     let else_block = self.block()?;
-                    else_branch = Some(Box::new(Statement::Expression(Expression::Block(
-                        else_block,
-                    ))));
+                    else_branch = Some(Box::new(Statement::Expression(Expression::Block(else_block))));
                 }
                 Ok(Some(Statement::If {
                     condition,
@@ -553,7 +548,8 @@ mod tests {
     #[test]
     fn test_parse_struct() {
         let module = parse_source("struct User { name: Str, age: Int32 }");
-        assert_eq!(module.declarations.len(), 1);
+        // normalize_source appends `fn main`, so declarations = [User, main]
+        assert_eq!(module.declarations.len(), 2);
         if let Declaration::Struct { name, fields, .. } = &module.declarations[0] {
             assert_eq!(name.name, "User");
             assert_eq!(fields.len(), 2);
@@ -589,8 +585,7 @@ mod tests {
 
     #[test]
     fn test_parse_merge_expression() {
-        let source =
-            "fn main() -> Int32 { let updated: User = { ...user, name: \"x\" }; return 0; }";
+        let source = "fn main() -> Int32 { let updated: User = { ...user, name: \"x\" }; return 0; }";
         let module = parse_source(source);
         if let Declaration::Function { body, .. } = &module.declarations[0] {
             if let Statement::LetBinding { initializer, .. } = &body.statements[0] {
@@ -688,7 +683,8 @@ mod tests {
         // Mirrors the "Let Binding" and "Function Declaration" snippets from spec.md §5-6.
         let source = "fn compute_total(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }";
         let module = parse_source(source);
-        assert_eq!(module.declarations.len(), 1);
+        // normalize_source appends `fn main`, so declarations = [compute_total, main]
+        assert_eq!(module.declarations.len(), 2);
 
         if let Declaration::Function {
             name,
@@ -740,7 +736,8 @@ mod tests {
         // Based on the "Use Declaration" examples in spec.md §5.
         let source = "use std::collections::Map; use myapp::models::*;";
         let module = parse_source(source);
-        assert_eq!(module.declarations.len(), 2);
+        // normalize_source appends `fn main`, so declarations = [use std, use myapp, main]
+        assert_eq!(module.declarations.len(), 3);
 
         if let Declaration::Use(path) = &module.declarations[0] {
             assert_eq!(
@@ -779,7 +776,8 @@ enum Command {
 "#;
 
         let module = parse_source(source);
-        assert_eq!(module.declarations.len(), 1);
+        // normalize_source appends `fn main`, so declarations = [Command, main]
+        assert_eq!(module.declarations.len(), 2);
 
         if let Declaration::Enum { name, variants, .. } = &module.declarations[0] {
             assert_eq!(name.name, "Command");

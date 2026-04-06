@@ -1,0 +1,13 @@
+namespace main
+
+fn check(one: Int32) -> Bool {
+  return (one == 1);
+}
+
+fn main() -> Int32 {
+  if check(3) {
+    return 0;
+  } else {
+    return 3;
+  }
+}

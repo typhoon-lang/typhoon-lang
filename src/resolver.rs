@@ -1,6 +1,5 @@
 use crate::ast::*;
-use crate::span::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclId(pub usize);
@@ -100,18 +99,22 @@ impl Resolver {
     ) -> Result<(), String> {
         match &declaration.node {
             DeclarationKind::Function {
+                generics,
                 params,
                 body,
                 return_type,
                 ..
             } => {
+                let type_params = self.generic_type_params(generics);
                 for param in params {
-                    if let Err(err) = self.resolve_type(scope, &param.type_annotation) {
+                    if let Err(err) =
+                        self.resolve_type(scope, &param.type_annotation, &type_params)
+                    {
                         return Err(err);
                     }
                 }
                 if let Some(ret) = return_type {
-                    if let Err(err) = self.resolve_type(scope, ret) {
+                    if let Err(err) = self.resolve_type(scope, ret, &type_params) {
                         return Err(err);
                     }
                 }
@@ -122,24 +125,30 @@ impl Resolver {
                 }
                 self.resolve_block(fn_scope, body)
             }
-            DeclarationKind::Struct { fields, .. } => {
+            DeclarationKind::Struct {
+                generics, fields, ..
+            } => {
+                let type_params = self.generic_type_params(generics);
                 for (_name, ty) in fields {
-                    self.resolve_type(scope, ty)?;
+                    self.resolve_type(scope, ty, &type_params)?;
                 }
                 Ok(())
             }
-            DeclarationKind::Enum { variants, .. } => {
+            DeclarationKind::Enum {
+                generics, variants, ..
+            } => {
+                let type_params = self.generic_type_params(generics);
                 for variant in variants {
                     if let Some(payload) = &variant.node.payload {
                         match &payload.node {
                             EnumVariantPayloadKind::Tuple(types) => {
                                 for ty in types {
-                                    self.resolve_type(scope, ty)?;
+                                    self.resolve_type(scope, ty, &type_params)?;
                                 }
                             }
                             EnumVariantPayloadKind::Struct(fields) => {
                                 for (_id, ty) in fields {
-                                    self.resolve_type(scope, ty)?;
+                                    self.resolve_type(scope, ty, &type_params)?;
                                 }
                             }
                             _ => {}
@@ -148,15 +157,22 @@ impl Resolver {
                 }
                 Ok(())
             }
-            DeclarationKind::Newtype { type_alias, .. } => self.resolve_type(scope, type_alias),
+            DeclarationKind::Newtype { type_alias, .. } => {
+                self.resolve_type(scope, type_alias, &HashSet::new())
+            }
             DeclarationKind::Use(_) => Ok(()),
             _ => Ok(()),
         }
     }
 
-    fn resolve_type(&self, scope: ScopeId, ty: &crate::ast::Type) -> Result<(), String> {
+    fn resolve_type(
+        &self,
+        scope: ScopeId,
+        ty: &crate::ast::Type,
+        type_params: &HashSet<String>,
+    ) -> Result<(), String> {
         for arg in &ty.node.generic_args {
-            self.resolve_type(scope, arg)?;
+            self.resolve_type(scope, arg, type_params)?;
         }
 
         let primitives = [
@@ -169,14 +185,22 @@ impl Resolver {
             return Ok(());
         }
 
-        let common_named = ["Option", "Result", "Buf", "Map", "Set", "Node"];
+        if type_params.contains(name) {
+            return Ok(());
+        }
+
+        let common_named = ["Option", "Result", "Buf", "Map", "Set", "Node", "Ref", "Array"];
         if common_named.contains(&name.as_str()) {
             return Ok(());
         }
 
         if let Some(decl_id) = self.lookup(scope, name) {
             if let Some(DeclInfo::Newtype { aliased_type }) = self.decls.get(&decl_id) {
-                return self.resolve_type(scope, &Spanned::new(aliased_type.clone(), ty.span));
+                return self.resolve_type(
+                    scope,
+                    &Spanned::new_dummy(aliased_type.clone(), ty.span),
+                    type_params,
+                );
             }
             Ok(())
         } else {
@@ -239,7 +263,7 @@ impl Resolver {
                 Ok(decl_id)
             }
             DeclarationKind::Use(path) => {
-                for segment in &path.node.segments {
+                if let Some(segment) = path.node.segments.last() {
                     let decl_id = self.declare(
                         scope,
                         Identifier {
@@ -275,7 +299,7 @@ impl Resolver {
             } => {
                 self.declare(scope, name.clone())?;
                 if let Some(ty) = type_annotation {
-                    self.resolve_type(scope, ty)?;
+                    self.resolve_type(scope, ty, &HashSet::new())?;
                 }
                 self.resolve_expression(scope, initializer)?;
                 Ok(())
@@ -367,7 +391,7 @@ impl Resolver {
                 self.resolve_expression(scope, right)
             }
             ExpressionKind::UnaryOp { expr, .. } => self.resolve_expression(scope, expr),
-            ExpressionKind::FieldAccess { base, field } => {
+            ExpressionKind::FieldAccess { base, field: _ } => {
                 self.resolve_expression(scope, base)?;
                 Ok(())
             }
@@ -382,6 +406,13 @@ impl Resolver {
             },
             _ => Ok(()),
         }
+    }
+
+    fn generic_type_params(&self, generics: &[GenericParam]) -> HashSet<String> {
+        generics
+            .iter()
+            .map(|param| param.node.name.name.clone())
+            .collect()
     }
 
     fn lookup(&self, mut scope: ScopeId, name: &str) -> Option<DeclId> {
@@ -415,7 +446,7 @@ impl Resolver {
                 }
                 Ok(())
             }
-            PatternKind::Or(a, b) => Ok(()),
+            PatternKind::Or(_a, _b) => Ok(()),
             PatternKind::Guard { pattern: p, .. } => self.declare_pattern(scope, p),
             PatternKind::EnumVariant {
                 payload: Some(p), ..
@@ -483,5 +514,11 @@ mod tests {
         let mut resolver = Resolver::new();
         let err = resolver.resolve_module(&module).unwrap_err();
         assert!(err.iter().any(|msg| msg.contains("Duplicate declaration")));
+    }
+
+    #[test]
+    fn resolves_generic_type_params_in_function_signatures() {
+        let resolver = resolve("fn id<T>(x: T) -> T { return x; }");
+        assert!(resolver.decls.len() >= 2);
     }
 }

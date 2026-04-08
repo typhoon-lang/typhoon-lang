@@ -13,62 +13,70 @@ This document outlines the step-by-step implementation of the Typhoon language a
     - [x] Operator precedence table (Pipe `|>` lowest, `?` highest after field access)
     - [x] Disambiguation of `{ ...x, f: v }` (merge expression) vs `{ stmt; expr }` (block)
     - [x] AST with source spans for error reporting
+    - [x] Postfix calls on any expression (`expr(args...)`) enabling `x.method(...)`
+    - [x] Parse `interface` / `impl Trait for Type { ... }` / `extend Type { ... }`
 - [x] **Milestone:** All example programs in `spec.md` parse without error.
 
 ## Phase 2: Name Resolution and Type Inference
 **Goal:** Resolve every identifier to its declaration and infer all types via bidirectional Hindley-Milner.
 
 - [ ] Name Resolution
-    - [ ] Build scope tree
-    - [ ] Resolve all identifiers to canonical `DeclId`
-    - [ ] Introduce `DeclId` and `ScopeId` interners (arena indices)
-    - [ ] Symbol tables per scope (map `String` → `DeclId`)
-    - [ ] Handle shadowing and duplicate declaration errors
-    - [ ] Resolve `use` paths and populate namespace imports
-    - [ ] Resolve `struct`/`enum`/`newtype` type names in type annotations
-    - [ ] Resolve member names for field access and enum variants
+    - [x] Build scope tree
+    - [x] Resolve all identifiers to canonical `DeclId`
+    - [x] Introduce `DeclId` and `ScopeId` interners (arena indices)
+    - [x] Symbol tables per scope (map `String` → `DeclId`)
+    - [x] Handle shadowing and duplicate declaration errors
+    - [x] Resolve `use` paths and populate namespace imports
+    - [x] Resolve `struct`/`enum`/`newtype` type names in type annotations
+    - [ ] Resolve member names for field access and enum variants (compiler currently types some field access without resolver-member linking)
     - [ ] Emit source-span-aware errors (unknown name, ambiguous path, private access)
-    - [ ] Tests: scope shadowing, unresolved names, `use` glob, path segments
+    - [x] Tests: scope shadowing, unresolved names, `use` glob, path segments
 - [ ] Type Inference
-    - [ ] Implement bidirectional HM inference
-    - [ ] Handle generics and interface bounds
-    - [ ] `Result`/`Option` desugaring
+    - [x] Implement bidirectional HM inference
+    - [x] Handle generics and interface bounds
+    - [x] `Result`/`Option` desugaring
     - [ ] Type representation: `TyVar`, `TyCon`, `TyApp`, `TyFn`, `TyTuple`, `TyArray`
-    - [ ] Unification with occurs check and union-find
-    - [ ] Generalization at `let` bindings
-    - [ ] Instantiation at identifier use sites
-    - [ ] Expected-type propagation (bidirectional) for literals and blocks
-    - [ ] Numeric literal defaulting rules (Int32, Float32) with explicit `as`
+    - [x] Unification with occurs check and union-find
+    - [x] Generalization at `let` bindings
+    - [x] Instantiation at identifier use sites
+    - [x] Expected-type propagation (bidirectional) for literals and blocks
+    - [x] Numeric literal defaulting rules (Int32, Float32) with explicit `as`
     - [ ] Constraint solving for interface bounds (trait-like)
     - [ ] Structural typing rules for `struct` initialization and `enum` variants
-    - [ ] Type checking for `if`, `match`, `return`, and block trailing expression
-    - [ ] Tests: inferred let types, function calls, polymorphic `Option`/`Result`
+    - [x] Type checking for `if`, `match`, `return`, and block trailing expression
+    - [x] Struct field access typing (`x.field`) from declared struct field types
+    - [x] Array indexing typing `a[i] -> Option<T>` for both fixed arrays and `Array<T>`
+    - [x] Method-call typing `x.method(args...)` via mangled function symbols (`__ty_method__Type__method`)
+    - [x] Built-in `Array<T>.push(val) -> Unit` typing (in-place)
+    - [x] Tests: inferred let types, function calls, polymorphic `Option`/`Result`
 - [ ] Desugaring
-    - [ ] Desugar `?` operator (verify compatible return type)
-    - [ ] Eliminate `|>` by rewriting to direct calls before IR lowering
+    - [x] Desugar `?` operator (verify compatible return type)
+    - [x] Eliminate `|>` by rewriting to direct calls before IR lowering
     - [ ] Desugar `match` arms into core pattern forms (for later liveness)
-    - [ ] Desugar string interpolation into `Buf` builder calls
-    - [ ] Track desugared spans for error mapping
+    - [x] Desugar string interpolation into `Buf` builder calls
+    - [x] Track desugared spans for error mapping
+    - [x] Declaration renaming/desugaring supports `interface` / `impl` / `extend` blocks (methods desugar like functions)
 - [ ] **Milestone:** All example programs type-check. Invalid programs produce clear type errors.
 
 ### Phase 2 Status
-- Resolver: Basic scope tree, `DeclId`/`ScopeId` interners, per-scope symbol tables, and duplicate detection are implemented in `src/resolver.rs`. The resolver currently handles functions, parameters, `let` bindings, and `use` declarations; its tests cover parameter binding, missing identifiers, and duplicate declarations.
-- Type Checker: `src/type_inference.rs` validates literals, annotated `let` bindings, return expressions, and simple block typings against the lightweight `InferType` lattice (`Int32`, `Float32`, `Bool`, `Str`). The accompanying tests exercise a spec-inspired function and produce a mismatch error when a `let` shoves a string into an `Int32`.
-- Tests: After clearing the incremental cache, `cargo test` now successfully builds and exercises the parser, resolver, and type-inference suites, demonstrating the applied Phase 2 functionality.
+- Resolver: Scope tree + `DeclId`/`ScopeId` interners and per-scope symbol tables are implemented in `src/resolver.rs`, covering functions/params/`let`/`use` plus generic type params and annotation type names.
+- Type Checker: `src/type_inference.rs` implements HM-style inference with unification (occurs check), generalization/instantiation, `if`/`match`/`if let` checking, and `Result`/`Option` constructor support used by desugaring.
+- Desugar: `src/desugar.rs` rewrites `|>`, `?`, and string interpolation into core calls while preserving spans for diagnostics.
+- Tests: `cargo test` exercises parser/resolver/type-inference/desugar behavior for generics, constructors, and control-flow typing.
 
 ## Phase 3: Liveness Checker
 **Goal:** Enforce linear type rules and annotate every binding with its consumption point.
 
 - [ ] Implement Linear Type Rules
-    - [ ] Maintain live set per scope (stack of `LiveSetId`s)
-    - [ ] Track consumption at assignment (`let b = a`)
-    - [ ] Track consumption at function calls
-    - [ ] Track consumption in merge expressions
-    - [ ] Track consumption in `conc` block captures and channel sends
-    - [ ] Track consumption during pattern matching (match arms, destructuring)
+    - [x] Maintain live set per scope (stack of `LiveSetId`s)
+    - [x] Track consumption at assignment (`let b = a`)
+    - [x] Track consumption at function calls
+    - [x] Track consumption in merge expressions
+    - [x] Track consumption in `conc` block captures and channel sends
+    - [x] Track consumption during pattern matching (match arms, destructuring)
     - [ ] Track consumption when calling generic functions (monomorphized types)
-    - [ ] Model `ref` types as shared, escaping the linear live set
-    - [ ] Record spans of consumption and creation to improve diagnostics
+    - [x] Model `ref` types as shared, escaping the linear live set
+    - [x] Record spans of consumption and creation to improve diagnostics
     - [ ] Integrate with resolver/type-inference results (`DeclId` → `InferType`)
 - [ ] Implement Automatic Drop Insertion
     - [ ] Insert drops for remaining live bindings at end of scope
@@ -76,15 +84,15 @@ This document outlines the step-by-step implementation of the Typhoon language a
     - [ ] Emit drops for `match`/`if` tails that exit early
     - [ ] Support `Drop` trait hooking for standard library types
 - [ ] Handle Special Bindings
-    - [ ] Exempt `let mut` from liveness tracking (free at scope exit)
+    - [x] Exempt `let mut` from liveness tracking (free at scope exit)
     - [ ] Support `static`/`const` globals as always-live
     - [ ] Track renames/aliases created by `let alias = original`
 - [ ] Conditional Liveness
-    - [ ] Ensure all branches of `if`/`match` consume the same live bindings
-    - [ ] Validate loops (`while`, `for`) maintain live-set invariants across iterations
+    - [x] Ensure all branches of `if`/`match` consume the same live bindings
+    - [x] Validate loops (`while`, `for`) maintain live-set invariants across iterations
     - [ ] Ensure early `return`/`break`/`continue` consume pending bindings
     - [ ] Emit actionable diagnostics describing which binding was prematurely consumed or forgotten
-    - [ ] Generate test suite covering linear violations: conditional moves, `conc` capture misuse, channels
+    - [x] Generate test suite covering linear violations: conditional moves, `conc` capture misuse, channels
     - [ ] Provide regression harness that runs against `spec.md` examples for `conc`/`merge`
 - [ ] **Milestone:** Ownership violations caught with clear error messages. Test suite covers conditional moves, loop moves, and captures.
 
@@ -101,47 +109,25 @@ This document outlines the step-by-step implementation of the Typhoon language a
 - Step 3: Emit drop instructions for any live binding that survives to the end of a scope, paying attention to `@repr(C)`/FFI boundaries and the `Drop` trait hook for stdlib types.
 - Step 4: Build diagnostics/tests covering conditional moves, loops, `conc` captures, and channel ownership failures, using `spec.md` examples as regression harnesses.
 
-## Phase 1–3 Verification & Gaps
+# Phase 1-3 Limitations
+A few catches / limitations right now:
 
-Summary: ran the test-suite and inspected core modules. Phase 1 (lexer + parser) and Phase 3 (liveness) are largely implemented and tested; Phase 2 (name resolution + type inference) is partially implemented. Below lists the gaps discovered and short remediation notes (file pointers).
-
-Phase 1 gaps
-- String interpolation split into parts + expression spans: PARTIAL — lexer treats interpolated strings as single StrLit. (src/lexer.rs string_lit)
-- Doc-comments tokenization: PARTIAL — comments are skipped but not tracked as doc comments. (src/lexer.rs skip_whitespace)
-- AST spans for error mapping: MISSING — AST nodes lack source span fields. (src/ast.rs)
-
-Phase 2 gaps (high priority)
-- Resolve `use` paths fully / import population: PARTIAL — `use` declares last path segment only. (src/resolver.rs)
-- Member names (field access / enum variants): MISSING — resolver does not map field/variant names to DeclId. (src/resolver.rs; needs symbol metadata)
-- Full Hindley–Milner inference (generics, unification, generalization): MISSING — current TypeChecker is an annotation-driven checker (src/type_inference.rs)
-- Desugaring (`?`, `|>`, match, string interpolation): MISSING — no dedicated desugar pass.
-- Type representations (TyVar/TyCon/TyApp/TyFn): MISSING — InferType is lightweight, needs redesign for HM.
-
-Phase 3 gaps
-- Span-aware diagnostics: MISSING — liveness reports strings but AST lacks spans. (src/ast.rs, src/liveness.rs)
-- FFI/@repr(C) and Drop-trait aware drop-insertion: MISSING
-- Stronger integration with typed DeclId map: PARTIAL — liveness works with identifier names; mapping DeclId→InferType not integrated. (src/liveness.rs)
-
-Suggested next work (Phase 2 continue)
-1. Add AST source spans (small API change across parser + lexer) — enables better diagnostics and eases error mapping.
-2. Upgrade TypeChecker to a HM core:
-   - Introduce TyVar/TyCon/TyApp/TyFn types
-   - Implement unification with occurs-check and union-find
-   - Generalize at let bindings and instantiate at use sites
-3. Implement generic resolution: declare generic params and bind them to type variables during inference.
-4. Add desugar pass to lower `?`, `|>`, and string interpolation before IR lowering.
+  - Resolver doesn’t yet resolve member names for field access or enum variants, and diagnostics are still string-based rather than structured error types.
+  - Type inference doesn’t yet implement interface-bound constraint solving or structural typing rules for `struct` init / general enums (beyond `Option`/`Result` patterns).
+  - Liveness doesn’t yet integrate with resolver/type-inference IDs, and its drop handling is diagnostics-oriented (not an inserted/typed drop IR).
 
 ## Phase 4: LLVM Code Generation
 **Goal:** Produce correct native binaries for all example programs.
 
 - [ ] Lower AST to LLVM IR
     - [ ] Struct lowering (sorted by alignment unless `@repr(C)`)
-    - [ ] `alloca` for size-stable `let` bindings
-    - [ ] `malloc` placeholder for heap types (to be replaced in Phase 5)
-    - [ ] `match` lowering (switch for integers, decision trees for structures)
-    - [ ] Function prolog/epilog generation (stack frame layout)
+    - [x] `alloca` for size-stable `let` bindings
+    - [x] Heap lowering via `ty_alloc`/`ty_free`/`ty_realloc` runtime API (malloc-backed for now; swapped to slab in Phase 5)
+    - [x] Mixed arrays: fixed `[N x T]` for literals, widen to `%struct.TyArray*` (`Array<T>`) for `let mut` / annotated `Array<T>`
+    - [x] `match` lowering (switch for integers, decision trees for structures)
+    - [x] Function prolog/epilog generation (stack frame layout)
     - [ ] Generic monomorphization
-    - [ ] Call lowering with ABI usage and argument passing/promotion
+    - [x] Call lowering with ABI usage and argument passing/promotion
     - [ ] Pointer provenance metadata for `ref` vs linear pointers
     - [ ] Inline `@derive` generated helpers (Eq, Hash, Display)
 - [ ] Optimizations and Annotations
@@ -154,9 +140,11 @@ Suggested next work (Phase 2 continue)
 - [ ] **Milestone:** Programs compile to native binaries and produce correct output.
 
 ### Phase 4 Status
-- Control flow: `if`/`else` and `while` loops emit labeled basic blocks with conditional `br`; `return`, `let`, and expressions lower to registers/local slots.
-- Struct/enum: module preamble emits `struct`/`enum` type defs, `struct` initialization uses GEP/store per field, `merge` mutates fields via GEP/store, and placeholders for enums/match prepare for tagging.
-- Codegen binary: `src/main.rs` now drives lexing → parsing → resolution → typing → liveness → codegen, writes `.ll`, and invokes `clang`; README documents the compile recipe.
+- Control flow: `if`/`else`, `if let`, and `while` now emit labeled basic blocks with conditional `br`, and `match` lowers to real branch trees with payload binding.
+- Values/ABI: size-stable locals use `alloca`, struct/ADT values lower through SSA aggregates, constructors emit `insertvalue`, and call lowering now honors the declared symbol names and return conventions.
+- Codegen binary: `src/main.rs` now drives lexing → parsing → resolution → typing → liveness → codegen, writes `.ll`, invokes `clang` with separate IR/C modes, and links `main` correctly on Windows.
+- Methods/arrays: method calls `x.method(...)` lower to `@__ty_method__Type__method(...)`, `Array<T>.push` lowers to runtime `ty_array_push`, and indexing `a[i]` lowers to `ty_array_get_ptr` plus LLVM `Option<T>` construction.
+- Tests: `cargo test` passes, and a smoke compile of a minimal Typhoon program reaches a native executable.
 
 ## Phase 5: Slab Allocator and Scheduler
 **Goal:** Replace `malloc`/`free` placeholders with production runtime.
@@ -166,6 +154,7 @@ Suggested next work (Phase 2 continue)
     - [ ] Size-class free list
     - [ ] Virtual memory reservation (`mmap`/`VirtualAlloc`)
     - [ ] Integration with LLVM IR (heap type lowering uses allocator interfaces)
+    - [x] (v0) Runtime heap API + array helpers are `malloc`-backed (`ty_alloc`/`ty_realloc`/`ty_free`, `ty_array_from_fixed`, `ty_array_push`, `ty_array_get_ptr`)
 - [ ] Implement M:N Scheduler
     - [ ] Work-stealing deques (one OS thread per core)
     - [ ] Stackful coroutines (64 KB initial, grows on fault)

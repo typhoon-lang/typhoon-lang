@@ -4,9 +4,8 @@ use std::path::Path;
 use std::process::Command;
 
 use typhoon_lang::codegen::Codegen;
-use typhoon_lang::lexer::Lexer;
+use typhoon_lang::driver::compile_project;
 use typhoon_lang::liveness::LiveAnalyzer;
-use typhoon_lang::parser::Parser;
 use typhoon_lang::resolver::Resolver;
 use typhoon_lang::type_inference::TypeChecker;
 
@@ -24,19 +23,12 @@ fn main() {
         "a.out".to_string()
     };
 
-    let source = match fs::read_to_string(input) {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("Failed to read {}: {}", input, err);
-            std::process::exit(1);
-        }
-    };
-
-    let tokens = Lexer::new(source).tokenize();
-    let module = match Parser::new(tokens).parse_module() {
+    let module = match compile_project(Path::new(input)) {
         Ok(m) => m,
-        Err(err) => {
-            eprintln!("Parse error: {}", err);
+        Err(errs) => {
+            for e in errs {
+                eprintln!("Compile error: {}", e);
+            }
             std::process::exit(1);
         }
     };
@@ -63,7 +55,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let ir = Codegen::lower_module(&module);
+    let ir = Codegen::lower_module(&module, checker.types());
     let ir_text = ir.to_llvm_ir();
 
     let ll_path = Path::new(&output).with_extension("ll");
@@ -72,10 +64,14 @@ fn main() {
         std::process::exit(1);
     }
 
+    let runtime_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime").join("runtime.c");
     match Command::new("clang")
         .arg("-x")
         .arg("ir")
         .arg(ll_path.as_os_str())
+        .arg("-x")
+        .arg("c")
+        .arg(runtime_c.as_os_str())
         .arg("-o")
         .arg(&output)
         .status()

@@ -32,4 +32,8 @@ jobs:
         run: cargo test --verbose
 
       - name: Run sample tests
-        run: cargo run --verbose -- sample/main.ty main.exe
+        run: |
+          cargo run --verbose -- sample/main.ty main
+          chmod +x ./main
+          ./main || status=$?
+          echo "Command exited with $status"

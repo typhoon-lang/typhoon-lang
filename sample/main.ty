@@ -1,17 +1,22 @@
 namespace main
 
-fn check(even: Int32) -> Bool {
-  let ar = [2, 4, 8, 16, 32]
-  for x in ar {
-    if even % x == 0 {
-      return true;
+struct Popcount {}
+
+impl Popcount {
+  fn check(self, even: Int32) -> Bool {
+    let ar = [2, 4, 8, 16, 32];
+    for x in ar {
+      if even % x == 0 {
+        return true;
+      }
     }
+    return false;
   }
-  return false;
 }
 
 fn main() -> Int32 {
-  if check(5) {
+  let p: Popcount = Popcount {}
+  if p.check(5) {
     return 0;
   } else {
     return 3;

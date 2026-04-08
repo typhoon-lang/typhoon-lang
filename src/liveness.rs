@@ -614,15 +614,15 @@ mod tests {
     }
 
     fn mk_stmt(kind: StatementKind) -> Statement {
-        Spanned::new(kind, dummy_span())
+        Spanned::new_dummy(kind, dummy_span())
     }
 
     fn mk_expr(kind: ExpressionKind) -> Expression {
-        Spanned::new(kind, dummy_span())
+        Spanned::new_dummy(kind, dummy_span())
     }
 
     fn mk_type(name: &str) -> Type {
-        Spanned::new(
+        Spanned::new_dummy(
             TypeKind {
                 name: name.into(),
                 generic_args: vec![],
@@ -640,11 +640,11 @@ mod tests {
     }
 
     fn mk_decl(kind: DeclarationKind) -> Declaration {
-        Spanned::new(kind, dummy_span())
+        Spanned::new_dummy(kind, dummy_span())
     }
 
     fn mk_else(kind: ElseBranchKind) -> ElseBranch {
-        Spanned::new(kind, dummy_span())
+        Spanned::new_dummy(kind, dummy_span())
     }
 
     fn mk_block(statements: Vec<Statement>) -> Block {
@@ -763,7 +763,7 @@ mod tests {
                 return_type: Some(mk_type("Int32")),
                 body: Block {
                     statements: vec![mk_stmt(StatementKind::Loop {
-                        kind: Spanned::new(LoopKindKind::Block(loop_body.clone()), dummy_span()),
+                        kind: Spanned::new_dummy(LoopKindKind::Block(loop_body.clone()), dummy_span()),
                         body: loop_body,
                     })],
                     trailing_expression: Some(Box::new(mk_expr(ExpressionKind::Literal(
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn ref_binding_not_consumed() {
         // ref<Int32> parameter — needs a generic type arg
-        let ref_type = Spanned::new(
+        let ref_type = Spanned::new_dummy(
             TypeKind {
                 name: "ref".into(),
                 generic_args: vec![mk_type("Int32")],
@@ -906,7 +906,7 @@ mod tests {
                 span: dummy_span(),
             }))
         };
-        let ref_node_type = Spanned::new(
+        let ref_node_type = Spanned::new_dummy(
             TypeKind {
                 name: "ref".into(),
                 generic_args: vec![mk_type("Node")],

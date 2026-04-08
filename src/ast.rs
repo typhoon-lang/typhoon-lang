@@ -1,14 +1,26 @@
 // src/ast.rs
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spanned<T> {
     pub node: T,
     pub span: Span,
+    pub id: NodeId,
 }
 
 impl<T> Spanned<T> {
-    pub fn new(node: T, span: Span) -> Self {
-        Spanned { node, span }
+    pub fn new(node: T, span: Span, id: NodeId) -> Self {
+        Spanned { node, span, id }
+    }
+
+    pub fn new_dummy(node: T, span: Span) -> Self {
+        Spanned {
+            node,
+            span,
+            id: NodeId(0),
+        }
     }
 }
 

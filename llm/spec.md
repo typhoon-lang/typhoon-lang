@@ -78,7 +78,7 @@ unsafe  use  true  false  as
 true  false  BoolLit
 "hello"      StrLit   (UTF-8, static — lives in rodata)
 "Hi {name}"  StrLit   (interpolated — compiler expands at call site)
-[1, 2, 3]   ArrayLit
+[1, 2, 3]    ArrayLit
 ```
 
 ### Comments

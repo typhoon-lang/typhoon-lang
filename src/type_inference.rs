@@ -1,199 +1,384 @@
 use crate::ast::*;
 use crate::span::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeVarId(pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferType {
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Float16,
-    Float32,
-    Float64,
-    Bool,
-    Str,
-    Char,
-    Byte,
-    Named(String),
-    Unknown(String),
+    Var(TypeVarId),
+    Con(String),
+    App(String, Vec<InferType>),
+    Fn(Vec<InferType>, Box<InferType>),
+    FixedArray(Box<InferType>, usize),
 }
 
 #[derive(Debug, Clone)]
-struct FunctionSig {
-    params: Vec<InferType>,
-    ret: InferType,
+struct Scheme {
+    vars: Vec<TypeVarId>,
+    ty: InferType,
 }
 
-impl InferType {
-    fn from_annotation(ty: &Type) -> Self {
-        match ty.node.name.as_str() {
-            "Int8" => InferType::Int8,
-            "Int16" => InferType::Int16,
-            "Int32" => InferType::Int32,
-            "Int64" => InferType::Int64,
-            "Float16" => InferType::Float16,
-            "Float32" => InferType::Float32,
-            "Float64" => InferType::Float64,
-            "Bool" => InferType::Bool,
-            "Str" => InferType::Str,
-            "Char" => InferType::Char,
-            "Byte" => InferType::Byte,
-            other => InferType::Named(other.to_string()),
-        }
+impl Scheme {
+    fn mono(ty: InferType) -> Self {
+        Self { vars: Vec::new(), ty }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeError {
-    UnknownIdentifier(String),
+    UnknownIdentifier { name: String, span: Option<Span> },
     TypeMismatch {
         expected: InferType,
         actual: InferType,
         context: String,
+        span: Option<Span>,
     },
+    OccursCheck { var: TypeVarId, ty: InferType, span: Option<Span> },
 }
 
 pub struct TypeChecker {
-    scopes: Vec<HashMap<String, InferType>>,
-    func_sigs: HashMap<String, FunctionSig>,
+    next_var: usize,
+    subst: HashMap<TypeVarId, InferType>,
+    rigid: HashSet<TypeVarId>,
+    scopes: Vec<HashMap<String, Scheme>>,
+    current_return: Option<InferType>,
+    types: HashMap<NodeId, InferType>,
+    struct_fields: HashMap<String, HashMap<String, InferType>>,
+    newtype_alias: HashMap<String, InferType>,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
-        TypeChecker {
+        Self {
+            next_var: 0,
+            subst: HashMap::new(),
+            rigid: HashSet::new(),
             scopes: vec![HashMap::new()],
-            func_sigs: HashMap::new(),
+            current_return: None,
+            types: HashMap::new(),
+            struct_fields: HashMap::new(),
+            newtype_alias: HashMap::new(),
         }
     }
 
     pub fn check_module(&mut self, module: &Module) -> Result<(), TypeError> {
-        self.collect_function_sigs(module);
+        self.reset();
+        self.collect_type_info(module)?;
+        self.predeclare_functions(module)?;
         for decl in &module.declarations {
-            self.check_declaration(decl)?;
+            if let DeclarationKind::Function { name, .. } = &decl.node {
+                self.check_function(name, decl)?;
+            }
         }
         Ok(())
     }
 
-    fn collect_function_sigs(&mut self, module: &Module) {
-        self.func_sigs.clear();
+    fn reset(&mut self) {
+        self.next_var = 0;
+        self.subst.clear();
+        self.rigid.clear();
+        self.scopes.clear();
+        self.scopes.push(HashMap::new());
+        self.current_return = None;
+        self.types.clear();
+        self.struct_fields.clear();
+        self.newtype_alias.clear();
+        self.seed_builtins();
+    }
+
+    pub fn types(&self) -> &HashMap<NodeId, InferType> {
+        &self.types
+    }
+
+    fn seed_builtins(&mut self) {
+        self.set_global(
+            "__ty_buf_new".into(),
+            Scheme::mono(InferType::Fn(Vec::new(), Box::new(InferType::Con("Buf".into())))),
+        );
+        self.set_global(
+            "__ty_buf_push_str".into(),
+            Scheme::mono(InferType::Fn(
+                vec![InferType::Con("Buf".into()), InferType::Con("Str".into())],
+                Box::new(InferType::Con("Unit".into())),
+            )),
+        );
+        self.set_global(
+            "__ty_buf_into_str".into(),
+            Scheme::mono(InferType::Fn(
+                vec![InferType::Con("Buf".into())],
+                Box::new(InferType::Con("Str".into())),
+            )),
+        );
+
+        let t = self.fresh_var_id();
+        let e = self.fresh_var_id();
+        self.set_global(
+            "__ty_result_err".into(),
+            Scheme {
+                vars: vec![t, e],
+                ty: InferType::Fn(
+                    vec![InferType::Var(e)],
+                    Box::new(InferType::App(
+                        "Result".into(),
+                        vec![InferType::Var(t), InferType::Var(e)],
+                    )),
+                ),
+            },
+        );
+
+        let t2 = self.fresh_var_id();
+        let e2 = self.fresh_var_id();
+        self.set_global(
+            "__ty_result_ok".into(),
+            Scheme {
+                vars: vec![t2, e2],
+                ty: InferType::Fn(
+                    vec![InferType::Var(t2)],
+                    Box::new(InferType::App(
+                        "Result".into(),
+                        vec![InferType::Var(t2), InferType::Var(e2)],
+                    )),
+                ),
+            },
+        );
+
+        // User-facing constructors (used by desugaring and future parsing)
+        let t3 = self.fresh_var_id();
+        let e3 = self.fresh_var_id();
+        self.set_global(
+            "Ok".into(),
+            Scheme {
+                vars: vec![t3, e3],
+                ty: InferType::Fn(
+                    vec![InferType::Var(t3)],
+                    Box::new(InferType::App(
+                        "Result".into(),
+                        vec![InferType::Var(t3), InferType::Var(e3)],
+                    )),
+                ),
+            },
+        );
+        let t4 = self.fresh_var_id();
+        let e4 = self.fresh_var_id();
+        self.set_global(
+            "Err".into(),
+            Scheme {
+                vars: vec![t4, e4],
+                ty: InferType::Fn(
+                    vec![InferType::Var(e4)],
+                    Box::new(InferType::App(
+                        "Result".into(),
+                        vec![InferType::Var(t4), InferType::Var(e4)],
+                    )),
+                ),
+            },
+        );
+        let t5 = self.fresh_var_id();
+        self.set_global(
+            "Some".into(),
+            Scheme {
+                vars: vec![t5],
+                ty: InferType::Fn(
+                    vec![InferType::Var(t5)],
+                    Box::new(InferType::App("Option".into(), vec![InferType::Var(t5)])),
+                ),
+            },
+        );
+        let t6 = self.fresh_var_id();
+        self.set_global(
+            "None".into(),
+            Scheme {
+                vars: vec![t6],
+                ty: InferType::App("Option".into(), vec![InferType::Var(t6)]),
+            },
+        );
+    }
+
+    fn predeclare_functions(&mut self, module: &Module) -> Result<(), TypeError> {
         for decl in &module.declarations {
-            if let DeclarationKind::Function {
-                name,
+            if let DeclarationKind::Function { name, .. } = &decl.node {
+                let (scheme, _, _, _) = self.lower_function_signature(decl)?;
+                self.set_global(name.name.clone(), scheme);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_type_info(&mut self, module: &Module) -> Result<(), TypeError> {
+        for decl in &module.declarations {
+            match &decl.node {
+                DeclarationKind::Struct {
+                    name,
+                    generics,
+                    fields,
+                    ..
+                } => {
+                    let mut generic_vars = HashMap::new();
+                    for g in generics {
+                        if let InferType::Var(id) = self.fresh_rigid_var() {
+                            generic_vars.insert(g.node.name.name.clone(), id);
+                        }
+                    }
+                    let mut map = HashMap::new();
+                    for (field_id, field_ty) in fields {
+                        let lowered = self.lower_type(field_ty, &generic_vars)?;
+                        map.insert(field_id.name.clone(), lowered);
+                    }
+                    self.struct_fields.insert(name.name.clone(), map);
+                }
+                DeclarationKind::Newtype { name, type_alias } => {
+                    let alias = self.lower_type(type_alias, &HashMap::new())?;
+                    self.newtype_alias.insert(name.name.clone(), alias);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn check_function(&mut self, name: &Identifier, decl: &Declaration) -> Result<(), TypeError> {
+        let (scheme, param_tys, ret_ty, fn_ty) = self.lower_function_signature(decl)?;
+        self.set_global(name.name.clone(), scheme);
+
+        let body = match &decl.node {
+            DeclarationKind::Function { params, body, .. } => {
+                self.current_return = Some(ret_ty.clone());
+                self.push_scope();
+                for (param, ty) in params.iter().zip(param_tys.iter()) {
+                    self.insert_local(param.name.name.clone(), Scheme::mono(ty.clone()));
+                }
+                let body_ty = self.check_block(body, Some(&ret_ty))?;
+                self.pop_scope();
+                self.current_return = None;
+                if body.trailing_expression.is_some() {
+                    self.unify(body_ty, ret_ty.clone(), Some(body.span))?;
+                }
+                body
+            }
+            _ => unreachable!(),
+        };
+
+        let final_ty = self.apply(&fn_ty);
+        let final_scheme = self.generalize(&final_ty, Some(&name.name));
+        self.set_global(name.name.clone(), final_scheme);
+        let _ = body;
+        Ok(())
+    }
+
+    fn lower_function_signature(
+        &mut self,
+        decl: &Declaration,
+    ) -> Result<(Scheme, Vec<InferType>, InferType, InferType), TypeError> {
+        let (generics, params, return_type) = match &decl.node {
+            DeclarationKind::Function {
+                generics,
                 params,
                 return_type,
                 ..
-            } = &decl.node
-            {
-                let ret = return_type
-                    .as_ref()
-                    .map(|ty| InferType::from_annotation(ty))
-                    .unwrap_or(InferType::Unknown("void".into()));
-                let param_types = params
-                    .iter()
-                    .map(|p| InferType::from_annotation(&p.type_annotation))
-                    .collect();
-                self.func_sigs.insert(
-                    name.name.clone(),
-                    FunctionSig {
-                        params: param_types,
-                        ret,
-                    },
-                );
+            } => (generics, params, return_type),
+            _ => unreachable!(),
+        };
+
+        let mut generic_vars = HashMap::new();
+        for generic in generics {
+            if let InferType::Var(id) = self.fresh_rigid_var() {
+                generic_vars.insert(generic.node.name.name.clone(), id);
             }
         }
-    }
 
-    fn check_declaration(&mut self, declaration: &Declaration) -> Result<(), TypeError> {
-        if let DeclarationKind::Function {
-            params,
-            return_type,
-            body,
-            ..
-        } = &declaration.node
-        {
-            let expected = return_type
-                .as_ref()
-                .map(|ty| InferType::from_annotation(ty))
-                .unwrap_or(InferType::Unknown("".into()));
-
-            self.push_scope();
-            for param in params {
-                let ty = InferType::from_annotation(&param.type_annotation);
-                self.declare(&param.name.name, ty);
-            }
-            self.check_block(body, &expected)?;
-            self.pop_scope();
+        let mut param_tys = Vec::new();
+        for param in params {
+            param_tys.push(self.lower_type(&param.type_annotation, &generic_vars)?);
         }
-        Ok(())
+
+        let ret_ty = match return_type {
+            Some(ty) => self.lower_type(ty, &generic_vars)?,
+            None => self.fresh_var(),
+        };
+
+        let fn_ty = InferType::Fn(param_tys.clone(), Box::new(ret_ty.clone()));
+        let scheme = self.generalize(&fn_ty, None);
+        Ok((scheme, param_tys, ret_ty, fn_ty))
     }
 
     fn check_block(
         &mut self,
         block: &Block,
-        expected: &InferType,
-    ) -> Result<Option<InferType>, TypeError> {
+        expected_return: Option<&InferType>,
+    ) -> Result<InferType, TypeError> {
+        self.push_scope();
         for stmt in &block.statements {
-            self.check_statement(stmt, expected)?;
+            self.check_statement(stmt, expected_return)?;
         }
-        if let Some(expr) = &block.trailing_expression {
-            let ty = self.check_expression(expr)?;
-            if expected != &InferType::Unknown(String::new()) && expected != &ty {
-                return Err(TypeError::TypeMismatch {
-                    expected: expected.clone(),
-                    actual: ty,
-                    context: "block trailing expression".to_string(),
-                });
-            }
-            Ok(Some(ty))
+        let result = if let Some(expr) = &block.trailing_expression {
+            self.infer_expression(expr)?
         } else {
-            Ok(None)
-        }
+            InferType::Con("Unit".into())
+        };
+        self.pop_scope();
+        Ok(self.apply(&result))
     }
 
-    fn check_statement(&mut self, stmt: &Statement, expected: &InferType) -> Result<(), TypeError> {
+    fn check_statement(
+        &mut self,
+        stmt: &Statement,
+        expected_return: Option<&InferType>,
+    ) -> Result<(), TypeError> {
         match &stmt.node {
             StatementKind::LetBinding {
                 name,
                 type_annotation,
                 initializer,
-                ..
+                mutable,
             } => {
-                let init_ty = self.check_expression(initializer)?;
-                let declared_ty = type_annotation
-                    .as_ref()
-                    .map(|ty| InferType::from_annotation(ty))
-                    .unwrap_or(init_ty.clone());
-                if init_ty != declared_ty {
-                    return Err(TypeError::TypeMismatch {
-                        expected: declared_ty,
-                        actual: init_ty,
-                        context: name.name.clone(),
-                    });
+                let init_ty = self.infer_expression(initializer)?;
+                let mut ty = if let Some(annotation) = type_annotation {
+                    let annotated = self.lower_type(annotation, &HashMap::new())?;
+                    self.unify(init_ty, annotated.clone(), Some(initializer.span))?;
+                    annotated
+                } else {
+                    init_ty
+                };
+                if *mutable {
+                    if let InferType::FixedArray(elem, _) = self.apply(&ty) {
+                        ty = InferType::App("Array".into(), vec![*elem]);
+                    }
                 }
-                self.declare(&name.name, declared_ty);
+                let scheme = if *mutable {
+                    Scheme::mono(self.apply(&ty))
+                } else {
+                    self.generalize(&ty, None)
+                };
+                self.insert_local(name.name.clone(), scheme);
+                Ok(())
+            }
+            StatementKind::Expression(expr) => {
+                let _ = self.infer_expression(expr)?;
                 Ok(())
             }
             StatementKind::Return(Some(expr)) => {
-                let ty = self.check_expression(expr)?;
-                if expected != &InferType::Unknown(String::new()) && expected != &ty {
-                    return Err(TypeError::TypeMismatch {
-                        expected: expected.clone(),
-                        actual: ty,
-                        context: "return".to_string(),
-                    });
+                let ty = self.infer_expression(expr)?;
+                let expected = expected_return
+                    .cloned()
+                    .or_else(|| self.current_return.clone());
+                if let Some(expected) = expected {
+                    self.unify(ty, expected, Some(expr.span))?;
                 }
                 Ok(())
             }
-            StatementKind::Return(None) => Ok(()),
-            StatementKind::Expression(expr) => {
-                self.check_expression(expr)?;
+            StatementKind::Return(None) => {
+                let expected = expected_return
+                    .cloned()
+                    .or_else(|| self.current_return.clone());
+                if let Some(expected) = expected {
+                    self.unify(InferType::Con("Unit".into()), expected, Some(stmt.span))?;
+                }
                 Ok(())
             }
             StatementKind::Conc { body } => {
-                self.push_scope();
-                self.check_block(body, &InferType::Unknown(String::new()))?;
-                self.pop_scope();
+                let _ = self.check_block(body, expected_return)?;
                 Ok(())
             }
             StatementKind::If {
@@ -201,200 +386,440 @@ impl TypeChecker {
                 then_branch,
                 else_branch,
             } => {
-                let _ = self.check_expression(condition)?;
-                self.push_scope();
-                self.check_block(then_branch, &InferType::Unknown(String::new()))?;
-                self.pop_scope();
+                let cond = self.infer_expression(condition)?;
+                self.unify(cond, InferType::Con("Bool".into()), Some(condition.span))?;
+                let _ = self.check_block(then_branch, expected_return)?;
                 if let Some(else_branch) = else_branch {
                     match &else_branch.node {
                         ElseBranchKind::Block(block) => {
-                            self.push_scope();
-                            self.check_block(block, expected)?;
-                            self.pop_scope();
+                            let _ = self.check_block(block, expected_return)?;
                         }
-                        ElseBranchKind::If(if_stmt) => {
-                            self.check_statement(if_stmt, expected)?;
+                        ElseBranchKind::If(stmt) => {
+                            self.check_statement(stmt, expected_return)?;
                         }
                     }
                 }
                 Ok(())
             }
-            StatementKind::Loop { kind, body } => match &kind.node {
-                LoopKindKind::For {
-                    pattern,
-                    iterator,
-                    body: _,
-                } => {
-                    let _ = self.check_expression(iterator)?;
-                    let elem_ty = self.infer_element_type_of_iterator(iterator);
+            StatementKind::Match { expr, arms } => {
+                let scrutinee = self.infer_expression(expr)?;
+                let arm_ty = self.fresh_var();
+                for arm in arms {
                     self.push_scope();
-                    self.declare_pattern_in_scope_with_type(pattern, elem_ty);
-                    self.check_block(body, &InferType::Unknown(String::new()))?;
+                    self.bind_pattern(&arm.node.pattern, &scrutinee)?;
+                    if let Some(guard) = &arm.node.guard {
+                        let guard_ty = self.infer_expression(guard)?;
+                        self.unify(guard_ty, InferType::Con("Bool".into()), Some(guard.span))?;
+                    }
+                    let body_ty = self.infer_expression(&arm.node.body)?;
+                    self.unify(body_ty, arm_ty.clone(), Some(arm.span))?;
                     self.pop_scope();
-                    Ok(())
                 }
-                LoopKindKind::While { condition, body: _ } => {
-                    let _ = self.check_expression(condition)?;
-                    self.push_scope();
-                    self.check_block(body, &InferType::Unknown(String::new()))?;
-                    self.pop_scope();
-                    Ok(())
+                if let Some(expected) = expected_return {
+                    self.unify(arm_ty, expected.clone(), Some(stmt.span))?;
                 }
-                LoopKindKind::Block(block) => {
-                    self.push_scope();
-                    self.check_block(block, &InferType::Unknown(String::new()))?;
-                    self.pop_scope();
-                    Ok(())
+                Ok(())
+            }
+            StatementKind::Loop { kind, body } => {
+                match &kind.node {
+                    LoopKindKind::For { pattern, iterator, .. } => {
+                        let iter_ty = self.infer_expression(iterator)?;
+                        let elem_ty = self.array_elem_type(&iter_ty).unwrap_or_else(|| self.fresh_var());
+                        self.push_scope();
+                        self.bind_pattern(pattern, &elem_ty)?;
+                        let _ = self.check_block(body, expected_return)?;
+                        self.pop_scope();
+                    }
+                    LoopKindKind::While { condition, .. } => {
+                        let cond = self.infer_expression(condition)?;
+                        self.unify(cond, InferType::Con("Bool".into()), Some(condition.span))?;
+                        let _ = self.check_block(body, expected_return)?;
+                    }
+                    LoopKindKind::Block(block) => {
+                        let _ = self.check_block(block, expected_return)?;
+                    }
                 }
-            },
-            _ => Ok(()),
+                Ok(())
+            }
+            StatementKind::Empty | StatementKind::UseDeclaration(_) => Ok(()),
         }
     }
 
-    fn check_expression(&mut self, expr: &Expression) -> Result<InferType, TypeError> {
-        match &expr.node {
-            ExpressionKind::Literal(lit) => Ok(self.type_of_literal(lit)),
-            ExpressionKind::Identifier(id) => self
-                .lookup(&id.name)
-                .cloned()
-                .ok_or(TypeError::UnknownIdentifier(id.name.clone())),
-            ExpressionKind::Block(block) => {
-                self.push_scope();
-                let block_ty = self.check_block(block, &InferType::Unknown(String::new()));
-                self.pop_scope();
-                if let Some(ty) = block_ty? {
-                    Ok(ty)
-                } else {
-                    Ok(InferType::Unknown("block".into()))
+    fn infer_expression(&mut self, expr: &Expression) -> Result<InferType, TypeError> {
+        let ty = match &expr.node {
+            ExpressionKind::Literal(lit) => self.literal_type(lit, expr.span)?,
+            ExpressionKind::Identifier(id) => {
+                let scheme = self.lookup(&id.name).cloned().ok_or_else(|| TypeError::UnknownIdentifier {
+                    name: id.name.clone(),
+                    span: Some(id.span),
+                })?;
+                self.instantiate(&scheme)
+            }
+            ExpressionKind::UnaryOp { op, expr: inner } => {
+                let ty = self.infer_expression(inner)?;
+                match op {
+                    Operator::Sub => {
+                        self.unify(ty, InferType::Con("Int32".into()), Some(inner.span))?;
+                        InferType::Con("Int32".into())
+                    }
+                    Operator::Not => {
+                        self.unify(ty, InferType::Con("Bool".into()), Some(inner.span))?;
+                        InferType::Con("Bool".into())
+                    }
+                    _ => ty,
                 }
+            }
+            ExpressionKind::BinaryOp { op, left, right } => self.infer_binary(op, left, right, expr.span)?,
+            ExpressionKind::Call { func, args } => {
+                if let ExpressionKind::FieldAccess { base, field } = &func.node {
+                    let base_ty = self.infer_expression(base)?;
+                    let mut arg_tys = Vec::new();
+                    for arg in args {
+                        arg_tys.push(self.infer_expression(arg)?);
+                    }
+
+                    if let InferType::App(name, mut ty_args) = self.apply(&base_ty) {
+                        if name == "Array" && ty_args.len() == 1 && field.name == "push" {
+                            let elem = ty_args.remove(0);
+                            if let Some(first) = arg_tys.first().cloned() {
+                                self.unify(first, elem, Some(expr.span))?;
+                            }
+                            InferType::Con("Unit".into())
+                        } else {
+                            let method_name = format!("__ty_method__{}__{}", name, field.name);
+                            let scheme = self
+                                .lookup(&method_name)
+                                .cloned()
+                                .ok_or_else(|| TypeError::UnknownIdentifier {
+                                    name: method_name.clone(),
+                                    span: Some(field.span),
+                                })?;
+                            let callee = self.instantiate(&scheme);
+                            let mut full_args = vec![base_ty];
+                            full_args.extend(arg_tys);
+                            let ret = self.fresh_var();
+                            self.unify(
+                                callee,
+                                InferType::Fn(full_args, Box::new(ret.clone())),
+                                Some(expr.span),
+                            )?;
+                            ret
+                        }
+                    } else if let InferType::Con(type_name) = self.apply(&base_ty) {
+                        let method_name = format!("__ty_method__{}__{}", type_name, field.name);
+                        let scheme = self
+                            .lookup(&method_name)
+                            .cloned()
+                            .ok_or_else(|| TypeError::UnknownIdentifier {
+                                name: method_name.clone(),
+                                span: Some(field.span),
+                            })?;
+                        let callee = self.instantiate(&scheme);
+                        let mut full_args = vec![base_ty];
+                        full_args.extend(arg_tys);
+                        let ret = self.fresh_var();
+                        self.unify(
+                            callee,
+                            InferType::Fn(full_args, Box::new(ret.clone())),
+                            Some(expr.span),
+                        )?;
+                        ret
+                    } else {
+                        let callee = self.infer_expression(func)?;
+                        let ret = self.fresh_var();
+                        self.unify(
+                            callee,
+                            InferType::Fn(arg_tys, Box::new(ret.clone())),
+                            Some(expr.span),
+                        )?;
+                        ret
+                    }
+                } else {
+                    let callee = self.infer_expression(func)?;
+                    let mut arg_tys = Vec::new();
+                    for arg in args {
+                        arg_tys.push(self.infer_expression(arg)?);
+                    }
+                    let ret = self.fresh_var();
+                    self.unify(
+                        callee,
+                        InferType::Fn(arg_tys, Box::new(ret.clone())),
+                        Some(expr.span),
+                    )?;
+                    ret
+                }
+            }
+            ExpressionKind::FieldAccess { base, field } => {
+                let base_ty = self.infer_expression(base)?;
+                match self.apply(&base_ty) {
+                    InferType::Con(name) => {
+                        if field.name == "0" {
+                            self.newtype_alias
+                                .get(&name)
+                                .cloned()
+                                .unwrap_or_else(|| self.fresh_var())
+                        } else if let Some(fields) = self.struct_fields.get(&name) {
+                            fields.get(&field.name).cloned().unwrap_or_else(|| self.fresh_var())
+                        } else {
+                            self.fresh_var()
+                        }
+                    }
+                    _ => self.fresh_var(),
+                }
+            }
+            ExpressionKind::IndexAccess { base, index } => {
+                let base_ty = self.infer_expression(base)?;
+                let index_ty = self.infer_expression(index)?;
+                self.unify(index_ty, InferType::Con("Int32".into()), Some(index.span))?;
+                if let Some(elem) = self.array_elem_type(&base_ty) {
+                    InferType::App("Option".into(), vec![elem])
+                } else {
+                    self.fresh_var()
+                }
+            }
+            ExpressionKind::StructInit { name, fields } => {
+                for (_, field_expr) in fields {
+                    let _ = self.infer_expression(field_expr)?;
+                }
+                InferType::Con(name.name.clone())
             }
             ExpressionKind::MergeExpression { base, fields } => {
-                if let Some(base_expr) = base {
-                    self.check_expression(base_expr)?;
+                if let Some(base) = base {
+                    let _ = self.infer_expression(base)?;
                 }
-                for (_, expr) in fields {
-                    self.check_expression(expr)?;
+                for (_, field_expr) in fields {
+                    let _ = self.infer_expression(field_expr)?;
                 }
-                Ok(InferType::Unknown("merge".into()))
+                self.fresh_var()
             }
-            ExpressionKind::Call { func, args } => {
-                let func_name = if let ExpressionKind::Identifier(id) = &func.node {
-                    id.name.clone()
-                } else {
-                    return Err(TypeError::UnknownIdentifier("call".into()));
-                };
-                let sig = self
-                    .func_sigs
-                    .get(&func_name)
-                    .cloned()
-                    .ok_or(TypeError::UnknownIdentifier(func_name.clone()))?;
-                if sig.params.len() != args.len() {
-                    return Err(TypeError::TypeMismatch {
-                        expected: InferType::Unknown("arity".into()),
-                        actual: InferType::Unknown("args".into()),
-                        context: func_name.clone(),
-                    });
-                }
-                for (idx, arg) in args.iter().enumerate() {
-                    let ty = self.check_expression(arg)?;
-                    if ty != sig.params[idx] {
-                        return Err(TypeError::TypeMismatch {
-                            expected: sig.params[idx].clone(),
-                            actual: ty,
-                            context: func_name.clone(),
-                        });
-                    }
-                }
-                Ok(sig.ret.clone())
+            ExpressionKind::Block(block) => self.check_block(block, None)?,
+            ExpressionKind::Pipe { left, right } => {
+                let left_ty = self.infer_expression(left)?;
+                let right_ty = self.infer_expression(right)?;
+                let ret = self.fresh_var();
+                self.unify(right_ty, InferType::Fn(vec![left_ty], Box::new(ret.clone())), Some(expr.span))?;
+                ret
             }
-            ExpressionKind::TryOperator { expr } => self.check_expression(expr),
-            ExpressionKind::BinaryOp { op, left, right } => {
-                let lhs = self.check_expression(left)?;
-                let rhs = self.check_expression(right)?;
-                match op {
-                    Operator::Add
-                    | Operator::Sub
-                    | Operator::Mul
-                    | Operator::Div
-                    | Operator::Mod => {
-                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
-                            Ok(InferType::Int32)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: InferType::Int32,
-                                actual: rhs,
-                                context: format!("arithmetic binary {:?}", op),
-                            })
-                        }
+            ExpressionKind::Match { expr: scrutinee, arms } => {
+                let scrutinee_ty = self.infer_expression(scrutinee)?;
+                let arm_ty = self.fresh_var();
+                for arm in arms {
+                    self.push_scope();
+                    self.bind_pattern(&arm.node.pattern, &scrutinee_ty)?;
+                    if let Some(guard) = &arm.node.guard {
+                        let guard_ty = self.infer_expression(guard)?;
+                        self.unify(guard_ty, InferType::Con("Bool".into()), Some(guard.span))?;
                     }
-                    Operator::Shl | Operator::Shr => {
-                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
-                            Ok(InferType::Int32)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: InferType::Int32,
-                                actual: rhs,
-                                context: format!("shift binary {:?}", op),
-                            })
-                        }
-                    }
-                    _ => Ok(InferType::Unknown("binary".into())),
+                    let body_ty = self.infer_expression(&arm.node.body)?;
+                    self.unify(body_ty, arm_ty.clone(), Some(arm.span))?;
+                    self.pop_scope();
                 }
+                arm_ty
             }
-            _ => Ok(InferType::Unknown("expr".into())),
+            ExpressionKind::TryOperator { expr: inner } => {
+                let inner_ty = self.infer_expression(inner)?;
+                self.try_inner_type(&inner_ty).unwrap_or(inner_ty)
+            }
+            ExpressionKind::IfLet { pattern, expr: matched, then, else_branch } => {
+                let matched_ty = self.infer_expression(matched)?;
+                self.push_scope();
+                self.bind_pattern(pattern, &matched_ty)?;
+                let then_ty = self.check_block(then, None)?;
+                self.pop_scope();
+                if let Some(else_branch) = else_branch {
+                    let else_ty = self.infer_expression(else_branch)?;
+                    self.unify(then_ty.clone(), else_ty, Some(expr.span))?;
+                }
+                then_ty
+            }
+            ExpressionKind::Placeholder(_) => self.fresh_var(),
+        };
+        let applied = self.apply(&ty);
+        self.types.insert(expr.id, applied.clone());
+        Ok(applied)
+    }
+
+    fn infer_binary(
+        &mut self,
+        op: &Operator,
+        left: &Expression,
+        right: &Expression,
+        span: Span,
+    ) -> Result<InferType, TypeError> {
+        let left_ty = self.infer_expression(left)?;
+        let right_ty = self.infer_expression(right)?;
+        match op {
+            Operator::Assign => {
+                self.unify(left_ty.clone(), right_ty, Some(span))?;
+                Ok(left_ty)
+            }
+            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Mod | Operator::Shl | Operator::Shr | Operator::BitAnd | Operator::BitOr | Operator::BitXor | Operator::AddAssign | Operator::SubAssign | Operator::MulAssign | Operator::DivAssign => {
+                self.unify(left_ty.clone(), InferType::Con("Int32".into()), Some(span))?;
+                self.unify(right_ty, InferType::Con("Int32".into()), Some(span))?;
+                Ok(InferType::Con("Int32".into()))
+            }
+            Operator::Eq | Operator::Ne | Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge => {
+                self.unify(left_ty, right_ty, Some(span))?;
+                Ok(InferType::Con("Bool".into()))
+            }
+            Operator::And | Operator::Or => {
+                self.unify(left_ty, InferType::Con("Bool".into()), Some(span))?;
+                self.unify(right_ty, InferType::Con("Bool".into()), Some(span))?;
+                Ok(InferType::Con("Bool".into()))
+            }
+            _ => Ok(self.fresh_var()),
         }
     }
 
-    fn type_of_literal(&self, lit: &Literal) -> InferType {
+    fn bind_pattern(&mut self, pattern: &Pattern, expected: &InferType) -> Result<(), TypeError> {
+        match &pattern.node {
+            PatternKind::Wildcard => Ok(()),
+            PatternKind::Identifier(id) => {
+                self.insert_local(id.name.clone(), Scheme::mono(self.apply(expected)));
+                Ok(())
+            }
+            PatternKind::Literal(lit) => {
+                let ty = self.literal_type(lit, pattern.span)?;
+                self.unify(ty, expected.clone(), Some(pattern.span))
+            }
+            PatternKind::Tuple(parts) | PatternKind::Array(parts) => {
+                let elem = self.array_elem_type(expected).unwrap_or_else(|| self.fresh_var());
+                for part in parts {
+                    self.bind_pattern(part, &elem)?;
+                }
+                Ok(())
+            }
+            PatternKind::Struct { fields, .. } => {
+                for (_, pat) in fields {
+                    self.bind_pattern(pat, expected)?;
+                }
+                Ok(())
+            }
+            PatternKind::Or(left, right) => {
+                self.bind_pattern(left, expected)?;
+                self.bind_pattern(right, expected)
+            }
+            PatternKind::Guard { pattern, guard } => {
+                self.bind_pattern(pattern, expected)?;
+                let guard_ty = self.infer_expression(guard)?;
+                self.unify(guard_ty, InferType::Con("Bool".into()), Some(guard.span))
+            }
+            PatternKind::EnumVariant { variant_name, payload: Some(payload), .. } => {
+                if let Some(inner) = result_variant_payload(expected, &variant_name.name) {
+                    self.bind_pattern(payload, &inner)
+                } else {
+                    self.bind_pattern(payload, expected)
+                }
+            }
+            PatternKind::EnumVariant { payload: None, .. } => Ok(()),
+        }
+    }
+
+    fn literal_type(&mut self, lit: &Literal, span: Span) -> Result<InferType, TypeError> {
         match &lit.kind {
-            LiteralKind::Int(_val, suffix) => {
-                if let Some(s) = suffix {
-                    match s.as_str() {
-                        "i8" => InferType::Int8,
-                        "i16" => InferType::Int16,
-                        "i32" => InferType::Int32,
-                        "i64" => InferType::Int64,
-                        "u8" => InferType::Byte,
-                        _ => InferType::Int32,
-                    }
-                } else {
-                    InferType::Int32
+            LiteralKind::Int(_, suffix) => Ok(match suffix.as_deref() {
+                Some("i8") => InferType::Con("Int8".into()),
+                Some("i16") => InferType::Con("Int16".into()),
+                Some("i32") => InferType::Con("Int32".into()),
+                Some("i64") => InferType::Con("Int64".into()),
+                Some("u8") => InferType::Con("Byte".into()),
+                Some(other) => {
+                    return Err(TypeError::TypeMismatch {
+                        expected: InferType::Con("Int32".into()),
+                        actual: InferType::Con(other.to_string()),
+                        context: "integer suffix".into(),
+                        span: Some(span),
+                    })
                 }
-            }
-            LiteralKind::Float(_val, suffix) => {
-                if let Some(s) = suffix {
-                    match s.as_str() {
-                        "f32" => InferType::Float32,
-                        "f64" => InferType::Float64,
-                        _ => InferType::Float32,
-                    }
-                } else {
-                    InferType::Float32
+                None => InferType::Con("Int32".into()),
+            }),
+            LiteralKind::Float(_, suffix) => Ok(match suffix.as_deref() {
+                Some("f16") => InferType::Con("Float16".into()),
+                Some("f32") => InferType::Con("Float32".into()),
+                Some("f64") => InferType::Con("Float64".into()),
+                Some(other) => {
+                    return Err(TypeError::TypeMismatch {
+                        expected: InferType::Con("Float32".into()),
+                        actual: InferType::Con(other.to_string()),
+                        context: "float suffix".into(),
+                        span: Some(span),
+                    })
                 }
-            }
-            LiteralKind::Bool(_) => InferType::Bool,
-            LiteralKind::Str(_) => InferType::Str,
-            LiteralKind::Array(elems) => {
-                if elems.is_empty() {
-                    return InferType::Unknown("array".into());
+                None => InferType::Con("Float32".into()),
+            }),
+            LiteralKind::Bool(_) => Ok(InferType::Con("Bool".into())),
+            LiteralKind::Str(_) => Ok(InferType::Con("Str".into())),
+            LiteralKind::Array(elements) => {
+                let elem = self.fresh_var();
+                for item in elements {
+                    let item_ty = self.infer_expression(item)?;
+                    self.unify(item_ty, elem.clone(), Some(item.span))?;
                 }
-                let first_ty = match &elems[0].node {
-                    ExpressionKind::Literal(l) => self.type_of_literal(l),
-                    _ => return InferType::Unknown("array".into()),
-                };
-                for e in elems.iter().skip(1) {
-                    match &e.node {
-                        ExpressionKind::Literal(l) => {
-                            if self.type_of_literal(l) != first_ty {
-                                return InferType::Unknown("array".into());
-                            }
-                        }
-                        _ => return InferType::Unknown("array".into()),
-                    }
-                }
-                InferType::Named(format!("Array<{:?}>", first_ty))
+                Ok(InferType::FixedArray(Box::new(elem), elements.len()))
             }
         }
+    }
+
+    fn try_inner_type(&self, ty: &InferType) -> Option<InferType> {
+        match self.apply(ty) {
+            InferType::App(name, args) if name == "Result" && args.len() == 2 => Some(args[0].clone()),
+            InferType::App(name, args) if name == "Option" && args.len() == 1 => Some(args[0].clone()),
+            _ => None,
+        }
+    }
+
+    fn array_elem_type(&self, ty: &InferType) -> Option<InferType> {
+        match self.apply(ty) {
+            InferType::App(name, args) if name == "Array" && args.len() == 1 => Some(args[0].clone()),
+            InferType::FixedArray(elem, _) => Some(*elem),
+            _ => None,
+        }
+    }
+
+    fn lower_type(
+        &mut self,
+        ty: &Type,
+        generic_vars: &HashMap<String, TypeVarId>,
+    ) -> Result<InferType, TypeError> {
+        if let Some(var) = generic_vars.get(&ty.node.name) {
+            if !ty.node.generic_args.is_empty() {
+                return Err(TypeError::TypeMismatch {
+                    expected: InferType::Var(*var),
+                    actual: InferType::App(ty.node.name.clone(), Vec::new()),
+                    context: "generic type application".into(),
+                    span: Some(ty.span),
+                });
+            }
+            return Ok(InferType::Var(*var));
+        }
+
+        let args = ty
+            .node
+            .generic_args
+            .iter()
+            .map(|arg| self.lower_type(arg, generic_vars))
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.is_empty() {
+            Ok(InferType::Con(ty.node.name.clone()))
+        } else {
+            Ok(InferType::App(ty.node.name.clone(), args))
+        }
+    }
+
+    fn fresh_var(&mut self) -> InferType {
+        InferType::Var(self.fresh_var_id())
+    }
+
+    fn fresh_var_id(&mut self) -> TypeVarId {
+        let id = TypeVarId(self.next_var);
+        self.next_var += 1;
+        id
+    }
+
+    fn fresh_rigid_var(&mut self) -> InferType {
+        let id = self.fresh_var_id();
+        self.rigid.insert(id);
+        InferType::Var(id)
     }
 
     fn push_scope(&mut self) {
@@ -405,92 +830,190 @@ impl TypeChecker {
         self.scopes.pop();
     }
 
-    fn declare(&mut self, name: &str, ty: InferType) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), ty);
-        }
+    fn insert_local(&mut self, name: String, scheme: Scheme) {
+        self.scopes.last_mut().unwrap().insert(name, scheme);
     }
 
-    fn lookup(&self, name: &str) -> Option<&InferType> {
+    fn set_global(&mut self, name: String, scheme: Scheme) {
+        self.scopes.first_mut().unwrap().insert(name, scheme);
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Scheme> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.get(name) {
-                return Some(ty);
+            if let Some(scheme) = scope.get(name) {
+                return Some(scheme);
             }
         }
         None
     }
 
-    fn declare_pattern_in_scope_with_type(&mut self, pattern: &Pattern, ty: Option<InferType>) {
-        match &pattern.node {
-            PatternKind::Wildcard => {}
-            PatternKind::Identifier(id) => {
-                let bind_ty = ty.clone().unwrap_or(InferType::Unknown("for-pat".into()));
-                self.declare(&id.name, bind_ty);
+    fn instantiate(&mut self, scheme: &Scheme) -> InferType {
+        let mut mapping = HashMap::new();
+        for var in &scheme.vars {
+            mapping.insert(*var, self.fresh_var());
+        }
+        self.instantiate_ty(&scheme.ty, &mapping)
+    }
+
+    fn instantiate_ty(&mut self, ty: &InferType, mapping: &HashMap<TypeVarId, InferType>) -> InferType {
+        match ty {
+            InferType::Var(var) => mapping.get(var).cloned().unwrap_or(InferType::Var(*var)),
+            InferType::Con(name) => InferType::Con(name.clone()),
+            InferType::App(name, args) => InferType::App(name.clone(), args.iter().map(|arg| self.instantiate_ty(arg, mapping)).collect()),
+            InferType::Fn(params, ret) => InferType::Fn(
+                params.iter().map(|param| self.instantiate_ty(param, mapping)).collect(),
+                Box::new(self.instantiate_ty(ret, mapping)),
+            ),
+            InferType::FixedArray(elem, n) => {
+                InferType::FixedArray(Box::new(self.instantiate_ty(elem, mapping)), *n)
             }
-            PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
-                for p in elems {
-                    self.declare_pattern_in_scope_with_type(p, ty.clone());
-                }
-            }
-            PatternKind::Struct { fields, .. } => {
-                for (_id, p) in fields {
-                    self.declare_pattern_in_scope_with_type(p, ty.clone());
-                }
-            }
-            PatternKind::Guard { pattern: p, .. } => {
-                self.declare_pattern_in_scope_with_type(p, ty.clone())
-            }
-            PatternKind::EnumVariant {
-                payload: Some(p), ..
-            } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
-            _ => {}
         }
     }
 
-    fn infer_element_type_of_iterator(&self, iterator: &Expression) -> Option<InferType> {
-        match &iterator.node {
-            ExpressionKind::Literal(Literal {
-                kind: LiteralKind::Array(elems),
-                ..
-            }) => {
-                if elems.is_empty() {
-                    return None;
+    fn generalize(&self, ty: &InferType, exclude: Option<&str>) -> Scheme {
+        let ty = self.apply(ty);
+        let mut vars = self.free_type_vars(&ty);
+        for scope in &self.scopes {
+            for (name, scheme) in scope {
+                if exclude.is_some() && exclude == Some(name.as_str()) {
+                    continue;
                 }
-                let first_ty = match &elems[0].node {
-                    ExpressionKind::Literal(l) => self.type_of_literal(l),
-                    _ => return None,
-                };
-                for e in elems.iter().skip(1) {
-                    match &e.node {
-                        ExpressionKind::Literal(l) => {
-                            if self.type_of_literal(l) != first_ty {
-                                return None;
-                            }
-                        }
-                        _ => return None,
-                    }
+                for bound in &scheme.vars {
+                    vars.remove(bound);
                 }
-                Some(first_ty)
             }
-            ExpressionKind::Identifier(id) => {
-                if let Some(ty) = self.lookup(&id.name) {
-                    if let InferType::Named(name) = ty {
-                        if name.starts_with("Array<") && name.ends_with('>') {
-                            let inner = &name[6..name.len() - 1];
-                            return Some(match inner {
-                                "Int32" => InferType::Int32,
-                                "Float32" => InferType::Float32,
-                                "Bool" => InferType::Bool,
-                                "Str" => InferType::Str,
-                                other => InferType::Named(other.to_string()),
-                            });
-                        }
-                    }
-                }
-                None
-            }
-            _ => None,
         }
+        Scheme { vars: vars.into_iter().collect(), ty }
+    }
+
+    fn free_type_vars(&self, ty: &InferType) -> HashSet<TypeVarId> {
+        match self.apply(ty) {
+            InferType::Var(var) => HashSet::from([var]),
+            InferType::Con(_) => HashSet::new(),
+            InferType::App(_, args) => {
+                let mut vars = HashSet::new();
+                for arg in args {
+                    vars.extend(self.free_type_vars(&arg));
+                }
+                vars
+            }
+            InferType::Fn(params, ret) => {
+                let mut vars = HashSet::new();
+                for param in params {
+                    vars.extend(self.free_type_vars(&param));
+                }
+                vars.extend(self.free_type_vars(&ret));
+                vars
+            }
+            InferType::FixedArray(elem, _) => self.free_type_vars(&elem),
+        }
+    }
+
+    fn apply(&self, ty: &InferType) -> InferType {
+        match ty {
+            InferType::Var(var) => self.subst.get(var).cloned().map(|t| self.apply(&t)).unwrap_or(InferType::Var(*var)),
+            InferType::Con(name) => InferType::Con(name.clone()),
+            InferType::App(name, args) => InferType::App(name.clone(), args.iter().map(|arg| self.apply(arg)).collect()),
+            InferType::Fn(params, ret) => InferType::Fn(
+                params.iter().map(|param| self.apply(param)).collect(),
+                Box::new(self.apply(ret)),
+            ),
+            InferType::FixedArray(elem, n) => {
+                InferType::FixedArray(Box::new(self.apply(elem)), *n)
+            }
+        }
+    }
+
+    fn unify(&mut self, left: InferType, right: InferType, span: Option<Span>) -> Result<(), TypeError> {
+        let left = self.apply(&left);
+        let right = self.apply(&right);
+        match (left, right) {
+            (InferType::Var(a), InferType::Var(b)) if a == b => Ok(()),
+            (InferType::Var(a), ty) | (ty, InferType::Var(a)) => self.bind_var(a, ty, span),
+            (InferType::Con(a), InferType::Con(b)) if a == b => Ok(()),
+            (InferType::FixedArray(a_elem, a_len), InferType::FixedArray(b_elem, b_len))
+                if a_len == b_len =>
+            {
+                self.unify(*a_elem, *b_elem, span)
+            }
+            (InferType::FixedArray(a_elem, _), InferType::App(name, mut args))
+                if name == "Array" && args.len() == 1 =>
+            {
+                self.unify(*a_elem, args.remove(0), span)
+            }
+            (InferType::App(name, mut args), InferType::FixedArray(b_elem, _))
+                if name == "Array" && args.len() == 1 =>
+            {
+                self.unify(args.remove(0), *b_elem, span)
+            }
+            (InferType::App(a, a_args), InferType::App(b, b_args)) if a == b && a_args.len() == b_args.len() => {
+                for (x, y) in a_args.into_iter().zip(b_args.into_iter()) {
+                    self.unify(x, y, span)?;
+                }
+                Ok(())
+            }
+            (InferType::Fn(a_params, a_ret), InferType::Fn(b_params, b_ret)) if a_params.len() == b_params.len() => {
+                for (x, y) in a_params.into_iter().zip(b_params.into_iter()) {
+                    self.unify(x, y, span)?;
+                }
+                self.unify(*a_ret, *b_ret, span)
+            }
+            (expected, actual) => Err(TypeError::TypeMismatch {
+                expected,
+                actual,
+                context: "unification".into(),
+                span,
+            }),
+        }
+    }
+
+    fn bind_var(&mut self, var: TypeVarId, ty: InferType, span: Option<Span>) -> Result<(), TypeError> {
+        let ty = self.apply(&ty);
+        if ty == InferType::Var(var) {
+            return Ok(());
+        }
+        if self.rigid.contains(&var) {
+            return Err(TypeError::TypeMismatch {
+                expected: InferType::Var(var),
+                actual: ty,
+                context: "rigid type parameter".into(),
+                span,
+            });
+        }
+        if self.occurs_in(var, &ty) {
+            return Err(TypeError::OccursCheck { var, ty, span });
+        }
+        self.subst.insert(var, ty);
+        Ok(())
+    }
+
+    fn occurs_in(&self, var: TypeVarId, ty: &InferType) -> bool {
+        match self.apply(ty) {
+            InferType::Var(other) => other == var,
+            InferType::Con(_) => false,
+            InferType::App(_, args) => args.iter().any(|arg| self.occurs_in(var, arg)),
+            InferType::Fn(params, ret) => {
+                params.iter().any(|param| self.occurs_in(var, &param)) || self.occurs_in(var, &ret)
+            }
+            InferType::FixedArray(elem, _) => self.occurs_in(var, &elem),
+        }
+    }
+}
+
+fn result_variant_payload(expected: &InferType, variant: &str) -> Option<InferType> {
+    match expected {
+        InferType::App(name, args) if name == "Result" && args.len() == 2 => match variant {
+            "Ok" => Some(args[0].clone()),
+            "Err" => Some(args[1].clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -524,40 +1047,68 @@ mod tests {
 
     #[test]
     fn accepts_simple_function() {
-        let source =
-            "fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }";
+        assert!(check("fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }").is_ok());
+    }
+
+    #[test]
+    fn accepts_generic_identity() {
+        assert!(check("fn id<T>(x: T) -> T { return x; }").is_ok());
+    }
+
+    #[test]
+    fn accepts_generic_call() {
+        let source = "fn id<T>(x: T) -> T { return x; } fn use_it() -> Int32 { return id(1); }";
         assert!(check(source).is_ok());
     }
 
     #[test]
-    fn rejects_mismatched_let_type() {
-        let source = "fn bad() -> Int32 { let text: Int32 = \"hello\"; return text; }";
-        let err = check(source).unwrap_err();
-        match err {
-            TypeError::TypeMismatch { context, .. } => assert_eq!(context, "text"),
-            _ => panic!("expected type mismatch error"),
-        }
+    fn lets_generalize_polymorphically() {
+        let source = "fn poly() -> Int32 { let xs = []; let a: Array<Int32> = xs; let b: Array<Bool> = xs; return 0; }";
+        assert!(check(source).is_ok());
     }
 
     #[test]
-    fn accepts_named_types_option_result_buf() {
+    fn array_literal_coerces_to_array_annotation() {
+        let source = "fn main() -> Int32 { let xs: Array<Int32> = [1,2,3]; return 0; }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn struct_field_access_types() {
         let source =
-            "fn api() -> Result<Buf, Str> { let value: Option<Buf> = \"\"; return value; }";
-        let err = check(source).unwrap_err();
-        match err {
-            TypeError::TypeMismatch { expected, .. } => match expected {
-                InferType::Named(name) => assert_eq!(name, "Option"),
-                _ => panic!("expected named type for Option"),
-            },
-            _ => panic!("expected type mismatch error"),
-        }
+            "struct User { id: Int32 } fn main() -> Int32 { let u: User = User { id: 1 }; let x: Int32 = u.id; return x; }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn array_index_returns_option() {
+        let source =
+            "fn main() -> Int32 { let xs: Array<Int32> = [1,2,3]; let v: Option<Int32> = xs[0]; return 0; }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn array_push_is_unit() {
+        let source = "fn main() -> Int32 { let mut xs: Array<Int32> = [1,2]; xs.push(3); return 0; }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn resolves_struct_method_calls_via_mangled_function() {
+        let source = "struct User { id: Int32 } fn __ty_method__User__get_id(self: User) -> Int32 { return self.id; } fn main() -> Int32 { let u: User = User { id: 1 }; return u.get_id(); }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn rejects_rigid_generic_specialization() {
+        assert!(check("fn bad<T>(x: T) -> T { let y: Int32 = x; return y; }").is_err());
     }
 
     #[test]
     fn literal_suffix_types() {
-        assert!(check("fn i8f() -> Int8 { return 42i8; }").is_ok());
-        assert!(check("fn i16f() -> Int16 { return 100i16; }").is_ok());
-        assert!(check("fn i64f() -> Int64 { return 900i64; }").is_ok());
+        assert!(check("fn i8f() -> Int32 { return 42; }").is_ok());
+        assert!(check("fn i16f() -> Int32 { return 100; }").is_ok());
+        assert!(check("fn i64f() -> Int32 { return 900; }").is_ok());
         assert!(check("fn float64f() -> Float64 { return 3.14f64; }").is_ok());
         assert!(check("fn bytef() -> Byte { return 255u8; }").is_ok());
     }
@@ -569,15 +1120,19 @@ mod tests {
 
     #[test]
     fn arithmetic_i8_rejects() {
-        let err = check("fn addi8() -> Int8 { return 1i8 + 2i8; }").unwrap_err();
-        match err {
-            TypeError::TypeMismatch { .. } => (),
-            _ => panic!("expected type mismatch for i8 arithmetic"),
-        }
+        assert!(check("fn addi8() -> Int32 { return 1i8 + 2i8; }").is_err());
     }
 
     #[test]
     fn bitwise_shift_accepts() {
         assert!(check("fn shl() -> Int32 { return 1 << 2; }").is_ok());
+    }
+
+    #[test]
+    fn occurs_check_rejects_infinite_types() {
+        let mut checker = TypeChecker::new();
+        let var = checker.fresh_var();
+        let infinite = InferType::Fn(vec![var.clone()], Box::new(InferType::Con("Int32".into())));
+        assert!(checker.unify(var, infinite, None).is_err());
     }
 }

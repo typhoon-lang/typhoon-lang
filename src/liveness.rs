@@ -266,7 +266,32 @@ impl LiveAnalyzer {
                         pattern, iterator, ..
                     } => {
                         self.analyze_expression(iterator)?;
-                        self.analyze_pattern(pattern)?;
+
+                        // Pass 1: validate body with loop var in scope (unchanged)
+                        self.push();
+                        if let PatternKind::Identifier(id) = &pattern.node {
+                            self.insert_binding(id, "for loop", false, false)?;
+                        }
+                        self.analyze_block_no_drops(body)?;
+                        self.pop();
+
+                        // Pass 2 (branch-consistency): seed the stack with `x` so the body can resolve it
+                        let mut for_base = base.clone();
+                        let mut for_scope = LiveSet::new();
+                        if let PatternKind::Identifier(id) = &pattern.node {
+                            // ignore duplicate-binding error; this is a fresh scope
+                            let _ = for_scope.insert(id, "for loop", false, false);
+                        }
+                        for_base.push(for_scope);
+
+                        let mut loop_stack = self.run_branch_block(body, for_base)?;
+
+                        // Strip the for-scope level we added — it isn't part of `base`
+                        loop_stack.pop();
+
+                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                        self.merge_branch_result(&loop_stack);
+                        return Ok(()); // skip the fallthrough pass on lines 281-283
                     }
                     LoopKindKind::While { condition, .. } => {
                         self.analyze_expression(condition)?;
@@ -763,7 +788,10 @@ mod tests {
                 return_type: Some(mk_type("Int32")),
                 body: Block {
                     statements: vec![mk_stmt(StatementKind::Loop {
-                        kind: Spanned::new_dummy(LoopKindKind::Block(loop_body.clone()), dummy_span()),
+                        kind: Spanned::new_dummy(
+                            LoopKindKind::Block(loop_body.clone()),
+                            dummy_span(),
+                        ),
                         body: loop_body,
                     })],
                     trailing_expression: Some(Box::new(mk_expr(ExpressionKind::Literal(

@@ -1,11 +1,12 @@
 namespace main
 
-struct Popcount {}
+struct Popcount {
+  ar: [Int32],
+}
 
 impl Popcount {
   fn check(self, even: Int32) -> Bool {
-    let ar = [2, 4, 8, 16, 32];
-    for x in ar {
+    for x in self.ar {
       if even % x == 0 {
         return true;
       }
@@ -15,7 +16,9 @@ impl Popcount {
 }
 
 fn main() -> Int32 {
-  let p: Popcount = Popcount {}
+  let p: Popcount = Popcount {
+    ar: [2, 4, 8, 16, 32],
+  }
   if p.check(5) {
     return 0;
   } else {

@@ -91,10 +91,17 @@ impl LiveSet {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DropInfo {
+    pub name: String,
+
+    pub is_heap: bool, // Track if it was allocated in a slab
+}
+
 pub struct LiveAnalyzer {
     stack: Vec<LiveSet>,
     errors: Vec<String>,
-    drops: Vec<String>,
+    structured_drops: HashMap<NodeId, Vec<DropInfo>>,
 }
 
 impl LiveAnalyzer {
@@ -102,11 +109,14 @@ impl LiveAnalyzer {
         Self {
             stack: Vec::new(),
             errors: Vec::new(),
-            drops: Vec::new(),
+            structured_drops: HashMap::new(),
         }
     }
 
-    pub fn analyze_module(&mut self, module: &Module) -> Result<(), Vec<String>> {
+    pub fn analyze_module(
+        &mut self,
+        module: &Module,
+    ) -> Result<&HashMap<NodeId, Vec<DropInfo>>, Vec<String>> {
         for decl in &module.declarations {
             if let DeclarationKind::Function { params, body, .. } = &decl.node {
                 self.push();
@@ -117,22 +127,28 @@ impl LiveAnalyzer {
                         break;
                     }
                 }
+                // In analyze_module — remove the redundant record_drops call:
                 if let Err(err) = self.analyze_block(body) {
                     self.errors.push(err);
                 }
                 let set = self.pop();
-                self.record_drops(&set);
+                // record param-scope drops under a different id
+                self.record_drops(decl.id, &set);
             }
         }
         if self.errors.is_empty() {
-            Ok(())
+            Ok(&self.structured_drops)
         } else {
             Err(self.errors.clone())
         }
     }
 
-    pub fn drops(&self) -> &[String] {
-        &self.drops
+    /// Flat list of all drop names across all scopes (used by tests).
+    pub fn drops(&self) -> Vec<String> {
+        self.structured_drops
+            .values()
+            .flat_map(|v| v.iter().map(|d| d.name.clone()))
+            .collect()
     }
 
     fn push(&mut self) {
@@ -188,7 +204,7 @@ impl LiveAnalyzer {
             Ok(())
         })();
         let set = self.pop();
-        self.record_drops(&set);
+        self.record_drops(block.block_id, &set); // block.id from Spanned wrapper
         result
     }
 
@@ -510,7 +526,7 @@ impl LiveAnalyzer {
         let mut branch = LiveAnalyzer {
             stack,
             errors: Vec::new(),
-            drops: Vec::new(),
+            structured_drops: HashMap::new(),
         };
         branch.analyze_block_no_drops(block)?;
         if branch.errors.is_empty() {
@@ -528,7 +544,7 @@ impl LiveAnalyzer {
         let mut branch = LiveAnalyzer {
             stack,
             errors: Vec::new(),
-            drops: Vec::new(),
+            structured_drops: HashMap::new(),
         };
         branch.analyze_statement_no_drops(stmt)?;
         if branch.errors.is_empty() {
@@ -546,7 +562,7 @@ impl LiveAnalyzer {
         let mut branch = LiveAnalyzer {
             stack,
             errors: Vec::new(),
-            drops: Vec::new(),
+            structured_drops: HashMap::new(),
         };
         branch.analyze_expression(expr)?;
         if branch.errors.is_empty() {
@@ -594,15 +610,15 @@ impl LiveAnalyzer {
         }
     }
 
-    fn record_drops(&mut self, set: &LiveSet) {
-        for (name, origin, span) in set.unconsumed() {
-            self.drops.push(format!(
-                "Drop '{}' (origin: {}; span: {})",
-                name,
-                origin,
-                format_span(span)
-            ));
+    fn record_drops(&mut self, block_id: NodeId, set: &LiveSet) {
+        let mut drops = Vec::new();
+        for (name, _origin, _span) in set.unconsumed() {
+            // We check if this binding was a 'let' or 'mut' that
+            // the codegen would have placed on the slab.
+            let is_heap = set.mutables.contains(&name);
+            drops.push(DropInfo { name, is_heap });
         }
+        self.structured_drops.insert(block_id, drops);
     }
 
     fn analyze_pattern(&mut self, _pattern: &Pattern) -> Result<(), String> {
@@ -677,6 +693,7 @@ mod tests {
             statements,
             trailing_expression: None,
             span: dummy_span(),
+            block_id: NodeId(1),
         }
     }
 
@@ -700,7 +717,7 @@ mod tests {
         let module = parse(source);
         let mut analyzer = LiveAnalyzer::new();
         match analyzer.analyze_module(&module) {
-            Ok(()) => Ok(analyzer.drops().to_vec()),
+            Ok(_drop_map) => Ok(analyzer.drops()),
             Err(err) => Err(err),
         }
     }
@@ -710,6 +727,7 @@ mod tests {
         let drops =
             analyze("fn unused(count: Int32) -> Int32 { let zero: Int32 = 0; return zero; }")
                 .unwrap();
+        println!("{:?}", drops);
         assert!(drops.iter().any(|msg| msg.contains("count")));
     }
 
@@ -726,6 +744,7 @@ mod tests {
     fn drop_records_unconsumed_let() {
         let drops =
             analyze("fn leftover() -> Int32 { let temporary: Int32 = 42; return 0; }").unwrap();
+        println!("{:?}", drops);
         assert!(drops.iter().any(|msg| msg.contains("temporary")));
     }
 
@@ -786,22 +805,10 @@ mod tests {
                 generics: vec![],
                 params: vec![mk_param("token", "Int32")],
                 return_type: Some(mk_type("Int32")),
-                body: Block {
-                    statements: vec![mk_stmt(StatementKind::Loop {
-                        kind: Spanned::new_dummy(
-                            LoopKindKind::Block(loop_body.clone()),
-                            dummy_span(),
-                        ),
-                        body: loop_body,
-                    })],
-                    trailing_expression: Some(Box::new(mk_expr(ExpressionKind::Literal(
-                        Literal {
-                            kind: LiteralKind::Int(0, None),
-                            span: dummy_span(),
-                        },
-                    )))),
-                    span: dummy_span(),
-                },
+                body: mk_block(vec![mk_stmt(StatementKind::Loop {
+                    kind: Spanned::new_dummy(LoopKindKind::Block(loop_body.clone()), dummy_span()),
+                    body: loop_body,
+                })]),
             })],
             span: dummy_span(),
         };

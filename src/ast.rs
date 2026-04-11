@@ -143,6 +143,7 @@ pub struct Block {
     pub statements: Vec<Statement>,
     pub trailing_expression: Option<Box<Expression>>,
     pub span: Span,
+    pub block_id: NodeId,
 }
 
 pub type Statement = Spanned<StatementKind>;
@@ -160,18 +161,18 @@ pub enum StatementKind {
     Expression(Expression),
     // Return statement
     Return(Option<Expression>),
-    // Conc block
+    /// `Conc` block — body is `Block` so the scope has a NodeId.
     Conc {
         body: Block,
     },
     // Use declaration
     UseDeclaration(UsePath),
-    // Loop (e.g. for, while)
+    /// Loop (`for` / `while` / bare `loop`) — body is `Block`.
     Loop {
         kind: LoopKind,
         body: Block,
     },
-    // If statement
+    /// `if` / `else` — then-branch is `Block`.
     If {
         condition: Expression,
         then_branch: Block,

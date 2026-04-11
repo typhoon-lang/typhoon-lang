@@ -149,12 +149,12 @@ A few catches / limitations right now:
 ## Phase 5: Slab Allocator and Scheduler
 **Goal:** Replace `malloc`/`free` placeholders with production runtime.
 
-- [ ] Implement Per-Task Slab Allocator
-    - [ ] Bump allocator
-    - [ ] Size-class free list
-    - [ ] Virtual memory reservation (`mmap`/`VirtualAlloc`)
-    - [ ] Integration with LLVM IR (heap type lowering uses allocator interfaces)
-    - [x] (v0) Runtime heap API + array helpers are `malloc`-backed (`ty_alloc`/`ty_realloc`/`ty_free`, `ty_array_from_fixed`, `ty_array_push`, `ty_array_get_ptr`)
+- [x] Implement Per-Task Slab Allocator
+    - [x] Bump allocator
+    - [x] Size-class free list
+    - [x] Virtual memory reservation (`mmap`/`VirtualAlloc`)
+    - [x] Integration with LLVM IR (heap type lowering uses allocator interfaces)
+    - [x] (v1) Runtime heap API + array helpers are `arena`-backed (`ty_alloc`/`ty_realloc`/`ty_free`, `ty_array_from_fixed`, `ty_array_push`, `ty_array_get_ptr`)
 - [ ] Implement M:N Scheduler
     - [ ] Work-stealing deques (one OS thread per core)
     - [ ] Stackful coroutines (64 KB initial, grows on fault)

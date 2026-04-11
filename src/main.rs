@@ -48,14 +48,17 @@ fn main() {
     }
 
     let mut liveness = LiveAnalyzer::new();
-    if let Err(errors) = liveness.analyze_module(&module) {
-        for err in errors {
-            eprintln!("Liveness error: {}", err);
+    let result = match liveness.analyze_module(&module) {
+        Ok(drop_map) => drop_map,
+        Err(errors) => {
+            for err in errors {
+                eprintln!("Liveness error: {}", err);
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
-    }
+    };
 
-    let ir = Codegen::lower_module(&module, checker.types());
+    let ir = Codegen::lower_module(&module, checker.types(), result);
     let ir_text = ir.to_llvm_ir();
 
     let ll_path = Path::new(&output).with_extension("ll");
@@ -64,7 +67,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let runtime_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime").join("runtime.c");
+    let runtime_c = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("runtime")
+        .join("runtime.c");
     match Command::new("clang")
         .arg("-x")
         .arg("ir")

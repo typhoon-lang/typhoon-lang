@@ -316,6 +316,7 @@ impl Parser {
             statements,
             trailing_expression,
             span: start_span.join(end_span),
+            block_id: self.alloc_id(),
         })
     }
 

@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::liveness::DropInfo;
 use crate::span::Span;
 use crate::type_inference::InferType;
 use std::collections::HashMap;
@@ -46,8 +47,12 @@ impl IrModule {
 pub struct Codegen;
 
 impl Codegen {
-    pub fn lower_module(module: &Module, types: &HashMap<NodeId, InferType>) -> IrModule {
-        let mut b = IrBuilder::new();
+    pub fn lower_module(
+        module: &Module,
+        types: &HashMap<NodeId, InferType>,
+        drop_map: &HashMap<NodeId, Vec<DropInfo>>,
+    ) -> IrModule {
+        let mut b = IrBuilder::new(drop_map);
         b.types = Some(types as *const _);
         b.collect_types(module);
         let functions = module
@@ -67,10 +72,13 @@ impl Codegen {
                         .map(|ty| b.lower_type(ty))
                         .unwrap_or_else(|| "void".to_string());
                     let body_ir = b.emit_function(name, params, &ret_ty, body);
-                    let param_list = params
+                    let mut param_list: Vec<(String, String)> = params
                         .iter()
                         .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation)))
                         .collect();
+                    if !is_main(name.name.clone()) {
+                        param_list.insert(0, ("task".to_string(), "i8*".to_string()));
+                    }
                     Some(IrFunction {
                         name: link_symbol_name(&name.name),
                         body: body_ir,
@@ -91,7 +99,7 @@ impl Codegen {
 
 // ── IR builder ────────────────────────────────────────────────────────────────
 
-struct IrBuilder {
+struct IrBuilder<'a> {
     lines: Vec<String>,
     next_tmp: usize,
     next_label: usize,
@@ -106,10 +114,11 @@ struct IrBuilder {
     extra_preamble: Vec<String>,
     adt_structs: HashMap<String, String>,
     types: Option<*const HashMap<NodeId, InferType>>,
+    drop_map: &'a HashMap<NodeId, Vec<DropInfo>>,
 }
 
-impl IrBuilder {
-    fn new() -> Self {
+impl<'a> IrBuilder<'a> {
+    fn new(drop_map: &'a HashMap<NodeId, Vec<DropInfo>>) -> Self {
         Self {
             lines: Vec::new(),
             next_tmp: 0,
@@ -125,6 +134,7 @@ impl IrBuilder {
             extra_preamble: Vec::new(),
             adt_structs: HashMap::new(),
             types: None,
+            drop_map: drop_map,
         }
     }
 
@@ -179,15 +189,16 @@ impl IrBuilder {
         }
 
         for decl in [
-            "declare i8* @ty_alloc(i64, i64)",
-            "declare i8* @ty_realloc(i8*, i64, i64)",
-            "declare void @ty_free(i8*)",
-            "declare %struct.Buf* @ty_buf_new()",
-            "declare void @ty_buf_push_str(%struct.Buf*, i8*)",
-            "declare i8* @ty_buf_into_str(%struct.Buf*)",
-            "declare %struct.TyArray* @ty_array_from_fixed(i8*, i64, i64, i64)",
-            "declare void @ty_array_push(%struct.TyArray*, i8*)",
+            "declare %struct.Buf* @ty_buf_new(i8* %task)",
+            "declare void @ty_buf_push_str(i8*, %struct.Buf*, i8*)",
+            "declare i8* @ty_buf_into_str(i8*, %struct.Buf*)",
+            "declare %struct.TyArray* @ty_array_from_fixed(i8*, i8*, i64, i64, i64)",
+            "declare void @ty_array_push(i8*, %struct.TyArray*, i8*)",
             "declare i8* @ty_array_get_ptr(%struct.TyArray*, i64)",
+            "declare i8* @slab_arena_new()",
+            "declare i8* @slab_alloc(i8* %task, i32 %size_class)",
+            "declare void @slab_free(i8* %task, i8* %ptr, i32 %size_class)",
+            "declare i8* @mmap(i8*, i64, i32, i32, i32, i64)", // For VM reservation
         ] {
             self.extra_preamble.push(decl.to_string());
         }
@@ -241,10 +252,14 @@ impl IrBuilder {
                         .as_ref()
                         .map(|ty| self.lower_type(ty))
                         .unwrap_or_else(|| "void".to_string());
-                    let param_types = params
+                    let mut param_types: Vec<String> = params
                         .iter()
                         .map(|p| self.lower_type(&p.type_annotation))
                         .collect();
+                    println!("{}", name.name.clone());
+                    if !is_main(name.name.clone()) {
+                        param_types.insert(0, "i8*".to_string());
+                    }
                     self.func_sigs
                         .insert(name.name.clone(), (ret_ty, param_types));
                 }
@@ -278,17 +293,17 @@ impl IrBuilder {
         self.current_fn_ret_ty = ret_ty.to_string();
         self.current_fn_name = Some(name.name.clone());
         self.emit("entry:".to_string());
-
+        if is_main(name.name.clone()) {
+            self.emit("  %t0 = alloca i8*".to_string());
+            self.emit("  %task_init = call i8* @slab_arena_new()".to_string());
+            self.emit("  store i8* %task_init, i8** %t0".to_string());
+            self.emit("  %task = load i8*, i8** %t0".to_string());
+        } else {
+            self.emit_function_param("task".to_string(), "i8*".to_string());
+        }
         for param in params {
             let ty = self.lower_type(&param.type_annotation);
-            let slot = self.tmp();
-            self.emit(format!("  {} = alloca {}", slot, ty));
-            self.emit(format!(
-                "  store {} %{}, {}* {}",
-                ty, param.name.name, ty, slot
-            ));
-            self.locals.insert(param.name.name.clone(), slot);
-            self.locals_type.insert(param.name.name.clone(), ty);
+            self.emit_function_param(param.name.name.clone(), ty);
         }
 
         let terminated = self.emit_block_stmts(body, ret_ty);
@@ -329,6 +344,17 @@ impl IrBuilder {
         self.lines.join("\n")
     }
 
+    fn emit_function_param(&mut self, name: String, lower_type: String) {
+        let slot = self.tmp();
+        self.emit(format!("  {} = alloca {}", slot, lower_type));
+        self.emit(format!(
+            "  store {} %{}, {}* {}",
+            lower_type, name, lower_type, slot
+        ));
+        self.locals.insert(name.clone(), slot);
+        self.locals_type.insert(name.clone(), lower_type);
+    }
+
     // ── Statement emission ────────────────────────────────────────────────────
 
     /// Emit all statements in `block`. Returns true if a terminator was emitted.
@@ -337,6 +363,15 @@ impl IrBuilder {
         for stmt in &block.statements {
             if self.emit_stmt(stmt, ret_ty) {
                 return true;
+            }
+        }
+        // Before exiting the block, emit slab_free for everything dying here.
+        // block.id comes from the Spanned wrapper, mirroring how liveness keys drops.
+        if let Some(drops) = self.drop_map.get(&block.block_id).cloned() {
+            for drop in &drops {
+                if drop.is_heap {
+                    self.emit_slab_free(&drop.name);
+                }
             }
         }
         false
@@ -390,6 +425,53 @@ impl IrBuilder {
         }
     }
 
+    fn emit_block_end(&mut self, block_id: NodeId) {
+        if let Some(drops) = self.drop_map.get(&block_id).cloned() {
+            for drop in &drops {
+                if drop.is_heap {
+                    self.emit_slab_free(&drop.name);
+                }
+            }
+        }
+    }
+
+    /// Emit a `slab_free` call for the named local, if it was slab-allocated.
+    /// Looks up the typed pointer in `locals` and the LLVM type in `locals_type`
+    /// to reconstruct the size class.
+    fn emit_slab_free(&mut self, name: &str) {
+        let typed_ptr = match self.locals.get(name).cloned() {
+            Some(p) => p,
+            None => return, // not a local we know about
+        };
+        let ty = self
+            .locals_type
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "i32".to_string());
+
+        // Only free if this was heap-allocated (pointer to struct / not a plain alloca slot)
+        // Convention: slab-allocated locals store the typed pointer directly (ends with '*')
+        // while stack allocas store the slot address. We use the same heuristic as emit_let.
+        if !ty.ends_with('*') {
+            return;
+        }
+
+        let size = self.llvm_const_sizeof(&ty);
+        let class_id = get_size_class(size);
+
+        let raw = self.tmp();
+        self.emit(format!(
+            "  {} = bitcast {}* {} to i8*",
+            raw,
+            ty.trim_end_matches('*'),
+            typed_ptr
+        ));
+        self.emit(format!(
+            "  call void @slab_free(i8* %task, i8* {}, i32 {})",
+            raw, class_id
+        ));
+    }
+
     fn emit_let(
         &mut self,
         name: &Identifier,
@@ -431,7 +513,7 @@ impl IrBuilder {
                 let al = self.llvm_const_alignof(&elem_ty);
                 let out = self.tmp();
                 self.emit(format!(
-                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* {}, i64 {}, i64 {}, i64 {})",
+                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* %task, i8* {}, i64 {}, i64 {}, i64 {})",
                     out, raw, elems.len(), sz, al
                 ));
 
@@ -456,19 +538,32 @@ impl IrBuilder {
         let ty = type_annotation
             .map(|t| self.lower_type(t))
             .unwrap_or_else(|| self.expr_llvm_type(initializer));
-        if mutable && !ty.ends_with('*') && ty != "void" {
-            let (size, align) = self.llvm_size_align_of(&ty);
-            let raw = self.tmp();
+
+        let is_heap_allocated = mutable && !ty.ends_with('*') && ty != "void";
+
+        if is_heap_allocated {
+            // Implement Slab Allocation Logic
+            let size = self.llvm_const_sizeof(&ty);
+            let class_id = get_size_class(size);
+
+            let raw_ptr = self.tmp();
+            // %task is passed as a hidden first argument to the function
             self.emit(format!(
-                "  {} = call i8* @ty_alloc(i64 {}, i64 {})",
-                raw, size, align
+                "  {} = call i8* @slab_alloc(i8* %task, i32 {})",
+                raw_ptr, class_id
             ));
-            let ptr = self.tmp();
-            self.emit(format!("  {} = bitcast i8* {} to {}*", ptr, raw, ty));
-            self.emit(format!("  store {} {}, {}* {}", ty, value, ty, ptr));
-            self.locals.insert(name.name.clone(), ptr);
+
+            let typed_ptr = self.tmp();
+            self.emit(format!(
+                "  {} = bitcast i8* {} to {}*",
+                typed_ptr, raw_ptr, ty
+            ));
+
+            self.emit(format!("  store {} {}, {}* {}", ty, value, ty, typed_ptr));
+            self.locals.insert(name.name.clone(), typed_ptr);
             self.locals_type.insert(name.name.clone(), ty);
         } else {
+            // Default stack allocation (alloca)
             let slot = self.tmp();
             self.emit(format!("  {} = alloca {}", slot, ty));
             self.emit(format!("  store {} {}, {}* {}", ty, value, ty, slot));
@@ -677,7 +772,7 @@ impl IrBuilder {
                 let elem_size = self.llvm_const_sizeof(&elem_ty);
                 let align = self.llvm_const_alignof(&elem_ty);
                 self.emit(format!(
-                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* {}, i64 {}, i64 {}, i64 {})",
+                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* %task, i8* {}, i64 {}, i64 {}, i64 {})",
                     ty_array_ptr, raw_ptr_i8, elems.len(), elem_size, align
                 ));
 
@@ -1090,7 +1185,7 @@ impl IrBuilder {
                     let raw = self.tmp();
                     self.emit(format!("  {} = bitcast {}* {} to i8*", raw, val_ty, slot));
                     self.emit(format!(
-                        "  call void @ty_array_push(%struct.TyArray* {}, i8* {})",
+                        "  call void @ty_array_push(i8* %task, %struct.TyArray* {}, i8* {})",
                         base_val, raw
                     ));
                 }
@@ -1105,15 +1200,24 @@ impl IrBuilder {
                     .get(&method_sym)
                     .cloned()
                     .unwrap_or_else(|| ("i32".to_string(), vec![]));
+
+                // param_types is [i8* (task), self_ty, arg1_ty, ...]
+                // Index 0 = task (injected separately)
+                // Index 1 = self
+                // Index 2+ = explicit args
                 let self_ty = param_types
-                    .first()
+                    .get(1) // ← was .first() i.e. index 0
                     .cloned()
                     .unwrap_or_else(|| base_ty.clone());
-                let mut arg_pairs = vec![format!("{} {}", self_ty, base_val)];
+
+                let mut arg_pairs = vec![
+                    "i8* %task".to_string(), // ← task first, bare reference
+                    format!("{} {}", self_ty, base_val),
+                ];
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
                     let t = param_types
-                        .get(i + 1)
+                        .get(i + 2) // ← was i + 1, now offset by 2 (skip task + self)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
                     arg_pairs.push(format!("{} {}", t, v));
@@ -1156,6 +1260,7 @@ impl IrBuilder {
                 ""
             };
             let mut arg_pairs = Vec::new();
+            arg_pairs.push("i8* %task".to_string());
             for (i, arg) in args.iter().enumerate() {
                 let v = self.emit_expr(arg);
                 let t = param_types
@@ -1783,7 +1888,7 @@ impl IrBuilder {
         }
     }
 
-    fn inferred_expr_type<'a>(&self, expr: &'a Expression) -> Option<&'a InferType> {
+    fn inferred_expr_type(&self, expr: &'a Expression) -> Option<&'a InferType> {
         // SAFETY: types map lives longer than this builder call.
         let types = unsafe { &*self.types? };
         types.get(&expr.id)
@@ -2039,12 +2144,27 @@ impl IrBuilder {
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
+fn is_main(name: String) -> bool {
+    return name == "main".to_string() || name.ends_with("__main");
+}
+
 fn int_suffix_to_llvm(suffix: &str) -> &'static str {
     match suffix {
         "i8" | "u8" => "i8",
         "i16" => "i16",
         "i64" => "i64",
         _ => "i32",
+    }
+}
+
+fn get_size_class(size: i64) -> u32 {
+    match size {
+        0..=8 => 0,
+        9..=16 => 1,
+        17..=32 => 2,
+        33..=64 => 3,
+        65..=128 => 4,
+        _ => 5, // Fallback/Large
     }
 }
 
@@ -2141,20 +2261,30 @@ mod tests {
             .unwrap();
         let mut checker = crate::type_inference::TypeChecker::new();
         checker.check_module(&module).unwrap();
-        let ir = Codegen::lower_module(&module, checker.types());
+        let mut liveness = crate::liveness::LiveAnalyzer::new();
+        let drop_map = liveness
+            .analyze_module(&module)
+            .unwrap_or(&std::collections::HashMap::new())
+            .clone();
+        let ir = Codegen::lower_module(&module, checker.types(), &drop_map);
         ir.to_llvm_ir()
     }
 
     #[test]
     fn lowers_function_declarations() {
         let source = "fn main(a: Int32) -> Int32 { return a; }";
-        let mut src = format!("namespace main\n{}", source);
+        let src = format!("namespace main\n{}", source);
         let module = Parser::new(Lexer::new(src).tokenize())
             .parse_module()
             .unwrap();
         let mut checker = crate::type_inference::TypeChecker::new();
         checker.check_module(&module).unwrap();
-        let ir = Codegen::lower_module(&module, checker.types());
+        let mut liveness = crate::liveness::LiveAnalyzer::new();
+        let drop_map = liveness
+            .analyze_module(&module)
+            .unwrap_or(&std::collections::HashMap::new())
+            .clone();
+        let ir = Codegen::lower_module(&module, checker.types(), &drop_map);
         assert_eq!(ir.functions.len(), 1);
         assert_eq!(ir.functions[0].name, "main");
         assert_eq!(ir.functions[0].ret_type, "i32");
@@ -2194,7 +2324,7 @@ mod tests {
     #[test]
     fn heap_allocates_mutable_struct_lets() {
         let text = compile("struct Point { x: Int32, y: Int32 } fn main() -> Int32 { let mut p: Point = Point { x: 1, y: 2 }; return 0; }");
-        assert!(text.contains("call i8* @ty_alloc"));
+        assert!(text.contains("call i8* @slab_alloc"));
         assert!(text.contains("bitcast i8*"));
         assert!(text.contains("%struct.Point*"));
     }

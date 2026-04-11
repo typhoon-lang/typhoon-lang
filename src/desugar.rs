@@ -230,7 +230,11 @@ impl Desugar {
                 }
                 StatementKind::Loop { kind, body } => {
                     match &kind.node {
-                        LoopKindKind::For { iterator, body: inner, .. } => {
+                        LoopKindKind::For {
+                            iterator,
+                            body: inner,
+                            ..
+                        } => {
                             max_id = max_id.max(max_id_expr(iterator));
                             for s in &inner.statements {
                                 max_id = max_id.max(max_id_stmt(s));
@@ -239,7 +243,10 @@ impl Desugar {
                                 max_id = max_id.max(max_id_expr(t));
                             }
                         }
-                        LoopKindKind::While { condition, body: inner } => {
+                        LoopKindKind::While {
+                            condition,
+                            body: inner,
+                        } => {
                             max_id = max_id.max(max_id_expr(condition));
                             for s in &inner.statements {
                                 max_id = max_id.max(max_id_stmt(s));
@@ -748,10 +755,9 @@ impl Desugar {
                         name: "Ok".to_string(),
                         span: inner.span,
                     },
-                    payload: Some(Box::new(self.mk_pat(
-                        PatternKind::Identifier(ok_id.clone()),
-                        inner.span,
-                    ))),
+                    payload: Some(Box::new(
+                        self.mk_pat(PatternKind::Identifier(ok_id.clone()), inner.span),
+                    )),
                 };
                 let err_pat = PatternKind::EnumVariant {
                     enum_name: Identifier {
@@ -762,10 +768,9 @@ impl Desugar {
                         name: "Err".to_string(),
                         span: inner.span,
                     },
-                    payload: Some(Box::new(self.mk_pat(
-                        PatternKind::Identifier(err_id.clone()),
-                        inner.span,
-                    ))),
+                    payload: Some(Box::new(
+                        self.mk_pat(PatternKind::Identifier(err_id.clone()), inner.span),
+                    )),
                 };
 
                 let ok_pat = self.mk_pat(ok_pat, inner.span);
@@ -796,15 +801,15 @@ impl Desugar {
                 );
 
                 let err_block = Block {
-                    statements: vec![self.mk_stmt(
-                        StatementKind::Return(Some(err_call)),
-                        inner.span,
-                    )],
+                    statements: vec![
+                        self.mk_stmt(StatementKind::Return(Some(err_call)), inner.span)
+                    ],
                     trailing_expression: Some(Box::new(self.mk_expr(
                         ExpressionKind::Placeholder("__ty_unreachable".to_string()),
                         inner.span,
                     ))),
                     span: inner.span,
+                    block_id: self.alloc_id(),
                 };
 
                 let err_pat = self.mk_pat(err_pat, inner.span);
@@ -939,6 +944,7 @@ impl Desugar {
                     statements,
                     trailing_expression: Some(Box::new(final_expr)),
                     span: *span,
+                    block_id: self.alloc_id(),
                 });
                 Ok(())
             }

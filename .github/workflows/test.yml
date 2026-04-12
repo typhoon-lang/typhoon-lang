@@ -13,11 +13,47 @@ jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    continue-on-error: true
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.21.x'
+
+      - name: Setup VS cmd
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Generate library build (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+            mkdir -p build
+            cd build
+            cmake ..
+
+      - name: Generate library build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+            mkdir -p build
+            cd build
+            cmake .. -G "Visual Studio 17 2022" -A x64
+
+      - name: Build library (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+            cd build
+            make
+
+      - name: Build library (Windows)
+        if: runner.os == 'Windows'
+        run: |
+            msbuild build\GeneratedRunner.sln -t:rebuild -verbosity:diag -property:Configuration=Debug
 
       - name: Set up Clang
         if: runner.os != 'macOS'

@@ -66,21 +66,29 @@ fn main() {
         eprintln!("Failed to write IR file {}: {}", ll_path.display(), err);
         std::process::exit(1);
     }
+    let build_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("build")
+        .join("output");
 
-    let runtime_c = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("runtime")
-        .join("runtime.c");
-    match Command::new("clang")
-        .arg("-x")
-        .arg("ir")
-        .arg(ll_path.as_os_str())
-        .arg("-x")
-        .arg("c")
-        .arg(runtime_c.as_os_str())
-        .arg("-o")
-        .arg(&output)
-        .status()
-    {
+    let mut cmd = Command::new("clang");
+
+    // 1. Specify the input IR (use -x ir if your file doesn't end in .ll)
+    cmd.arg(ll_path.as_os_str());
+
+    // 2. Stop 'ir' mode so it doesn't try to parse the library as IR
+    cmd.arg("-x").arg("none");
+
+    // 3. Set the library search path (the DIRECTORY)
+    cmd.arg("-L").arg(build_dir.as_os_str());
+
+    // 4. Set the library name
+    // Clang will find runtime.lib on Windows or libruntime.a on Unix
+    cmd.arg("-lruntime");
+
+    // 5. Add static and output flags
+    cmd.arg("-o").arg(&output);
+
+    match cmd.status() {
         Ok(status) if status.success() => {
             println!("Wrote {}", output);
         }

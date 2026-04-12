@@ -22,12 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-
-#ifdef _WIN32
-#  include <windows.h>
-#else
-#  include <sys/mman.h>
-#endif
+#include "platform.h"
 
 /* ── configuration ──────────────────────────────────────────────────────────── */
 
@@ -41,7 +36,7 @@ static const int32_t SIZE_CLASS_BYTES[NUM_SIZE_CLASSES] = {
 
 /* ── hard abort ─────────────────────────────────────────────────────────────── */
 
-static void ty_abort(void) { __builtin_trap(); }
+static void ty_abort(void) { TY_TRAP(); }
 
 /* ── helpers ────────────────────────────────────────────────────────────────── */
 

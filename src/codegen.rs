@@ -55,7 +55,7 @@ impl Codegen {
         let mut b = IrBuilder::new(drop_map);
         b.types = Some(types as *const _);
         b.collect_types(module);
-        let functions = module
+        let mut all_functions: Vec<IrFunction> = module
             .declarations
             .iter()
             .filter_map(|decl| {
@@ -76,7 +76,7 @@ impl Codegen {
                         .iter()
                         .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation)))
                         .collect();
-                    if !is_main(name.name.clone()) {
+                    if !is_main(&name.name) {
                         param_list.insert(0, ("task".to_string(), "i8*".to_string()));
                     }
                     Some(IrFunction {
@@ -90,8 +90,9 @@ impl Codegen {
                 }
             })
             .collect();
+        all_functions.extend(b.conc_functions.drain(..));
         IrModule {
-            functions,
+            functions: all_functions,
             preamble: b.preamble(),
         }
     }
@@ -107,6 +108,8 @@ struct IrBuilder<'a> {
     current_fn_ret_ty: String,
     locals: HashMap<String, String>,
     locals_type: HashMap<String, String>,
+    parent_locals: HashMap<String, String>,  // captured variables from parent scope
+    parent_types: HashMap<String, String>,   // types of captured variables
     type_decls: Vec<String>,
     struct_fields: HashMap<String, Vec<(String, String)>>,
     func_sigs: HashMap<String, (String, Vec<String>)>,
@@ -115,6 +118,7 @@ struct IrBuilder<'a> {
     adt_structs: HashMap<String, String>,
     types: Option<*const HashMap<NodeId, InferType>>,
     drop_map: &'a HashMap<NodeId, Vec<DropInfo>>,
+    conc_functions: Vec<IrFunction>,
 }
 
 impl<'a> IrBuilder<'a> {
@@ -127,6 +131,8 @@ impl<'a> IrBuilder<'a> {
             current_fn_ret_ty: "void".to_string(),
             locals: HashMap::new(),
             locals_type: HashMap::new(),
+            parent_locals: HashMap::new(),
+            parent_types: HashMap::new(),
             type_decls: Vec::new(),
             struct_fields: HashMap::new(),
             func_sigs: HashMap::new(),
@@ -135,6 +141,7 @@ impl<'a> IrBuilder<'a> {
             adt_structs: HashMap::new(),
             types: None,
             drop_map: drop_map,
+            conc_functions: Vec::new(),
         }
     }
 
@@ -189,16 +196,29 @@ impl<'a> IrBuilder<'a> {
         }
 
         for decl in [
+            // ── scheduler ──
+            "declare void @ty_sched_init()",
+            "declare void @ty_sched_shutdown()",
+            "declare i8* @ty_spawn(i8*, i8*, i8*)", // task, fn_ptr, arg
+            "declare void @ty_yield()",
+            "declare void @ty_await(i8*, i8*)", // task, coro_handle
+            "declare i8* @ty_chan_new(i64, i64)", // elem_size, cap
+            "declare void @ty_chan_send(i8*, i8*, i8*)", // task, chan, elem_ptr
+            "declare void @ty_chan_recv(i8*, i8*, i8*)", // task, chan, out_ptr
+            "declare void @ty_chan_close(i8*)", // chan
+            // ── Buf (all now take task first) ──
             "declare %struct.Buf* @ty_buf_new(i8* %task)",
             "declare void @ty_buf_push_str(i8*, %struct.Buf*, i8*)",
             "declare i8* @ty_buf_into_str(i8*, %struct.Buf*)",
+            // ── TyArray (all now take task first) ──
             "declare %struct.TyArray* @ty_array_from_fixed(i8*, i8*, i64, i64, i64)",
             "declare void @ty_array_push(i8*, %struct.TyArray*, i8*)",
             "declare i8* @ty_array_get_ptr(%struct.TyArray*, i64)",
+            // ── arena / slab ──
             "declare i8* @slab_arena_new()",
             "declare i8* @slab_alloc(i8* %task, i32 %size_class)",
             "declare void @slab_free(i8* %task, i8* %ptr, i32 %size_class)",
-            "declare i8* @mmap(i8*, i64, i32, i32, i32, i64)", // For VM reservation
+            "declare void @slab_arena_free(i8*)",
         ] {
             self.extra_preamble.push(decl.to_string());
         }
@@ -213,6 +233,33 @@ impl<'a> IrBuilder<'a> {
             "__ty_buf_into_str".into(),
             ("i8*".into(), vec!["%struct.Buf*".into()]),
         );
+        self.func_sigs.insert(
+            "ty_array_push".into(),
+            ("void".into(), vec!["%struct.TyArray*".into(), "i8*".into()]),
+        );
+        // ty_array_get_ptr has no task — handled in no_task_intrinsics()
+        self.func_sigs.insert(
+            "ty_spawn".into(),
+            ("i8*".into(), vec!["i8*".into(), "i8*".into()]),
+        ); // fn_ptr, arg
+        self.func_sigs
+            .insert("ty_await".into(), ("void".into(), vec!["i8*".into()])); // coro_handle
+        self.func_sigs
+            .insert("ty_yield".into(), ("void".into(), vec![]));
+        self.func_sigs.insert(
+            "ty_chan_new".into(),
+            ("i8*".into(), vec!["i64".into(), "i64".into()]),
+        );
+        self.func_sigs.insert(
+            "ty_chan_send".into(),
+            ("void".into(), vec!["i8*".into(), "i8*".into()]),
+        ); // chan, elem_ptr
+        self.func_sigs.insert(
+            "ty_chan_recv".into(),
+            ("void".into(), vec!["i8*".into(), "i8*".into()]),
+        ); // chan, out_ptr
+        self.func_sigs
+            .insert("ty_chan_close".into(), ("void".into(), vec!["i8*".into()]));
 
         for decl in &module.declarations {
             match &decl.node {
@@ -256,8 +303,7 @@ impl<'a> IrBuilder<'a> {
                         .iter()
                         .map(|p| self.lower_type(&p.type_annotation))
                         .collect();
-                    println!("{}", name.name.clone());
-                    if !is_main(name.name.clone()) {
+                    if !is_main(&name.name) {
                         param_types.insert(0, "i8*".to_string());
                     }
                     self.func_sigs
@@ -293,10 +339,11 @@ impl<'a> IrBuilder<'a> {
         self.current_fn_ret_ty = ret_ty.to_string();
         self.current_fn_name = Some(name.name.clone());
         self.emit("entry:".to_string());
-        if is_main(name.name.clone()) {
+        if is_main(&name.name) {
             self.emit("  %t0 = alloca i8*".to_string());
             self.emit("  %task_init = call i8* @slab_arena_new()".to_string());
             self.emit("  store i8* %task_init, i8** %t0".to_string());
+            self.emit("  call void @ty_sched_init()".to_string());
             self.emit("  %task = load i8*, i8** %t0".to_string());
         } else {
             self.emit_function_param("task".to_string(), "i8*".to_string());
@@ -383,10 +430,16 @@ impl<'a> IrBuilder<'a> {
             StatementKind::Return(Some(expr)) => {
                 let val = self.emit_expr(expr);
                 let ty = self.expr_llvm_type(expr);
+                if self.current_fn_name.as_deref().map_or(false, is_main) {
+                    self.emit("  call void @ty_sched_shutdown()".to_string());
+                }
                 self.emit(format!("  ret {} {}", ty, val));
                 true
             }
             StatementKind::Return(None) => {
+                if self.current_fn_name.as_deref().map_or(false, is_main) {
+                    self.emit("  call void @ty_sched_shutdown()".to_string());
+                }
                 self.emit("  ret void".to_string());
                 true
             }
@@ -418,7 +471,68 @@ impl<'a> IrBuilder<'a> {
                 false
             }
             StatementKind::Conc { body } => {
-                self.emit_block_stmts(body, ret_ty);
+                // Emit a trampoline function that can access captured variables from parent scope.
+                let tramp_name = format!(
+                    "__ty_conc_{}",
+                    self.label("tramp")
+                );
+                
+                let saved_lines = std::mem::take(&mut self.lines);
+                let saved_fn_name = self.current_fn_name.clone();
+                let saved_fn_ret_ty = self.current_fn_ret_ty.clone();
+                let saved_locals = std::mem::take(&mut self.locals);
+                let saved_types = std::mem::take(&mut self.locals_type);
+                let saved_parent_locals = std::mem::take(&mut self.parent_locals);
+                let saved_parent_types = std::mem::take(&mut self.parent_types);
+
+                // Capture parent scope for the trampoline
+                self.parent_locals = saved_locals.clone();
+                self.parent_types = saved_types.clone();
+
+                self.lines.clear();
+                self.locals.clear();
+                self.locals_type.clear();
+                self.current_fn_ret_ty = "void".to_string();
+                self.current_fn_name = Some(tramp_name.clone());
+                self.emit("entry:".to_string());
+                self.emit_function_param("task".to_string(), "i8*".to_string());
+                self.emit_function_param("arg".to_string(), "i8*".to_string());
+                self.emit_block_stmts(body, "void");
+                self.emit("  ret void".to_string());
+
+                let tramp_ir = IrFunction {
+                    name: tramp_name.clone(),
+                    body: self.lines.join("\n"),
+                    ret_type: "void".to_string(),
+                    params: vec![
+                        ("task".to_string(), "i8*".to_string()),
+                        ("arg".to_string(), "i8*".to_string()),
+                    ],
+                };
+                
+                // Restore
+                self.lines = saved_lines;
+                self.locals = saved_locals;
+                self.locals_type = saved_types;
+                self.current_fn_name = saved_fn_name;
+                self.current_fn_ret_ty = saved_fn_ret_ty;
+                self.parent_locals = saved_parent_locals;
+                self.parent_types = saved_parent_types;
+
+                // 2. Emit the spawn call at the current site
+                let fn_ptr = self.tmp();
+                self.emit(format!(
+                    "  {} = bitcast void (i8*, i8*)* @{} to i8*",
+                    fn_ptr, tramp_name
+                ));
+                let null_arg = self.tmp();
+                self.emit(format!("  {} = bitcast i8* null to i8*", null_arg));
+                self.emit(format!(
+                    "  call i8* @ty_spawn(i8* %task, i8* {}, i8* {})",
+                    fn_ptr, null_arg
+                ));
+
+                self.conc_functions.push(tramp_ir);
                 false
             }
             _ => false,
@@ -788,6 +902,11 @@ impl<'a> IrBuilder<'a> {
                     let tmp = self.tmp();
                     self.emit(format!("  {} = load {}, {}* {}", tmp, ty, ty, slot));
                     tmp
+                } else if self.parent_locals.get(&id.name).is_some() {
+                    // Variable from parent scope (captured in conc block)
+                    // For now, generate a stub that will fail at runtime
+                    // A proper implementation would unpack from arg parameter
+                    format!("0 ; FIXME: captured var {}", id.name)
                 } else {
                     id.name.clone()
                 }
@@ -870,6 +989,17 @@ impl<'a> IrBuilder<'a> {
     // ── Binary operations ─────────────────────────────────────────────────────
 
     fn emit_binop(&mut self, op: &Operator, left: &Expression, right: &Expression) -> String {
+        // Simple assignment
+        if *op == Operator::Assign {
+            let (slot, lval_ty) = self.resolve_lvalue(left);
+            let rhs_val = self.emit_expr(right);
+            self.emit(format!(
+                "  store {} {}, {}* {}",
+                lval_ty, rhs_val, lval_ty, slot
+            ));
+            return rhs_val;
+        }
+
         // Compound assignment
         if matches!(
             op,
@@ -983,11 +1113,13 @@ impl<'a> IrBuilder<'a> {
                     .locals
                     .get(&id.name)
                     .cloned()
+                    .or_else(|| self.parent_locals.get(&id.name).cloned())
                     .unwrap_or(id.name.clone());
                 let ty = self
                     .locals_type
                     .get(&id.name)
                     .cloned()
+                    .or_else(|| self.parent_types.get(&id.name).cloned())
                     .unwrap_or_else(|| "i32".to_string());
                 (slot, ty)
             }
@@ -997,10 +1129,12 @@ impl<'a> IrBuilder<'a> {
                         self.locals
                             .get(&id.name)
                             .cloned()
+                            .or_else(|| self.parent_locals.get(&id.name).cloned())
                             .unwrap_or(id.name.clone()),
                         self.locals_type
                             .get(&id.name)
                             .cloned()
+                            .or_else(|| self.parent_types.get(&id.name).cloned())
                             .unwrap_or_else(|| "[0 x i32]".to_string()),
                     ),
                     _ => (self.emit_expr(base), "[0 x i32]".to_string()),
@@ -1020,10 +1154,12 @@ impl<'a> IrBuilder<'a> {
                         self.locals
                             .get(&id.name)
                             .cloned()
+                            .or_else(|| self.parent_locals.get(&id.name).cloned())
                             .unwrap_or(id.name.clone()),
                         self.locals_type
                             .get(&id.name)
                             .cloned()
+                            .or_else(|| self.parent_types.get(&id.name).cloned())
                             .unwrap_or_else(|| "%struct.?".to_string()),
                     ),
                     _ => (self.emit_expr(base), "%struct.?".to_string()),
@@ -1051,15 +1187,29 @@ impl<'a> IrBuilder<'a> {
                     .get(&id.name)
                     .cloned()
                     .unwrap_or_else(|| ("i32".to_string(), vec![]));
-                let first_ty = param_types
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| lhs_ty.clone());
-                let mut arg_pairs = vec![format!("{} {}", first_ty, lhs)];
+
+                // param_types[0] = i8* (task) for user fns, or first real param
+                // for intrinsics. Treat the same as free-function branch:
+                // first slot is always task unless no_task intrinsic.
+                let mut arg_pairs = Vec::new();
+                if !is_no_task_intrinsic(&id.name) {
+                    arg_pairs.push("i8* %task".to_string());
+                }
+                // The piped value is the first *user-visible* argument.
+                let first_user_ty = if is_no_task_intrinsic(&id.name) {
+                    param_types.get(0)
+                } else {
+                    param_types.get(1) // skip the task slot
+                }
+                .cloned()
+                .unwrap_or(lhs_ty);
+                arg_pairs.push(format!("{} {}", first_user_ty, lhs));
+
+                let offset = if is_no_task_intrinsic(&id.name) { 1 } else { 2 };
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
                     let t = param_types
-                        .get(i + 1)
+                        .get(i + offset)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
                     arg_pairs.push(format!("{} {}", t, v));
@@ -1259,8 +1409,11 @@ impl<'a> IrBuilder<'a> {
             } else {
                 ""
             };
+
             let mut arg_pairs = Vec::new();
-            arg_pairs.push("i8* %task".to_string());
+            if !is_no_task_intrinsic(&runtime_name) {
+                arg_pairs.push("i8* %task".to_string());
+            }
             for (i, arg) in args.iter().enumerate() {
                 let v = self.emit_expr(arg);
                 let t = param_types
@@ -2144,8 +2297,8 @@ impl<'a> IrBuilder<'a> {
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
-fn is_main(name: String) -> bool {
-    return name == "main".to_string() || name.ends_with("__main");
+fn is_main(name: &str) -> bool {
+    return name == "main" || name.ends_with("__main");
 }
 
 fn int_suffix_to_llvm(suffix: &str) -> &'static str {
@@ -2192,11 +2345,24 @@ fn enum_variant_payload_index(variant_name: &str) -> Option<usize> {
     }
 }
 
+fn is_no_task_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "ty_array_get_ptr" | "ty_yield" | "ty_chan_new" | "ty_chan_close" | "slab_arena_new"
+    )
+}
+
 fn runtime_intrinsic_name(name: &str) -> Option<String> {
     match name {
         "__ty_buf_new" => Some("ty_buf_new".to_string()),
         "__ty_buf_push_str" => Some("ty_buf_push_str".to_string()),
         "__ty_buf_into_str" => Some("ty_buf_into_str".to_string()),
+
+        // Scheduler builtins — surface name matches C symbol directly
+        "spawn" => Some("ty_spawn".to_string()),
+        "yield" => Some("ty_yield".to_string()),
+        "await" => Some("ty_await".to_string()),
+
         _ => None,
     }
 }

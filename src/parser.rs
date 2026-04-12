@@ -379,11 +379,32 @@ impl Parser {
     }
 
     fn equality(&mut self) -> Result<Expression, String> {
-        let mut expr = self.comparison()?;
+        let mut expr = self.bitwise()?;
         while let Some(op) = if self.match_token(TokenType::Equal) {
             Some(Operator::Eq)
         } else if self.match_token(TokenType::NotEqual) {
             Some(Operator::Ne)
+        } else {
+            None
+        } {
+            let right = self.comparison()?;
+            expr = self.make_expr(ExpressionKind::BinaryOp {
+                op,
+                left: Box::new(expr),
+                right: Box::new(right),
+            });
+        }
+        Ok(expr)
+    }
+
+    fn bitwise(&mut self) -> Result<Expression, String> {
+        let mut expr = self.comparison()?;
+        while let Some(op) = if self.match_token(TokenType::BitwiseAnd) {
+            Some(Operator::BitAnd)
+        } else if self.match_token(TokenType::BitwiseOr) {
+            Some(Operator::BitOr)
+        } else if self.match_token(TokenType::BitwiseXor) {
+            Some(Operator::BitXor)
         } else {
             None
         } {
@@ -894,6 +915,16 @@ impl Parser {
         if self.peek_token().token_type == TokenType::Identifier
             && self.peek_token().lexeme == "ref"
         {
+            self.advance_token();
+            let inner = self.parse_type()?;
+            return Ok(self.make_type(TypeKind {
+                name: "Ref".to_string(),
+                generic_args: vec![inner],
+            }));
+        }
+
+        // Handle `&T` reference syntax (BitwiseAnd token used as reference type prefix)
+        if self.peek_token().token_type == TokenType::BitwiseAnd {
             self.advance_token();
             let inner = self.parse_type()?;
             return Ok(self.make_type(TypeKind {

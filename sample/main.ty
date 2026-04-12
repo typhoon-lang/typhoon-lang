@@ -5,23 +5,20 @@ struct Popcount {
 }
 
 impl Popcount {
-  fn check(self, even: Int32) -> Bool {
+  fn check(self, even: Int32) -> Int32 {
+    let mut count = 0;
     for x in self.ar {
-      if even % x == 0 {
-        return true;
+      if (x & even) == x {
+        count = count + 1;
       }
     }
-    return false;
+    return count;
   }
 }
 
 fn main() -> Int32 {
   let p: Popcount = Popcount {
-    ar: [2, 4, 8, 16, 32],
+    ar: [1, 2, 4, 8, 16, 32],
   }
-  if p.check(5) {
-    return 0;
-  } else {
-    return 3;
-  }
+  return p.check(15);
 }

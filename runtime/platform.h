@@ -74,6 +74,7 @@ typedef pthread_mutex_t TyMutex;
 static inline void ty_mutex_init(TyMutex* m)    { pthread_mutex_init(m, NULL); }
 static inline void ty_mutex_lock(TyMutex* m)    { pthread_mutex_lock(m); }
 static inline void ty_mutex_unlock(TyMutex* m)  { pthread_mutex_unlock(m); }
+static inline void ty_mutex_destroy(TyMutex* m) { pthread_mutex_destroy(m); }
 
 /* ── coroutine context (inline asm, replaces ucontext) ──────
  *
@@ -245,6 +246,7 @@ typedef CRITICAL_SECTION TyMutex;
 static inline void ty_mutex_init(TyMutex* m)    { InitializeCriticalSection(m); }
 static inline void ty_mutex_lock(TyMutex* m)    { EnterCriticalSection(m); }
 static inline void ty_mutex_unlock(TyMutex* m)  { LeaveCriticalSection(m); }
+static inline void ty_mutex_destroy(TyMutex* m) { DeleteCriticalSection(m); }
 
 /* ── coroutine context (Windows Fibers) ──────────────────────────────────── */
 /*

@@ -199,29 +199,52 @@ impl<'a> IrBuilder<'a> {
 
         for decl in [
             // ── scheduler ──
-            "declare void @ty_sched_init()",
-            "declare void @ty_sched_shutdown()",
-            "declare i8* @ty_spawn(i8*, i8*, i8*)", // task, fn_ptr, arg
-            "declare void @ty_yield()",
-            "declare void @ty_await(i8*, i8*)", // task, coro_handle
-            "declare i8* @ty_chan_new(i64, i64)", // elem_size, cap
-            "declare void @ty_chan_send(i8*, i8*, i8*)", // task, chan, elem_ptr
-            "declare void @ty_chan_recv(i8*, i8*, i8*)", // task, chan, out_ptr
-            "declare i32 @ty_chan_try_recv(i8*, i8*, i8*)", // task, chan, out_ptr -> i32 (0/1)
-            "declare void @ty_chan_close(i8*)", // chan
+            "declare void @ty_sched_init     ()",
+            "declare void @ty_sched_shutdown ()",
+            "declare i8*  @ty_spawn          (i8*, i8*, i8*)", // task, fn_ptr, arg
+            "declare void @ty_yield          ()",
+            "declare void @ty_await          (i8*, i8*)", // task, coro_handle
+            "declare i8*  @ty_chan_new       (i64, i64)", // elem_size, cap
+            "declare void @ty_chan_send      (i8*, i8*, i8*)", // task, chan, elem_ptr
+            "declare void @ty_chan_recv      (i8*, i8*, i8*)", // task, chan, out_ptr
+            "declare i32  @ty_chan_try_recv  (i8*, i8*, i8*)", // task, chan, out_ptr -> i32 (0/1)
+            "declare void @ty_chan_close     (i8*)",      // chan
             // ── Buf (all now take task first) ──
-            "declare %struct.Buf* @ty_buf_new(i8* %task)",
-            "declare void @ty_buf_push_str(i8*, %struct.Buf*, i8*)",
-            "declare i8* @ty_buf_into_str(i8*, %struct.Buf*)",
+            "declare %struct.Buf* @ty_buf_new      (i8* %task)",
+            "declare void         @ty_buf_push_str (i8*, %struct.Buf*, i8*)",
+            "declare i8*          @ty_buf_into_str (i8*, %struct.Buf*)",
             // ── TyArray (all now take task first) ──
-            "declare %struct.TyArray* @ty_array_from_fixed(i8*, i8*, i64, i64, i64)",
-            "declare void @ty_array_push(i8*, %struct.TyArray*, i8*)",
-            "declare i8* @ty_array_get_ptr(%struct.TyArray*, i64)",
+            "declare %struct.TyArray* @ty_array_from_fixed (i8*, i8*, i64, i64, i64)",
+            "declare void             @ty_array_push       (i8*, %struct.TyArray*, i8*)",
+            "declare i8*              @ty_array_get_ptr    (%struct.TyArray*, i64)",
             // ── arena / slab ──
-            "declare i8* @slab_arena_new()",
-            "declare i8* @slab_alloc(i8* %task, i32 %size_class)",
-            "declare void @slab_free(i8* %task, i8* %ptr, i32 %size_class)",
-            "declare void @slab_arena_free(i8*)",
+            "declare i8*  @slab_arena_new  ()",
+            "declare i8*  @slab_alloc      (i8* %task, i32 %size_class)",
+            "declare void @slab_free       (i8* %task, i8* %ptr, i32 %size_class)",
+            "declare void @slab_arena_free (i8*)",
+            // ── I/O driver (file ops) ──────────────────────────────────────────────────
+            "declare void @ty_io_subsystem_init     ()",
+            "declare void @ty_io_subsystem_shutdown ()",
+            "declare i32  @ty_io_open               (i8* %driver, i8* %path, i32 %flags, i32 %mode)",
+            "declare void @ty_io_close              (i8* %driver, i32 %fd)",
+            // ── print family ──────────────────────────────────────────────────────────
+            "declare void @ty_print    (i8* %task, i8* %s)",
+            "declare void @ty_println  (i8* %task, i8* %s)",
+            // ty_printf is varargs — LLVM declares varargs with "..."
+            "declare void @ty_printf   (i8* %task, i8* %fmt, ...)",
+            "declare void @ty_fprint   (i8* %task, i32 %fd, i8* %s)",
+            "declare void @ty_fprintln (i8* %task, i32 %fd, i8* %s)",
+            "declare void @ty_fprintf  (i8* %task, i32 %fd, i8* %fmt, ...)",
+            "declare void @ty_sprint   (i8* %task, %struct.Buf* %out, i8* %s)",
+            "declare void @ty_sprintln (i8* %task, %struct.Buf* %out, i8* %s)",
+            "declare void @ty_sprintf  (i8* %task, %struct.Buf* %out, i8* %fmt, ...)",
+            // ── scan family ───────────────────────────────────────────────────────────
+            "declare i8*  @ty_scan     (i8* %task)",
+            "declare i32  @ty_scanf    (i8* %task, i8* %fmt, ...)",
+            "declare i8*  @ty_fscan    (i8* %task, i32 %fd)",
+            "declare i32  @ty_fscanf   (i8* %task, i32 %fd, i8* %fmt, ...)",
+            "declare i8*  @ty_sscan    (i8* %task, i8* %src, i8** %rest_out)",
+            "declare i32  @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)",
         ] {
             self.extra_preamble.push(decl.to_string());
         }
@@ -353,6 +376,7 @@ impl<'a> IrBuilder<'a> {
             self.emit("  %task_init = call i8* @slab_arena_new()".to_string());
             self.emit(format!("  store i8* %task_init, i8** {}", task_slot));
             self.emit("  call void @ty_sched_init()".to_string());
+            self.emit("  call void @ty_io_subsystem_init()".to_string());
             self.emit(format!("  %task = load i8*, i8** {}", task_slot));
         } else {
             self.emit_function_param("task".to_string(), "i8*".to_string());
@@ -440,6 +464,7 @@ impl<'a> IrBuilder<'a> {
                 let val = self.emit_expr(expr);
                 let ty = self.expr_llvm_type(expr);
                 if self.current_fn_name.as_deref().map_or(false, is_main) {
+                    self.emit("  call void @ty_io_subsystem_init()".to_string());
                     self.emit("  call void @ty_sched_shutdown()".to_string());
                 }
                 self.emit(format!("  ret {} {}", ty, val));
@@ -447,6 +472,7 @@ impl<'a> IrBuilder<'a> {
             }
             StatementKind::Return(None) => {
                 if self.current_fn_name.as_deref().map_or(false, is_main) {
+                    self.emit("  call void @ty_io_subsystem_init()".to_string());
                     self.emit("  call void @ty_sched_shutdown()".to_string());
                 }
                 self.emit("  ret void".to_string());
@@ -536,8 +562,16 @@ impl<'a> IrBuilder<'a> {
                     self.current_fn_name = saved_fn_name;
                     self.current_fn_ret_ty = saved_ret_ty;
 
-                    // Run synchronously in caller thread.
-                    self.emit(format!("  call void @{}(i8* %task, i8* null)", tramp_name));
+                    // Spawn task for this concurrent block.
+                    let fn_cast = self.tmp();
+                    self.emit(format!(
+                        "  {} = bitcast void(i8*, i8*)* @{} to i8*",
+                        fn_cast, tramp_name
+                    ));
+                    self.emit(format!(
+                        "  call i8* @ty_spawn(i8* %task, i8* {}, i8* null)",
+                        fn_cast
+                    ));
 
                     self.conc_functions.push(tramp_ir);
                 } else {
@@ -723,15 +757,15 @@ impl<'a> IrBuilder<'a> {
                     self.current_fn_name = saved_fn_name;
                     self.current_fn_ret_ty = saved_ret_ty;
 
-                    // ── 4. Run synchronously with closure pointer ──────────
+                    // ── 4. Spawn task with closure ─────────────────────────
+                    let fn_cast = self.tmp();
                     self.emit(format!(
-                        "  call void @{}(i8* %task, i8* {})",
-                        tramp_name, closure_raw
+                        "  {} = bitcast void(i8*, i8*)* @{} to i8*",
+                        fn_cast, tramp_name
                     ));
-                    // Free closure in same arena that allocated it (parent `%task`).
                     self.emit(format!(
-                        "  call void @slab_free(i8* %task, i8* {}, i32 {})",
-                        closure_raw, class_id
+                        "  call i8* @ty_spawn(i8* %task, i8* {}, i8* {})",
+                        fn_cast, closure_raw
                     ));
 
                     self.conc_functions.push(tramp_ir);
@@ -1801,11 +1835,19 @@ impl<'a> IrBuilder<'a> {
             }
             let runtime_name =
                 runtime_intrinsic_name(&id.name).unwrap_or_else(|| link_symbol_name(&id.name));
-            let (ret_ty, param_types) = self
+            let (ret_ty, mut param_types) = self
                 .func_sigs
                 .get(&id.name)
                 .cloned()
                 .unwrap_or_else(|| ("i32".to_string(), vec![]));
+
+            // Builtin printf/fprintf/sprintf funcs: first arg is format string (i8*)
+            if param_types.is_empty()
+                && matches!(id.name.as_str(), "printf" | "fprintf" | "sprintf")
+            {
+                param_types = vec!["i8*".to_string()];
+            }
+
             let tail = if self.current_fn_name.as_deref() == Some(id.name.as_str()) {
                 "tail "
             } else {
@@ -2747,7 +2789,7 @@ impl<'a> IrBuilder<'a> {
         };
         let tmp = self.tmp();
         self.emit(format!(
-            "  {} = getelementptr inbounds ([{} x i8], [{} x i8]* {}, i32 0, i32 0)",
+            "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i32 0, i32 0",
             tmp, n, n, global
         ));
         tmp
@@ -3027,6 +3069,23 @@ fn runtime_intrinsic_name(name: &str) -> Option<String> {
         "spawn" => Some("ty_spawn".to_string()),
         "yield" => Some("ty_yield".to_string()),
         "await" => Some("ty_await".to_string()),
+
+        // stdio
+        "print" => Some("ty_print".to_string()),
+        "println" => Some("ty_println".to_string()),
+        "printf" => Some("ty_printf".to_string()),
+        "fprint" => Some("ty_fprint".to_string()),
+        "fprintln" => Some("ty_fprintln".to_string()),
+        "fprintf" => Some("ty_fprintf".to_string()),
+        "sprint" => Some("ty_sprint".to_string()),
+        "sprintln" => Some("ty_sprintln".to_string()),
+        "sprintf" => Some("ty_sprintf".to_string()),
+        "scan" => Some("ty_scan".to_string()),
+        "scanf" => Some("ty_scanf".to_string()),
+        "fscan" => Some("ty_fscan".to_string()),
+        "fscanf" => Some("ty_fscanf".to_string()),
+        "sscan" => Some("ty_sscan".to_string()),
+        "sscanf" => Some("ty_sscanf".to_string()),
 
         _ => None,
     }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(GeneratedRunner C)
+project(Typhoon C)
 
 # Enable Assembly support
 enable_language(ASM)
@@ -8,9 +8,13 @@ add_library(runtime STATIC
     runtime/platform.h
     runtime/atomic.h
     runtime/scheduler.h
+    runtime/io_driver.h
+    runtime/ty_mem.h
     runtime/ty_ctx.S
+    runtime/io_driver.c
     runtime/scheduler.c
-    runtime/runtime.c)
+    runtime/ty_mem.c
+    runtime/ty_io.c)
 
 if(NOT APPLE)
     set_target_properties(runtime PROPERTIES LINK_FLAGS "-static")

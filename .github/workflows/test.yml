@@ -53,7 +53,7 @@ jobs:
       - name: Build library (Windows)
         if: runner.os == 'Windows'
         run: |
-            msbuild build\GeneratedRunner.sln -t:rebuild -verbosity:diag -property:Configuration=Debug
+            msbuild build\Typhoon.sln -t:rebuild -verbosity:diag -property:Configuration=Debug
 
       - name: Set up Clang
         if: runner.os != 'macOS'
@@ -72,5 +72,4 @@ jobs:
         run: |
           cargo run --verbose -- sample/main.ty main
           chmod +x ./main
-          ./main || status=$?
-          echo "Command exited with $status"
+          ./main

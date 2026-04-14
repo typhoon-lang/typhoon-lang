@@ -9,6 +9,7 @@ impl Popcount {
     let ch: ref chan<Int32> = chan<Int32>();
     for x in self.ar {
       conc {
+        printf("Try %d\r\n", x);
         let n = match (x & even) {
           x => 1
           _ => 0
@@ -33,5 +34,7 @@ fn main() -> Int32 {
   let p: Popcount = Popcount {
     ar: [1, 2, 4, 8, 16, 32],
   }
-  return p.check(15);
+  let n = p.check(15);
+  printf("Result: %d\r\n", n);
+  return 0;
 }

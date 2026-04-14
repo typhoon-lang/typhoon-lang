@@ -1,5 +1,5 @@
 /*
- * runtime.c — Typhoon language runtime
+ * ty_mem.c — Typhoon memory system
  *
  * Memory layout
  * ─────────────
@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "platform.h"
+#include "ty_mem.h"
 
 /* ── configuration ──────────────────────────────────────────────────────────── */
 
@@ -270,12 +271,6 @@ void slab_free(SlabArena* arena, void* ptr, int32_t size_class) {
 
 /* ── Buf ─────────────────────────────────────────────────────────────────────── */
 
-typedef struct Buf {
-    char*   data;
-    int64_t len;
-    int64_t cap;
-} Buf;
-
 static void ty_buf_grow(SlabArena* arena, Buf* b, int64_t extra) {
     if (!b) return;
     int64_t need = b->len + extra + 1;
@@ -322,14 +317,6 @@ char* ty_buf_into_str(SlabArena* arena, Buf* b) {
 }
 
 /* ── TyArray ─────────────────────────────────────────────────────────────────── */
-
-typedef struct TyArray {
-    void*   data;
-    int64_t len;
-    int64_t cap;
-    int64_t elem_size;
-    int64_t elem_align;
-} TyArray;
 
 TyArray* ty_array_from_fixed(SlabArena* arena, void* data,
                               int64_t len, int64_t elem_size, int64_t elem_align) {

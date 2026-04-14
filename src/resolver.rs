@@ -164,6 +164,17 @@ impl Resolver {
         }
     }
 
+    fn internal_name(&self, name: &str) -> bool {
+        let internal = [
+            // flow control
+            "break", "continue", // type
+            "Ok", "Err", "Some", "None", "chan", // stdio
+            "print", "println", "printf", "fprint", "fprintln", "fprintf", "sprint", "sprintln",
+            "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
+        ];
+        return internal.contains(&name);
+    }
+
     fn resolve_type(
         &self,
         scope: ScopeId,
@@ -362,9 +373,9 @@ impl Resolver {
         match &expr.node {
             ExpressionKind::Identifier(id) => {
                 // Allow built-in identifiers
-                match id.name.as_str() {
-                    "Ok" | "Err" | "Some" | "None" | "chan" | "break" | "continue" => Ok(()),
-                    _ => {
+                match self.internal_name(&id.name) {
+                    true => Ok(()),
+                    false => {
                         if self.lookup(scope, &id.name).is_none() {
                             Err(format!("Unresolved identifier '{}'", id.name))
                         } else {

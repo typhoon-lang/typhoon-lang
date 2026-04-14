@@ -182,14 +182,14 @@ A few catches / limitations right now:
 ## Phase 6: IO and Networking
 **Goal:** Working HTTP server with zero-copy parsing and capability model.
 
-- [ ] Implement IO Driver (Rust FFI Bridge)
-    - [ ] `io_uring` (Linux)
-    - [ ] `kqueue` (macOS)
-    - [ ] `IOCP` (Windows)
-    - [ ] Async-safe handles consumable per task (`Network` capability token)
-- [ ] Integration with Scheduler
-    - [ ] I/O operations transparently yield coroutines
-    - [ ] Polling driver uses scheduler waitlists for read/write readiness
+- [x] Implement IO Driver
+    - [x] `io_uring` (Linux)
+    - [x] `kqueue` (macOS)
+    - [x] `IOCP` (Windows)
+    - [x] Async-safe handles consumable per task (`Network` capability token)
+- [x] Integration with Scheduler
+    - [x] I/O operations transparently yield coroutines
+    - [x] Polling driver uses scheduler waitlists for read/write readiness
 - [ ] Capability Model
     - [ ] Generate `Network` token at `main` entry point
     - [ ] Enforce token linearity during `net.listen` / `net.accept`
@@ -197,8 +197,8 @@ A few catches / limitations right now:
     - [ ] `LinearSocket` with single-owner semantics
     - [ ] Zero-copy HTTP/1.1 resumable parser (`StrView` pointers into slab)
     - [ ] Header linear scan
-    - [ ] TLS handshake offloaded to Rust or OS primitives (optional phase)
     - [ ] Back-pressure via channel-based request queue
+    - [ ] TLS handshake offloaded to C or OS primitives (optional phase)
 - [ ] **Milestone:** HTTP server handles 10,000 concurrent connections. Benchmarked against Go and Rust.
 
 ## Phase 7: Standard Library

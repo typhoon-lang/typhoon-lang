@@ -18,12 +18,8 @@
 #include "scheduler.h"
 #include "platform.h"
 #include "atomic.h"
+#include "ty_mem.h"
 #include <string.h>
-
-/* ── forward declarations ────────────────────────────────────────────────── */
-
-struct SlabArena* slab_arena_new(void);
-void              slab_arena_free(struct SlabArena*);
 
 /* ── configuration ───────────────────────────────────────────────────────── */
 
@@ -315,6 +311,7 @@ void ty_sched_init(void) {
 
     ty_preempt_install(preempt_tick, SIGPROF_HZ);
 
+    // main thread
     workers[0].id = 0;
     deque_init(&workers[0].deque);
     atomic_init(&workers[0].preempt_flag, 0);
@@ -609,3 +606,41 @@ void ty_chan_close(TyChan* ch) {
         r = next;
     }
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Additions required inside scheduler.c
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Paste the following five functions anywhere in the "public API" section of
+ * scheduler.c (after the existing sched_enqueue / worker definitions):
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+
+ // 1. Block current coroutine and swap to scheduler
+ void ty_coro_block_and_yield(void) {
+     Worker* w  = current_worker();
+     TyCoro* me = w ? w->current : NULL;
+     if (!me) return;
+     atomic_store_explicit(&me->state, CORO_BLOCKED, memory_order_release);
+     ty_ctx_swap(&me->ctx, &w->sched_ctx);
+ }
+
+ // 2. Thread-safe enqueue onto worker[0] from external thread
+ void sched_enqueue_from_external(void* co) {
+     TyCoro* coro = (TyCoro*)co;
+     atomic_store_explicit(&coro->state, CORO_RUNNABLE, memory_order_release);
+     deque_push(&workers[0].deque, coro);
+ }
+
+ // 3. Expose current coro pointer (void* for ABI isolation)
+ void* ty_current_coro_raw(void) {
+     return (void*)current_coro();
+ }
+
+ // 4. Expose current worker pointer (used by scheduler_io_glue.c)
+ Worker* ty_current_worker_ptr(void) {
+     return current_worker();
+ }
+
+ // ty_current_arena() is already defined in scheduler.c

@@ -474,25 +474,23 @@ impl TypeChecker {
         let ty = match &expr.node {
             ExpressionKind::Literal(lit) => self.literal_type(lit, expr.span)?,
             ExpressionKind::Identifier(id) => {
-                match id.name.as_str() {
-                    "chan" => {
-                        // chan has a generic return type that depends on context
-                        InferType::Con("Chan".into())
-                    }
-                    "break" | "continue" => {
-                        // break and continue are control flow; treat as Unit
-                        InferType::Con("Unit".into())
-                    }
-                    _ => {
-                        let scheme = self.lookup(&id.name).cloned().ok_or_else(|| {
-                            TypeError::UnknownIdentifier {
-                                name: id.name.clone(),
-                                span: Some(id.span),
-                            }
-                        })?;
-                        self.instantiate(&scheme)
-                    }
+                if id.name.as_str() == "chan" {
+                    // chan has a generic return type that depends on context
+                    return Ok(InferType::Con("Chan".into()));
                 }
+
+                if self.try_inner_func(id.name.clone()) {
+                    return Ok(InferType::Con("Unit".into()));
+                }
+
+                return self
+                    .lookup(&id.name)
+                    .cloned()
+                    .ok_or_else(|| TypeError::UnknownIdentifier {
+                        name: id.name.clone(),
+                        span: Some(id.span),
+                    })
+                    .map(|s| self.instantiate(&s));
             }
             ExpressionKind::UnaryOp { op, expr: inner } => {
                 let ty = self.infer_expression(inner)?;
@@ -624,6 +622,15 @@ impl TypeChecker {
                         ret
                     }
                 } else {
+                    // Check if func is a builtin function (printf, print, etc.)
+                    if let ExpressionKind::Identifier(id) = &func.node {
+                        if self.try_inner_func(id.name.clone()) {
+                            for arg in args {
+                                let _ = self.infer_expression(arg)?;
+                            }
+                            return Ok(InferType::Con("Unit".into()));
+                        }
+                    }
                     let callee = self.infer_expression(func)?;
                     let mut arg_tys = Vec::new();
                     for arg in args {
@@ -898,6 +905,16 @@ impl TypeChecker {
             }
             _ => None,
         }
+    }
+
+    fn try_inner_func(&self, ty: String) -> bool {
+        let internal = [
+            // flow control
+            "break", "continue", // stdio
+            "print", "println", "printf", "fprint", "fprintln", "fprintf", "sprint", "sprintln",
+            "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
+        ];
+        return internal.contains(&ty.as_str());
     }
 
     fn array_elem_type(&self, ty: &InferType) -> Option<InferType> {

@@ -56,6 +56,15 @@ void ty_await(struct SlabArena* arena, TyCoro* coro);
 /* Exit the current coroutine. Called automatically at function return. */
 void ty_coro_exit(void);
 
+// Block current coroutine; swap back to scheduler.
+void ty_coro_block_and_yield(void);
+
+// Thread-safe enqueue from the I/O poll thread.
+void sched_enqueue_from_external(void* co);
+
+// Expose current coro pointer as void* (ABI boundary).
+void* ty_current_coro_raw(void);
+
 /* Return the SlabArena owned by the currently running coroutine.
  * Used by emitted IR to get the task pointer without a parameter. */
 struct SlabArena* ty_current_arena(void);

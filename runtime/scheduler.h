@@ -20,6 +20,7 @@
 #include "platform.h"
 #include "atomic.h"
 #include "ty_mem.h"
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -120,6 +121,11 @@ struct TyChan {
  * Launches (nproc - 1) background worker threads. */
 void ty_sched_init(void);
 
+/* Drive the scheduler on worker 0 until all coroutines finish.
+ * Does not initiate shutdown; intended for normal "run main to completion"
+ * execution. Call ty_sched_shutdown() afterwards to stop workers. */
+void ty_sched_run(void);
+
 /* Call at end of main() to drain all coroutines and shut down workers. */
 void ty_sched_shutdown(void);
 
@@ -167,8 +173,9 @@ void ty_chan_send(SlabArena* arena, struct TyChan* chan, void* elem);
  * Blocks (cooperative) if the channel is empty. */
 void ty_chan_recv(SlabArena* arena, struct TyChan* chan, void* out);
 
-/* Try receive into `out`. Returns 1 if received, 0 if no value available.
- * Never blocks. */
+/* Try receive into `out`.
+ * Returns 1 if received, 0 if currently empty, -1 if closed and drained.
+ * The compiler may choose to poll/yield on 0 when lowering Option<T>. */
 int ty_chan_try_recv(SlabArena* arena, struct TyChan* chan, void* out);
 
 /* Close a channel; receivers drain remaining items then get zeroed values. */

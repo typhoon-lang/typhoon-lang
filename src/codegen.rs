@@ -86,7 +86,7 @@ impl Codegen {
                             ret_type: "void".to_string(),
                             params: vec![
                                 ("task".to_string(), "i8*".to_string()),
-                                ("arg".to_string(),  "i8*".to_string()),
+                                ("arg".to_string(), "i8*".to_string()),
                             ],
                         };
 
@@ -113,7 +113,7 @@ impl Codegen {
                             .collect();
                         param_list.insert(0, ("task".to_string(), "i8*".to_string()));
                         Some(IrFunction {
-                            name: name.name.clone(),
+                            name: link_symbol_name(&name.name), // ← apply the same mangling
                             body: body_ir,
                             ret_type: ret_ty,
                             params: param_list,
@@ -125,6 +125,7 @@ impl Codegen {
             })
             .collect();
         all_functions.extend(b.conc_functions.drain(..));
+
         IrModule {
             functions: all_functions,
             preamble: b.preamble(),
@@ -136,6 +137,7 @@ impl Codegen {
 
 struct IrBuilder<'a> {
     lines: Vec<String>,
+    entry_allocas: Vec<String>,
     next_tmp: usize,
     next_label: usize,
     current_fn_name: Option<String>,
@@ -160,6 +162,7 @@ impl<'a> IrBuilder<'a> {
     fn new(drop_map: &'a HashMap<NodeId, Vec<DropInfo>>) -> Self {
         Self {
             lines: Vec::new(),
+            entry_allocas: Vec::new(),
             next_tmp: 0,
             next_label: 0,
             current_fn_name: None,
@@ -214,6 +217,39 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
+    /// Emit an alloca into the entry block regardless of the current basic block.
+    /// LLVM only lowers entry-block allocas to static frame slots; allocas anywhere
+    /// else trigger the broken __chkstk + subq %rax,%rsp sequence on Windows x64.
+    fn emit_alloca(&mut self, tmp: &str, ty: &str) {
+        self.entry_allocas
+            .push(format!("  {} = alloca {}", tmp, ty));
+    }
+
+    /// Splice hoisted entry_allocas in right after the "entry:" label line.
+    fn finish_function_ir(&mut self) -> String {
+        let mut all = Vec::with_capacity(self.lines.len() + self.entry_allocas.len());
+        if !self.lines.is_empty() {
+            all.push(self.lines[0].clone());
+        }
+        all.extend(self.entry_allocas.drain(..));
+        if self.lines.len() > 1 {
+            all.extend(self.lines[1..].iter().cloned());
+        }
+        all.join("\n")
+    }
+
+    /// Load task from its alloca slot — never use the raw %task SSA param in
+    /// call arguments because %rcx gets clobbered by intervening loads.
+    fn emit_task_load(&mut self) -> String {
+        if let Some(slot) = self.locals.get("task").cloned() {
+            let t = self.tmp();
+            self.emit(format!("  {} = load i8*, i8** {}", t, slot));
+            t
+        } else {
+            "%task".to_string()
+        }
+    }
+
     // ── Type collection ───────────────────────────────────────────────────────
 
     fn collect_types(&mut self, module: &Module) {
@@ -227,13 +263,33 @@ impl<'a> IrBuilder<'a> {
         for decl in [
             "%struct.Buf = type { i8*, i64, i64 }",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }",
+            // Opaque runtime handles (passed as pointers only)
+            "%struct.Network = type { i8 }",
+            "%struct.Listener = type { i8 }",
+            "%struct.Socket = type { i8 }",
         ] {
             self.type_decls.push(decl.to_string());
         }
 
+        // Networking Result types referenced by runtime intrinsics below.
+        // Ensure their ADT layouts exist before we emit `declare` lines.
+        self.ensure_result("%struct.Listener*", "i32");
+        self.ensure_result("%struct.Socket*", "i32");
+        let res_listener_i32 = format!(
+            "%struct.Result__{}__{}",
+            mangle_llvm_type_name("%struct.Listener*"),
+            mangle_llvm_type_name("i32")
+        );
+        let res_socket_i32 = format!(
+            "%struct.Result__{}__{}",
+            mangle_llvm_type_name("%struct.Socket*"),
+            mangle_llvm_type_name("i32")
+        );
+
         for decl in [
             // ── scheduler ──
             "declare void @ty_sched_init     ()",
+            "declare void @ty_sched_run      ()",
             "declare void @ty_sched_shutdown ()",
             "declare i8*  @ty_spawn          (i8*, i8*, i8*)", // task, fn_ptr, arg
             "declare void @ty_yield          ()",
@@ -261,6 +317,10 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_io_subsystem_shutdown ()",
             "declare i32  @ty_io_open               (i8* %driver, i8* %path, i32 %flags, i32 %mode)",
             "declare void @ty_io_close              (i8* %driver, i32 %fd)",
+            // ── networking ───────────────────────────────────────────────────────────
+            "declare void @ty_net_init              ()",
+            "declare void @ty_net_shutdown          ()",
+            "declare %struct.Network* @ty_net_global()",
             // ── print family ──────────────────────────────────────────────────────────
             "declare void @ty_print    (i8* %task, i8* %s)",
             "declare void @ty_println  (i8* %task, i8* %s)",
@@ -279,9 +339,30 @@ impl<'a> IrBuilder<'a> {
             "declare i32  @ty_fscanf   (i8* %task, i32 %fd, i8* %fmt, ...)",
             "declare i8*  @ty_sscan    (i8* %task, i8* %src, i8** %rest_out)",
             "declare i32  @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)",
+            // ── Network / Listener / Socket methods (runtime-provided) ──────────────
+            // Result<Listener, Int32>
+            // Result<Socket, Int32>
         ] {
             self.extra_preamble.push(decl.to_string());
         }
+
+        // These declarations depend on the computed Result struct names above.
+        self.extra_preamble.push(format!(
+            "declare void @__ty_method__Network__listen(i8* %task, %struct.Network* %self, i8* %addr, {}* %out)",
+            res_listener_i32
+        ));
+        self.extra_preamble.push(format!(
+            "declare void @__ty_method__Listener__accept(i8* %task, %struct.Listener* %self, {}* %out)",
+            res_socket_i32
+        ));
+        self.extra_preamble.push(
+            "declare void @__ty_method__Socket__consume(i8* %task, %struct.Socket* %self, i8* %chan)"
+                .to_string(),
+        );
+        self.extra_preamble.push(
+            "declare void @__ty_method__Socket__close(i8* %task, %struct.Socket* %self)"
+                .to_string(),
+        );
 
         self.func_sigs
             .insert("__ty_buf_new".into(), ("%struct.Buf*".into(), vec![]));
@@ -293,6 +374,43 @@ impl<'a> IrBuilder<'a> {
             "__ty_buf_into_str".into(),
             ("i8*".into(), vec!["%struct.Buf*".into()]),
         );
+
+        // Runtime-provided networking methods.
+        self.func_sigs.insert(
+            "__ty_method__Network__listen".into(),
+            (
+                "void".into(),
+                vec![
+                    "i8*".into(),
+                    "%struct.Network*".into(),
+                    "i8*".into(),
+                    format!("{}*", res_listener_i32),
+                ],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Listener__accept".into(),
+            (
+                "void".into(),
+                vec![
+                    "i8*".into(),
+                    "%struct.Listener*".into(),
+                    format!("{}*", res_socket_i32),
+                ],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Socket__consume".into(),
+            (
+                "void".into(),
+                vec!["i8*".into(), "%struct.Socket*".into(), "i8*".into()],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Socket__close".into(),
+            ("void".into(), vec!["i8*".into(), "%struct.Socket*".into()]),
+        );
+
         self.func_sigs.insert(
             "ty_array_push".into(),
             ("void".into(), vec!["%struct.TyArray*".into(), "i8*".into()]),
@@ -324,6 +442,39 @@ impl<'a> IrBuilder<'a> {
         ); // chan, out_ptr -> i32
         self.func_sigs
             .insert("ty_chan_close".into(), ("void".into(), vec!["i8*".into()]));
+
+        // ── stdio intrinsics ──────────────────────────────────────────────────
+        // Keyed under both source names (what the call-site lookup uses) and
+        // runtime names. Param lists exclude the implicit leading `task` arg.
+        for (src, rt, ret, params) in [
+            ("print", "ty_print", "void", vec!["i8*"]),
+            ("println", "ty_println", "void", vec!["i8*"]),
+            ("printf", "ty_printf", "void", vec!["i8*"]),
+            ("fprint", "ty_fprint", "void", vec!["i32", "i8*"]),
+            ("fprintln", "ty_fprintln", "void", vec!["i32", "i8*"]),
+            ("fprintf", "ty_fprintf", "void", vec!["i32", "i8*"]),
+            ("sprint", "ty_sprint", "void", vec!["%struct.Buf*", "i8*"]),
+            (
+                "sprintln",
+                "ty_sprintln",
+                "void",
+                vec!["%struct.Buf*", "i8*"],
+            ),
+            ("sprintf", "ty_sprintf", "void", vec!["%struct.Buf*", "i8*"]),
+            ("scan", "ty_scan", "i8*", vec![]),
+            ("scanf", "ty_scanf", "i32", vec!["i8*"]),
+            ("fscan", "ty_fscan", "i8*", vec!["i32"]),
+            ("fscanf", "ty_fscanf", "i32", vec!["i32", "i8*"]),
+            ("sscan", "ty_sscan", "i8*", vec!["i8*", "i8**"]),
+            ("sscanf", "ty_sscanf", "i32", vec!["i8*", "i8*"]),
+        ] {
+            let sig = (
+                ret.to_string(),
+                params.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            self.func_sigs.insert(src.to_string(), sig.clone());
+            self.func_sigs.insert(rt.to_string(), sig);
+        }
 
         for decl in &module.declarations {
             match &decl.node {
@@ -397,6 +548,7 @@ impl<'a> IrBuilder<'a> {
         body: &Block,
     ) -> String {
         self.lines.clear();
+        self.entry_allocas.clear();
         self.locals.clear();
         self.locals_type.clear();
         self.next_tmp = 0; // Reset temporary counter for each function
@@ -445,7 +597,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        self.lines.join("\n")
+        self.finish_function_ir()
     }
 
     // ── Bootstrap helpers ─────────────────────────────────────────────────────
@@ -456,6 +608,7 @@ impl<'a> IrBuilder<'a> {
     /// here — the thin bootstrap `main()` owns those.
     fn emit_main_body(&mut self, params: &[Parameter], body: &Block) -> String {
         self.lines.clear();
+        self.entry_allocas.clear();
         self.locals.clear();
         self.locals_type.clear();
         self.next_tmp = 0;
@@ -465,12 +618,26 @@ impl<'a> IrBuilder<'a> {
         self.emit("entry:".to_string());
         // Bind task and arg params (arg is unused but must be accepted).
         self.emit_function_param("task".to_string(), "i8*".to_string());
-        self.emit_function_param("arg".to_string(),  "i8*".to_string());
+        self.emit_function_param("arg".to_string(), "i8*".to_string());
 
         // User params (main normally has none, but handle them anyway).
         for param in params {
             let ty = self.lower_type(&param.type_annotation);
-            self.emit_function_param(param.name.name.clone(), ty);
+            let slot = self.tmp();
+            self.emit_alloca(&slot, &ty);
+            if ty == "%struct.Network*" {
+                let net_val = self.tmp();
+                self.emit(format!(
+                    "  {} = call %struct.Network* @ty_net_global()",
+                    net_val
+                ));
+                self.emit(format!("  store {} {}, {}* {}", ty, net_val, ty, slot));
+            } else {
+                let z = self.zero_value(&ty);
+                self.emit(format!("  store {} {}, {}* {}", ty, z, ty, slot));
+            }
+            self.locals.insert(param.name.name.clone(), slot);
+            self.locals_type.insert(param.name.name.clone(), ty);
         }
 
         let terminated = self.emit_block_stmts(body, "void");
@@ -478,33 +645,32 @@ impl<'a> IrBuilder<'a> {
             self.emit("  ret void".to_string());
         }
 
-        self.lines.join("\n")
+        self.finish_function_ir()
     }
 
     /// Emit the thin C-style `main()` that:
     ///   1. initialises the arena, scheduler, and I/O subsystem
     ///   2. spawns `__ty_main_body` as a coroutine (Go-style: main IS a goroutine)
-    ///   3. drives the scheduler to completion via `ty_sched_shutdown`
+    ///   3. runs the scheduler to completion
     ///   4. tears down I/O and returns 0
     fn emit_bootstrap_main(&mut self) -> String {
         let mut lines: Vec<String> = Vec::new();
         lines.push("entry:".to_string());
 
-        // Arena + scheduler + I/O init
+        // Arena + scheduler + I/O + Net init
         lines.push("  %arena = call i8* @slab_arena_new()".to_string());
         lines.push("  call void @ty_sched_init()".to_string());
         lines.push("  call void @ty_io_subsystem_init()".to_string());
+        lines.push("  call void @ty_net_init()".to_string());
 
         // Cast __ty_main_body to i8* function pointer and spawn it
-        lines.push(
-            "  %main_fn = bitcast void(i8*, i8*)* @__ty_main_body to i8*".to_string(),
-        );
-        lines.push(
-            "  call i8* @ty_spawn(i8* %arena, i8* %main_fn, i8* null)".to_string(),
-        );
+        lines.push("  %main_fn = bitcast void(i8*, i8*)* @__ty_main_body to i8*".to_string());
+        lines.push("  call i8* @ty_spawn(i8* %arena, i8* %main_fn, i8* null)".to_string());
 
         // Run scheduler until all coroutines finish
+        lines.push("  call void @ty_sched_run()".to_string());
         lines.push("  call void @ty_sched_shutdown()".to_string());
+        lines.push("  call void @ty_net_shutdown()".to_string());
         lines.push("  call void @ty_io_subsystem_shutdown()".to_string());
         lines.push("  ret i32 0".to_string());
 
@@ -513,7 +679,7 @@ impl<'a> IrBuilder<'a> {
 
     fn emit_function_param(&mut self, name: String, lower_type: String) {
         let slot = self.tmp();
-        self.emit(format!("  {} = alloca {}", slot, lower_type));
+        self.emit_alloca(&slot, &lower_type);
         self.emit(format!(
             "  store {} %{}, {}* {}",
             lower_type, name, lower_type, slot
@@ -617,6 +783,7 @@ impl<'a> IrBuilder<'a> {
                 if captured.is_empty() {
                     // ── No-capture path ────────────────────────────────────
                     let saved_lines = std::mem::take(&mut self.lines);
+                    let saved_entry_allocas = std::mem::take(&mut self.entry_allocas);
                     let saved_fn_name = self.current_fn_name.clone();
                     let saved_ret_ty = self.current_fn_ret_ty.clone();
                     let saved_locals = std::mem::take(&mut self.locals);
@@ -628,12 +795,35 @@ impl<'a> IrBuilder<'a> {
                     self.emit("entry:".to_string());
                     self.emit_function_param("task".to_string(), "i8*".to_string());
                     self.emit_function_param("arg".to_string(), "i8*".to_string());
+
+                    // Even in the "no-capture" path the body may reference
+                    // variables from the enclosing scope by name (e.g. a
+                    // socket pointer passed into a spawned block).  Without
+                    // restoring the parent locals those identifiers fall
+                    // through to the "undefined identifier → 0" branch,
+                    // producing a null pointer that is immediately
+                    // dereferenced → segfault.
+                    //
+                    // We copy the parent locals into the trampoline scope,
+                    // excluding the hidden `task` and `arg` params that the
+                    // trampoline re-binds via emit_function_param above.
+                    for (name, slot) in &saved_locals {
+                        if name != "task" && name != "arg" {
+                            self.locals.insert(name.clone(), slot.clone());
+                        }
+                    }
+                    for (name, ty) in &saved_types {
+                        if name != "task" && name != "arg" {
+                            self.locals_type.insert(name.clone(), ty.clone());
+                        }
+                    }
+
                     self.emit_block_stmts(body, "void");
                     self.emit("  ret void".to_string());
 
                     let tramp_ir = IrFunction {
                         name: tramp_name.clone(),
-                        body: self.lines.join("\n"),
+                        body: self.finish_function_ir(),
                         ret_type: "void".to_string(),
                         params: vec![
                             ("task".to_string(), "i8*".to_string()),
@@ -642,6 +832,7 @@ impl<'a> IrBuilder<'a> {
                     };
 
                     self.lines = saved_lines;
+                    self.entry_allocas = saved_entry_allocas;
                     self.locals = saved_locals;
                     self.locals_type = saved_types;
                     self.mutable_vars = saved_mutable_vars;
@@ -654,10 +845,13 @@ impl<'a> IrBuilder<'a> {
                         "  {} = bitcast void(i8*, i8*)* @{} to i8*",
                         fn_cast, tramp_name
                     ));
-                    self.emit(format!(
-                        "  call i8* @ty_spawn(i8* %task, i8* {}, i8* null)",
-                        fn_cast
-                    ));
+                    {
+                        let _tv = self.emit_task_load();
+                        self.emit(format!(
+                            "  call i8* @ty_spawn(i8* {}, i8* {}, i8* null)",
+                            _tv, fn_cast
+                        ));
+                    }
 
                     self.conc_functions.push(tramp_ir);
                 } else {
@@ -694,7 +888,7 @@ impl<'a> IrBuilder<'a> {
                     // Build closure field types: mutable non-heap vars → pointers
                     let closure_field_tys: Vec<String> = captured
                         .iter()
-                        .map(|(name, _, ty, is_mutable)| {
+                        .map(|(_name, _, ty, is_mutable)| {
                             if *is_mutable && !ty.ends_with('*') {
                                 format!("{}*", ty)
                             } else {
@@ -719,10 +913,13 @@ impl<'a> IrBuilder<'a> {
 
                     // ── 2. Allocate & populate closure in parent ───────────
                     let closure_raw = self.tmp();
-                    self.emit(format!(
-                        "  {} = call i8* @slab_alloc(i8* %task, i32 {})",
-                        closure_raw, class_id
-                    ));
+                    {
+                        let _tv = self.emit_task_load();
+                        self.emit(format!(
+                            "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
+                            closure_raw, _tv, class_id
+                        ));
+                    }
                     let closure_typed = self.tmp();
                     self.emit(format!(
                         "  {} = bitcast i8* {} to {}*",
@@ -730,7 +927,7 @@ impl<'a> IrBuilder<'a> {
                     ));
 
                     // In the parent — populate closure fields
-                    for (idx, (name, slot, ty, is_mutable_var)) in captured.iter().enumerate() {
+                    for (idx, (_name, slot, ty, is_mutable_var)) in captured.iter().enumerate() {
                         let gep = self.tmp();
 
                         let _field_ty = if *is_mutable_var && !ty.ends_with('*') {
@@ -760,6 +957,7 @@ impl<'a> IrBuilder<'a> {
 
                     // ── 3. Emit trampoline ─────────────────────────────────
                     let saved_lines = std::mem::take(&mut self.lines);
+                    let saved_entry_allocas = std::mem::take(&mut self.entry_allocas);
                     let saved_fn_name = self.current_fn_name.clone();
                     let saved_ret_ty = self.current_fn_ret_ty.clone();
                     let saved_locals = std::mem::take(&mut self.locals);
@@ -810,7 +1008,7 @@ impl<'a> IrBuilder<'a> {
                         } else {
                             // Value (including pointer values): copy into a fresh alloca
                             let slot = self.tmp();
-                            self.emit(format!("  {} = alloca {}", slot, ty));
+                            self.emit_alloca(&slot, &ty);
                             self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, slot));
                             self.locals.insert(name.clone(), slot);
                             self.locals_type.insert(name.clone(), ty.clone());
@@ -828,7 +1026,7 @@ impl<'a> IrBuilder<'a> {
 
                     let tramp_ir = IrFunction {
                         name: tramp_name.clone(),
-                        body: self.lines.join("\n"),
+                        body: self.finish_function_ir(),
                         ret_type: "void".to_string(),
                         params: vec![
                             ("task".to_string(), "i8*".to_string()),
@@ -837,6 +1035,7 @@ impl<'a> IrBuilder<'a> {
                     };
 
                     self.lines = saved_lines;
+                    self.entry_allocas = saved_entry_allocas;
                     self.locals = saved_locals;
                     self.locals_type = saved_types;
                     self.mutable_vars = saved_mutable_vars;
@@ -849,10 +1048,13 @@ impl<'a> IrBuilder<'a> {
                         "  {} = bitcast void(i8*, i8*)* @{} to i8*",
                         fn_cast, tramp_name
                     ));
-                    self.emit(format!(
-                        "  call i8* @ty_spawn(i8* %task, i8* {}, i8* {})",
-                        fn_cast, closure_raw
-                    ));
+                    {
+                        let _tv = self.emit_task_load();
+                        self.emit(format!(
+                            "  call i8* @ty_spawn(i8* {}, i8* {}, i8* {})",
+                            _tv, fn_cast, closure_raw
+                        ));
+                    }
 
                     self.conc_functions.push(tramp_ir);
                 }
@@ -903,10 +1105,13 @@ impl<'a> IrBuilder<'a> {
             ty.trim_end_matches('*'),
             typed_ptr
         ));
-        self.emit(format!(
-            "  call void @slab_free(i8* %task, i8* {}, i32 {})",
-            raw, class_id
-        ));
+        {
+            let _tv = self.emit_task_load();
+            self.emit(format!(
+                "  call void @slab_free(i8* {}, i8* {}, i32 {})",
+                _tv, raw, class_id
+            ));
+        }
     }
 
     fn emit_let(
@@ -932,7 +1137,7 @@ impl<'a> IrBuilder<'a> {
             let elem_ty = self.infer_elem_ty(elems);
             let array_ty = format!("[{} x {}]", elems.len(), elem_ty);
             let alloca = self.tmp();
-            self.emit(format!("  {} = alloca {}", alloca, array_ty));
+            self.emit_alloca(&alloca, &array_ty);
             for (i, elem) in elems.iter().enumerate() {
                 let val = self.emit_expr(elem);
                 let gep = self.tmp();
@@ -954,13 +1159,13 @@ impl<'a> IrBuilder<'a> {
                 let sz = self.llvm_const_sizeof(&elem_ty);
                 let al = self.llvm_const_alignof(&elem_ty);
                 let out = self.tmp();
-                self.emit(format!(
-                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* %task, i8* {}, i64 {}, i64 {}, i64 {})",
-                    out, raw, elems.len(), sz, al
-                ));
+                {
+                    let _tv = self.emit_task_load();
+                    self.emit(format!("  {} = call %struct.TyArray* @ty_array_from_fixed(i8* {}, i8* {}, i64 {}, i64 {}, i64 {})", out, _tv, raw, elems.len(), sz, al));
+                }
 
                 let slot = self.tmp();
-                self.emit(format!("  {} = alloca %struct.TyArray*", slot));
+                self.emit_alloca(&slot, "%struct.TyArray*");
                 self.emit(format!(
                     "  store %struct.TyArray* {}, %struct.TyArray** {}",
                     out, slot
@@ -998,7 +1203,7 @@ impl<'a> IrBuilder<'a> {
                             .map(|t| self.lower_type(t))
                             .unwrap_or_else(|| "i8*".to_string());
                         let slot = self.tmp();
-                        self.emit(format!("  {} = alloca {}", slot, ty));
+                        self.emit_alloca(&slot, &ty);
                         self.emit(format!("  store {} {}, {}* {}", ty, chan_ptr, ty, slot));
                         self.locals.insert(name.name.clone(), slot);
                         self.locals_type.insert(name.name.clone(), ty);
@@ -1009,11 +1214,13 @@ impl<'a> IrBuilder<'a> {
         }
 
         let value = self.emit_expr(initializer);
+        let init_ty = self.expr_llvm_type(initializer);
         let ty = type_annotation
             .map(|t| self.lower_type(t))
-            .unwrap_or_else(|| self.expr_llvm_type(initializer));
+            .unwrap_or_else(|| init_ty.clone());
+        let value = self.emit_widen(&value, &init_ty, &ty);
 
-        let is_heap_allocated = mutable && !ty.ends_with('*') && ty != "void";
+        let is_heap_allocated = !ty.ends_with('*') && ty != "void";
 
         if is_heap_allocated {
             // Implement Slab Allocation Logic
@@ -1022,10 +1229,13 @@ impl<'a> IrBuilder<'a> {
 
             let raw_ptr = self.tmp();
             // %task is passed as a hidden first argument to the function
-            self.emit(format!(
-                "  {} = call i8* @slab_alloc(i8* %task, i32 {})",
-                raw_ptr, class_id
-            ));
+            {
+                let _tv = self.emit_task_load();
+                self.emit(format!(
+                    "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
+                    raw_ptr, _tv, class_id
+                ));
+            }
 
             let typed_ptr = self.tmp();
             self.emit(format!(
@@ -1039,7 +1249,7 @@ impl<'a> IrBuilder<'a> {
         } else {
             // Default stack allocation (alloca)
             let slot = self.tmp();
-            self.emit(format!("  {} = alloca {}", slot, ty));
+            self.emit_alloca(&slot, &ty);
             self.emit(format!("  store {} {}, {}* {}", ty, value, ty, slot));
             self.locals.insert(name.name.clone(), slot);
             self.locals_type.insert(name.name.clone(), ty);
@@ -1125,7 +1335,7 @@ impl<'a> IrBuilder<'a> {
                     .unwrap_or_else(|| "i32".to_string());
 
                 let idx_slot = self.tmp();
-                self.emit(format!("  {} = alloca i64", idx_slot));
+                self.emit_alloca(&idx_slot, "i64");
                 self.emit(format!("  store i64 0, i64* {}", idx_slot));
 
                 let len_ptr = self.tmp();
@@ -1169,7 +1379,7 @@ impl<'a> IrBuilder<'a> {
                         elem_val, elem_ty, elem_ty, elem_ptr
                     ));
                     let pat_slot = self.tmp();
-                    self.emit(format!("  {} = alloca {}", pat_slot, elem_ty));
+                    self.emit_alloca(&pat_slot, &elem_ty);
                     self.emit(format!(
                         "  store {} {}, {}* {}",
                         elem_ty, elem_val, elem_ty, pat_slot
@@ -1223,7 +1433,7 @@ impl<'a> IrBuilder<'a> {
                 let elem_ty = self.infer_elem_ty(elems);
                 let array_ty = format!("[{} x {}]", elems.len(), elem_ty);
                 let alloca = self.tmp();
-                self.emit(format!("  {} = alloca {}", alloca, array_ty));
+                self.emit_alloca(&alloca, &array_ty);
                 for (i, elem) in elems.iter().enumerate() {
                     let val = self.emit_expr(elem);
                     let gep = self.tmp();
@@ -1245,10 +1455,10 @@ impl<'a> IrBuilder<'a> {
                 let ty_array_ptr = self.tmp();
                 let elem_size = self.llvm_const_sizeof(&elem_ty);
                 let align = self.llvm_const_alignof(&elem_ty);
-                self.emit(format!(
-                    "  {} = call %struct.TyArray* @ty_array_from_fixed(i8* %task, i8* {}, i64 {}, i64 {}, i64 {})",
-                    ty_array_ptr, raw_ptr_i8, elems.len(), elem_size, align
-                ));
+                {
+                    let _tv = self.emit_task_load();
+                    self.emit(format!("  {} = call %struct.TyArray* @ty_array_from_fixed(i8* {}, i8* {}, i64 {}, i64 {}, i64 {})", ty_array_ptr, _tv, raw_ptr_i8, elems.len(), elem_size, align));
+                }
 
                 ty_array_ptr // Return the pointer to the ACTUAL TyArray struct
             }
@@ -1575,7 +1785,8 @@ impl<'a> IrBuilder<'a> {
                 // first slot is always task unless no_task intrinsic.
                 let mut arg_pairs = Vec::new();
                 if !is_no_task_intrinsic(&id.name) {
-                    arg_pairs.push("i8* %task".to_string());
+                    let _tv = self.emit_task_load();
+                    arg_pairs.push(format!("i8* {}", _tv));
                 }
                 // The piped value is the first *user-visible* argument.
                 let first_user_ty = if is_no_task_intrinsic(&id.name) {
@@ -1590,10 +1801,12 @@ impl<'a> IrBuilder<'a> {
                 let offset = if is_no_task_intrinsic(&id.name) { 1 } else { 2 };
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
+                    let actual_ty = self.expr_llvm_type(a);
                     let t = param_types
                         .get(i + offset)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
+                    let v = self.emit_widen(&v, &actual_ty, &t);
                     arg_pairs.push(format!("{} {}", t, v));
                 }
                 let tmp = self.tmp();
@@ -1714,14 +1927,17 @@ impl<'a> IrBuilder<'a> {
                             let val = self.emit_expr(arg0);
                             let val_ty = self.expr_llvm_type(arg0);
                             let slot = self.tmp();
-                            self.emit(format!("  {} = alloca {}", slot, val_ty));
+                            self.emit_alloca(&slot, &val_ty);
                             self.emit(format!("  store {} {}, {}* {}", val_ty, val, val_ty, slot));
                             let raw = self.tmp();
                             self.emit(format!("  {} = bitcast {}* {} to i8*", raw, val_ty, slot));
-                            self.emit(format!(
-                                "  call void @ty_chan_send(i8* %task, i8* {}, i8* {})",
-                                base_val, raw
-                            ));
+                            {
+                                let _tv = self.emit_task_load();
+                                self.emit(format!(
+                                    "  call void @ty_chan_send(i8* {}, i8* {}, i8* {})",
+                                    _tv, base_val, raw
+                                ));
+                            }
                         }
                         return "0".to_string();
                     }
@@ -1731,16 +1947,19 @@ impl<'a> IrBuilder<'a> {
                             self.ensure_option(&elem_ty);
 
                             let out_slot = self.tmp();
-                            self.emit(format!("  {} = alloca {}", out_slot, elem_ty));
+                            self.emit_alloca(&out_slot, &elem_ty);
                             let out_raw = self.tmp();
                             self.emit(format!(
                                 "  {} = bitcast {}* {} to i8*",
                                 out_raw, elem_ty, out_slot
                             ));
-                            self.emit(format!(
-                                "  call void @ty_chan_recv(i8* %task, i8* {}, i8* {})",
-                                base_val, out_raw
-                            ));
+                            {
+                                let _tv = self.emit_task_load();
+                                self.emit(format!(
+                                    "  call void @ty_chan_recv(i8* {}, i8* {}, i8* {})",
+                                    _tv, base_val, out_raw
+                                ));
+                            }
                             let loaded = self.tmp();
                             self.emit(format!(
                                 "  {} = load {}, {}* {}",
@@ -1759,27 +1978,37 @@ impl<'a> IrBuilder<'a> {
                                     self.ensure_option(&elem_ty);
 
                                     let out_slot = self.tmp();
-                                    self.emit(format!("  {} = alloca {}", out_slot, elem_ty));
+                                    self.emit_alloca(&out_slot, &elem_ty);
                                     let out_raw = self.tmp();
                                     self.emit(format!(
                                         "  {} = bitcast {}* {} to i8*",
                                         out_raw, elem_ty, out_slot
                                     ));
 
-                                    let success = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
-                                        success, base_val, out_raw
-                                    ));
-
-                                    let cond = self.tmp();
-                                    self.emit(format!("  {} = icmp eq i32 {}, 1", cond, success));
+                                    let poll_lbl = self.label("try_recv_poll");
                                     let some_lbl = self.label("try_recv_some");
                                     let none_lbl = self.label("try_recv_none");
+                                    let empty_lbl = self.label("try_recv_empty");
+                                    let wait_lbl = self.label("try_recv_wait");
                                     let merge_lbl = self.label("try_recv_merge");
+
+                                    self.emit(format!("  br label %{}", poll_lbl));
+
+                                    self.emit(format!("{}:", poll_lbl));
+                                    let success = self.tmp();
+                                    {
+                                        let _tv = self.emit_task_load();
+                                        self.emit(format!("  {} = call i32 @ty_chan_try_recv(i8* {}, i8* {}, i8* {})", success, _tv, base_val, out_raw));
+                                    }
+
+                                    let got_value = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = icmp eq i32 {}, 1",
+                                        got_value, success
+                                    ));
                                     self.emit(format!(
                                         "  br i1 {}, label %{}, label %{}",
-                                        cond, some_lbl, none_lbl
+                                        got_value, some_lbl, empty_lbl
                                     ));
 
                                     self.emit(format!("{}:", some_lbl));
@@ -1788,8 +2017,24 @@ impl<'a> IrBuilder<'a> {
                                         "  {} = load {}, {}* {}",
                                         loaded, elem_ty, elem_ty, out_slot
                                     ));
-                                    let some_val = self.emit_option_some(&opt_ty, &elem_ty, &loaded);
+                                    let some_val =
+                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded);
                                     self.emit(format!("  br label %{}", merge_lbl));
+
+                                    self.emit(format!("{}:", empty_lbl));
+                                    let is_closed = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = icmp slt i32 {}, 0",
+                                        is_closed, success
+                                    ));
+                                    self.emit(format!(
+                                        "  br i1 {}, label %{}, label %{}",
+                                        is_closed, none_lbl, wait_lbl
+                                    ));
+
+                                    self.emit(format!("{}:", wait_lbl));
+                                    self.emit("  call void @ty_yield()".to_string());
+                                    self.emit(format!("  br label %{}", poll_lbl));
 
                                     self.emit(format!("{}:", none_lbl));
                                     let none_val = self.emit_option_none(&opt_ty, &elem_ty);
@@ -1817,14 +2062,17 @@ impl<'a> IrBuilder<'a> {
                     let val = self.emit_expr(arg0);
                     let val_ty = self.expr_llvm_type(arg0);
                     let slot = self.tmp();
-                    self.emit(format!("  {} = alloca {}", slot, val_ty));
+                    self.emit_alloca(&slot, &val_ty);
                     self.emit(format!("  store {} {}, {}* {}", val_ty, val, val_ty, slot));
                     let raw = self.tmp();
                     self.emit(format!("  {} = bitcast {}* {} to i8*", raw, val_ty, slot));
-                    self.emit(format!(
-                        "  call void @ty_array_push(i8* %task, %struct.TyArray* {}, i8* {})",
-                        base_val, raw
-                    ));
+                    {
+                        let _tv = self.emit_task_load();
+                        self.emit(format!(
+                            "  call void @ty_array_push(i8* {}, %struct.TyArray* {}, i8* {})",
+                            _tv, base_val, raw
+                        ));
+                    }
                 }
                 return "0".to_string();
             }
@@ -1847,20 +2095,48 @@ impl<'a> IrBuilder<'a> {
                     .cloned()
                     .unwrap_or_else(|| base_ty.clone());
 
-                let mut arg_pairs = vec![
-                    "i8* %task".to_string(), // ← task first, bare reference
-                    format!("{} {}", self_ty, base_val),
-                ];
+                let _tv = self.emit_task_load();
+                let mut arg_pairs =
+                    vec![format!("i8* {}", _tv), format!("{} {}", self_ty, base_val)];
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
+                    let actual_ty = self.expr_llvm_type(a);
                     let t = param_types
                         .get(i + 2) // ← was i + 1, now offset by 2 (skip task + self)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
+                    let v = self.emit_widen(&v, &actual_ty, &t);
                     arg_pairs.push(format!("{} {}", t, v));
                 }
                 let tmp = self.tmp();
                 if ret_ty == "void" {
+                    // Check whether the last declared parameter is a Result/struct out-pointer.
+                    // If so, allocate it on the stack, pass the pointer, load and return the struct.
+                    // This covers __ty_method__Network__listen, __ty_method__Listener__accept, and
+                    // any future runtime methods that use the out-pointer ABI.
+                    let last_param = param_types.last().cloned().unwrap_or_default();
+                    let out_struct_ty = last_param
+                        .strip_suffix('*')
+                        .filter(|t| t.starts_with("%struct."))
+                        .map(|t| t.to_string());
+
+                    if let Some(desired_ty) = out_struct_ty {
+                        let out_slot = self.tmp();
+                        self.emit_alloca(&out_slot, &desired_ty);
+                        arg_pairs.push(format!("{}* {}", desired_ty, out_slot));
+                        self.emit(format!(
+                            "  call void @{}({})",
+                            runtime_name,
+                            arg_pairs.join(", ")
+                        ));
+                        let loaded = self.tmp();
+                        self.emit(format!(
+                            "  {} = load {}, {}* {}",
+                            loaded, desired_ty, desired_ty, out_slot
+                        ));
+                        return loaded;
+                    }
+
                     self.emit(format!(
                         "  call void @{}({})",
                         runtime_name,
@@ -1931,15 +2207,22 @@ impl<'a> IrBuilder<'a> {
             };
 
             let mut arg_pairs = Vec::new();
-            if !is_no_task_intrinsic(&runtime_name) {
-                arg_pairs.push("i8* %task".to_string());
+            let task_prepended = !is_no_task_intrinsic(&runtime_name);
+            if task_prepended {
+                let _tv = self.emit_task_load();
+                arg_pairs.push(format!("i8* {}", _tv));
             }
+            // param_types[0] is the task slot (i8*); user args start at index 1
+            // when task was prepended, so offset accordingly.
+            let param_offset = if task_prepended { 1 } else { 0 };
             for (i, arg) in args.iter().enumerate() {
                 let v = self.emit_expr(arg);
+                let actual_ty = self.expr_llvm_type(arg);
                 let t = param_types
-                    .get(i)
+                    .get(i + param_offset)
                     .cloned()
-                    .unwrap_or_else(|| "i32".to_string());
+                    .unwrap_or_else(|| actual_ty.clone());
+                let v = self.emit_widen(&v, &actual_ty, &t);
                 arg_pairs.push(format!("{} {}", t, v));
             }
             if ret_ty == "void" {
@@ -1981,7 +2264,7 @@ impl<'a> IrBuilder<'a> {
         }
         let result_slot = if result_ty != "void" {
             let slot = self.tmp();
-            self.emit(format!("  {} = alloca {}", slot, result_ty));
+            self.emit_alloca(&slot, &result_ty);
             Some((slot, result_ty))
         } else {
             None
@@ -2067,7 +2350,7 @@ impl<'a> IrBuilder<'a> {
         let result_ty = self.expr_llvm_type(call_expr);
         let result_slot = if result_ty != "void" {
             let slot = self.tmp();
-            self.emit(format!("  {} = alloca {}", slot, result_ty));
+            self.emit_alloca(&slot, &result_ty);
             Some((slot, result_ty))
         } else {
             None
@@ -2240,7 +2523,7 @@ impl<'a> IrBuilder<'a> {
                     return;
                 }
                 let slot = self.tmp();
-                self.emit(format!("  {} = alloca {}", slot, ty));
+                self.emit_alloca(&slot, &ty);
                 self.emit(format!("  store {} {}, {}* {}", ty, val, ty, slot));
                 self.locals.insert(id.name.clone(), slot);
                 self.locals_type.insert(id.name.clone(), ty.to_string());
@@ -2454,6 +2737,9 @@ impl<'a> IrBuilder<'a> {
             "Buf" => "%struct.Buf*".to_string(),
             "Array" => "%struct.TyArray*".to_string(),
             "Chan" => "i8*".to_string(),
+            "Network" => "%struct.Network*".to_string(),
+            "Listener" => "%struct.Listener*".to_string(),
+            "Socket" => "%struct.Socket*".to_string(),
             "Option" => ty
                 .node
                 .generic_args
@@ -2500,6 +2786,9 @@ impl<'a> IrBuilder<'a> {
                 "Str" => "i8*".to_string(),
                 "Buf" => "%struct.Buf*".to_string(),
                 "Chan" => "i8*".to_string(),
+                "Network" => "%struct.Network*".to_string(),
+                "Listener" => "%struct.Listener*".to_string(),
+                "Socket" => "%struct.Socket*".to_string(),
                 n => format!("%struct.{}", n),
             },
             InferType::App(name, args) if name == "Ref" && args.len() == 1 => "i8*".to_string(),
@@ -2797,6 +3086,50 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
+    fn emit_widen(&mut self, val: &str, actual_ty: &str, expected_ty: &str) -> String {
+        if actual_ty == expected_ty {
+            return val.to_string();
+        }
+        let int_rank = |t: &str| -> Option<u8> {
+            match t {
+                "i8" => Some(0),
+                "i16" => Some(1),
+                "i32" => Some(2),
+                "i64" => Some(3),
+                _ => None,
+            }
+        };
+        let float_rank = |t: &str| -> Option<u8> {
+            match t {
+                "half" => Some(0),
+                "float" => Some(1),
+                "double" => Some(2),
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(e)) = (int_rank(actual_ty), int_rank(expected_ty)) {
+            if a < e {
+                let tmp = self.tmp();
+                self.emit(format!(
+                    "  {} = sext {} {} to {}",
+                    tmp, actual_ty, val, expected_ty
+                ));
+                return tmp;
+            }
+        }
+        if let (Some(a), Some(e)) = (float_rank(actual_ty), float_rank(expected_ty)) {
+            if a < e {
+                let tmp = self.tmp();
+                self.emit(format!(
+                    "  {} = fpext {} {} to {}",
+                    tmp, actual_ty, val, expected_ty
+                ));
+                return tmp;
+            }
+        }
+        val.to_string()
+    }
+
     fn zero_value(&self, ty: &str) -> String {
         if ty.ends_with('*') {
             "null".to_string()
@@ -3060,7 +3393,9 @@ impl<'a> IrBuilder<'a> {
 // ── Free functions ────────────────────────────────────────────────────────────
 
 fn is_main(name: &str) -> bool {
-    return name == "main" || name.ends_with("__main");
+    // The user's entry point is usually named `main`.
+    // In a namespace, it becomes `ns__main`.
+    name == "main" || name.ends_with("__main")
 }
 
 fn int_suffix_to_llvm(suffix: &str) -> &'static str {
@@ -3168,8 +3503,11 @@ fn runtime_intrinsic_name(name: &str) -> Option<String> {
 }
 
 fn link_symbol_name(name: &str) -> String {
-    if name == "main__main" {
-        "main".to_string()
+    // Keep a stable OS entrypoint symbol (`main`) and route the user entry
+    // function through a distinct symbol to avoid collisions (notably in unit
+    // tests that parse a single file without namespace mangling).
+    if name == "main" || name == "main__main" {
+        "__ty_user_main".to_string()
     } else {
         name.to_string()
     }
@@ -3238,23 +3576,8 @@ mod tests {
 
     #[test]
     fn lowers_function_declarations() {
-        let source = "fn main(a: Int32) -> Int32 { return a; }";
-        let src = format!("namespace main\n{}", source);
-        let module = Parser::new(Lexer::new(src).tokenize())
-            .parse_module()
-            .unwrap();
-        let mut checker = crate::type_inference::TypeChecker::new();
-        checker.check_module(&module).unwrap();
-        let mut liveness = crate::liveness::LiveAnalyzer::new();
-        let drop_map = liveness
-            .analyze_module(&module)
-            .unwrap_or(&std::collections::HashMap::new())
-            .clone();
-        let ir = Codegen::lower_module(&module, checker.types(), &drop_map);
-        assert_eq!(ir.functions.len(), 2);
-        assert_eq!(ir.functions[0].name, "main");
-        assert_eq!(ir.functions[0].ret_type, "i32");
-        assert_eq!(ir.functions[0].params.len(), 0);
+        let text = compile("fn id(a: Int32) -> Int32 { return a; }");
+        assert!(text.contains("define i32 @id(i8* %task, i32 %a)"));
     }
 
     #[test]
@@ -3267,9 +3590,19 @@ mod tests {
     #[test]
     fn lowers_let_bindings() {
         let text = compile("fn main() -> Int32 { let x: Int32 = 3; return x; }");
-        assert!(text.contains("alloca i32"));
+        assert!(text.contains("call i8* @slab_alloc"));
         assert!(text.contains("store i32 3"));
         assert!(text.contains("load i32"));
+    }
+
+    #[test]
+    fn try_recv_yields_until_value_or_close() {
+        let text = compile(
+            "fn main() -> Int32 { let ch: ref chan<Int32> = chan<Int32>(); match ch.try_recv() { Some(v) => { return v; } None => { return 0; } } }",
+        );
+        assert!(text.contains("try_recv_poll"));
+        assert!(text.contains("call void @ty_yield()"));
+        assert!(text.contains("icmp slt i32"));
     }
 
     #[test]

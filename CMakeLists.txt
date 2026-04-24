@@ -21,12 +21,15 @@ add_library(runtime STATIC
     runtime/scheduler.h
     runtime/io_driver.h
     runtime/ty_mem.h
+    runtime/ty_net.h
     runtime/ty_ctx.S
     runtime/io_driver.c
     runtime/scheduler.c
     runtime/ty_mem.c
-    runtime/ty_io.c
-)
+    runtime/ty_net.c
+    runtime/ty_io.c)
+
+target_compile_definitions(runtime PRIVATE TY_SCHED_DEBUG_ENABLED=0)
 
 # 3. OUTPUT MANAGEMENT
 set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/output")

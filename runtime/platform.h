@@ -35,6 +35,15 @@
 #  define TY_TRAP() __builtin_trap()
 #endif
 
+/* Set TY_DEBUG_ENABLED=1 at compile time to enable verbose logging. */
+#ifndef TY_DEBUG
+#  ifdef TY_DEBUG_ENABLED
+#    define TY_DEBUG(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
+#  else
+#    define TY_DEBUG(fmt, ...) ((void)0)
+#  endif
+#endif
+
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  POSIX path

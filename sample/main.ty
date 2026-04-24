@@ -30,11 +30,41 @@ impl Popcount {
   }
 }
 
-fn main() -> Int32 {
+fn handle_connection(socket: Socket) {
+  let ch: ref chan<Int8> = chan<Int8>();
+  socket.consume(ch);
+
   let p: Popcount = Popcount {
-    ar: [1, 2, 4, 8, 16, 32],
+    ar: [1, 2, 4, 8, 16, 32, 64, 128],
   }
-  let n = p.check(15);
-  printf("Result: %d\r\n", n);
+  let mut loop = true;
+  while loop {
+    match ch.try_recv() {
+      Some(i) => {
+        let n = p.check(i);
+        printf("Result: %d\r\n", n);
+      }
+      None => { loop = false; }
+    }
+  }
+  socket.close();
+}
+
+fn main(net: Network) -> Int32 {
+  match net.listen("0.0.0.0:8080") {
+    Ok(listener) => {
+      println("Listening on :8080")
+      let mut loop = true;
+      while loop {
+        match listener.accept() {
+          Ok(socket) => {
+            conc { handle_connection(socket); }
+          }
+          Err(_) => { loop = false; }
+        }
+      }
+    }
+    Err(_) => { println("Listen failed\r\n") }
+  }
   return 0;
 }

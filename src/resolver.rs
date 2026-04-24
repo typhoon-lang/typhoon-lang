@@ -201,6 +201,8 @@ impl Resolver {
 
         let common_named = [
             "Option", "Result", "Buf", "Map", "Set", "Node", "Ref", "Array", "Chan", "chan", "ref",
+            // Runtime-provided capability/resource types
+            "Network", "Listener", "Socket",
         ];
         if common_named.contains(&name.as_str()) {
             return Ok(());

@@ -72,6 +72,8 @@ void ty_io_wake_coro(void* coro, int64_t result)
 {
     if (!coro)
         return;
+    TY_DEBUG("[io] wake coro=%p result=%lld\n",
+        coro, (long long)result);
     ty_coro_set_io_result(coro, result);
     sched_enqueue_from_external(coro); /* defined in scheduler.c */
 }
@@ -709,6 +711,13 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
     IoDriver* d = (IoDriver*)driver_ptr;
     int has_driver = (d && d->impl && atomic_load_explicit(&g_poll_running, memory_order_acquire));
 
+#if defined(_WIN32)
+    /* Never park a coroutine on stdio fds: IOCP is not reliable for them, and
+       a parked stdio write during shutdown will hang the drain loop forever. */
+    if (fd >= 0 && fd <= 2)
+        has_driver = 0;
+#endif
+
     if (coro && has_driver) {
         PendingReq* req = pool_alloc(
 #if defined(__linux__)
@@ -735,6 +744,8 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
 #elif defined(_WIN32)
             iocp_submit((IocpDriver*)d->impl, req);
 #endif
+            TY_DEBUG("[io] park coro=%p fd=%d is_write=%d len=%zu\n",
+                coro, fd, is_write, len);
             ty_io_park_coro(arena); /* yields; result stored by poll thread */
             return;
         }

@@ -285,8 +285,15 @@ void* slab_alloc(SlabArena* arena, int32_t size_class) {
         return (void*)head;
     }
     void* p = arena_bump_raw(arena, (size_t)SIZE_CLASS_BYTES[size_class], 16);
+    if (!p) {
+        // Try to grow the arena or allocate a new chunk here
+        TY_DEBUG("DEBUG: Arena bump failed. Current page: %p\n", (void*)arena->current_page);
+    }
     if (p)
         memset(p, 0, (size_t)SIZE_CLASS_BYTES[size_class]);
+    if (p == NULL) {
+        TY_DEBUG("FATAL: slab_alloc returned NULL\n");
+    }
     return p;
 }
 

@@ -85,12 +85,18 @@ fn main() {
     // 4. Set the library name
     // Clang will find runtime.lib on Windows or libruntime.a on Unix
     cmd.arg("-lruntime");
+    // Networking runtime uses Winsock on Windows.
+    if cfg!(windows) {
+        cmd.arg("-lWs2_32");
+    }
 
     // 5. Platform-Specific Glue
     if cfg!(windows) {
         // Forces Clang to link against the Static CRT (libcmt.lib)
         // This resolves the "__imp_strtod" errors
         cmd.arg("-fms-runtime-lib=static");
+        // Explicitly ignore the debug runtime to prevent LNK4098 conflicts
+        cmd.arg("-Wl,/NODEFAULTLIB:LIBCMTD");
     } else {
         // Linux and macOS need to link the math library and threads
         // if your runtime uses any C-standard headers or threading.

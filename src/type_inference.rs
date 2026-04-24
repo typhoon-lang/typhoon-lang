@@ -153,6 +153,64 @@ impl TypeChecker {
             },
         );
 
+        // ── Networking (runtime-provided methods) ───────────────────────────
+        // net.listen(addr: Str) -> Result<Listener, Int32>
+        self.set_global(
+            "__ty_method__Network__listen".into(),
+            Scheme::mono(InferType::Fn(
+                vec![
+                    InferType::Con("Network".into()),
+                    InferType::Con("Str".into()),
+                ],
+                Box::new(InferType::App(
+                    "Result".into(),
+                    vec![
+                        InferType::Con("Listener".into()),
+                        InferType::Con("Int32".into()),
+                    ],
+                )),
+            )),
+        );
+        // listener.accept() -> Result<Socket, Int32>
+        self.set_global(
+            "__ty_method__Listener__accept".into(),
+            Scheme::mono(InferType::Fn(
+                vec![InferType::Con("Listener".into())],
+                Box::new(InferType::App(
+                    "Result".into(),
+                    vec![
+                        InferType::Con("Socket".into()),
+                        InferType::Con("Int32".into()),
+                    ],
+                )),
+            )),
+        );
+        // socket.consume(ch: chan) -> Unit
+        self.set_global(
+            "__ty_method__Socket__consume".into(),
+            Scheme::mono(InferType::Fn(
+                vec![
+                    InferType::Con("Socket".into()),
+                    InferType::App(
+                        "Ref".into(),
+                        vec![InferType::App(
+                            "Chan".into(),
+                            vec![InferType::Con("Int8".into())],
+                        )],
+                    ),
+                ],
+                Box::new(InferType::Con("Unit".into())),
+            )),
+        );
+        // socket.close() -> Unit
+        self.set_global(
+            "__ty_method__Socket__close".into(),
+            Scheme::mono(InferType::Fn(
+                vec![InferType::Con("Socket".into())],
+                Box::new(InferType::Con("Unit".into())),
+            )),
+        );
+
         let t2 = self.fresh_var_id();
         let e2 = self.fresh_var_id();
         self.set_global(
@@ -779,9 +837,55 @@ impl TypeChecker {
             | Operator::SubAssign
             | Operator::MulAssign
             | Operator::DivAssign => {
-                self.unify(left_ty.clone(), InferType::Con("Int32".into()), Some(span))?;
-                self.unify(right_ty, InferType::Con("Int32".into()), Some(span))?;
-                Ok(InferType::Con("Int32".into()))
+                // Resolve both sides to concrete types first, then determine the
+                // result type.  We allow implicit widening within a single numeric
+                // hierarchy (int or float) so that e.g. `i8 + i32` yields Int32
+                // without requiring an explicit cast.  Mixing int and float is
+                // still a type error — that requires an explicit conversion.
+                let result_ty = match (&left_ty, &right_ty) {
+                    (InferType::Con(l), InferType::Con(r)) => {
+                        match (Self::numeric_rank(l), Self::numeric_rank(r)) {
+                            (Some(lr), Some(rr)) => {
+                                let same_chain = (lr < 10) == (rr < 10);
+                                if same_chain {
+                                    // The result is the wider of the two.
+                                    if lr >= rr {
+                                        left_ty.clone()
+                                    } else {
+                                        right_ty.clone()
+                                    }
+                                } else {
+                                    // Int mixed with Float — still an error.
+                                    return Err(TypeError::TypeMismatch {
+                                        expected: left_ty.clone(),
+                                        actual: right_ty.clone(),
+                                        context: "arithmetic operands".into(),
+                                        span: Some(span),
+                                    });
+                                }
+                            }
+                            // Fall back: require both sides to be Int32 (legacy
+                            // behaviour for unresolved type variables, Byte, etc.)
+                            _ => {
+                                self.unify(
+                                    left_ty.clone(),
+                                    InferType::Con("Int32".into()),
+                                    Some(span),
+                                )?;
+                                self.unify(right_ty, InferType::Con("Int32".into()), Some(span))?;
+                                InferType::Con("Int32".into())
+                            }
+                        }
+                    }
+                    // At least one side is not yet a concrete Con — unify both
+                    // against Int32 as before and keep Int32 as the result type.
+                    _ => {
+                        self.unify(left_ty.clone(), InferType::Con("Int32".into()), Some(span))?;
+                        self.unify(right_ty, InferType::Con("Int32".into()), Some(span))?;
+                        InferType::Con("Int32".into())
+                    }
+                };
+                Ok(result_ty)
             }
             Operator::Eq
             | Operator::Ne
@@ -1097,6 +1201,40 @@ impl TypeChecker {
         }
     }
 
+    /// Returns the widening rank for a numeric type constructor, or `None` if the
+    /// type is not part of a widening hierarchy.  Higher rank = wider type.
+    ///
+    /// Integer chain:  Int8(0) → Int16(1) → Int32(2) → Int64(3)
+    /// Float chain:    Float16(10) → Float32(11) → Float64(12)
+    ///
+    /// The two chains are disjoint: an integer can never widen into a float.
+    fn numeric_rank(name: &str) -> Option<u8> {
+        match name {
+            "Int8" => Some(0),
+            "Int16" => Some(1),
+            "Int32" => Some(2),
+            "Int64" => Some(3),
+            "Float16" => Some(10),
+            "Float32" => Some(11),
+            "Float64" => Some(12),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when a value of type `actual` can be implicitly widened
+    /// to `expected`.  Both must be concrete type constructors in the same
+    /// numeric hierarchy, and `actual` must be strictly narrower.
+    fn can_widen_to(actual: &str, expected: &str) -> bool {
+        match (Self::numeric_rank(actual), Self::numeric_rank(expected)) {
+            (Some(a), Some(b)) => {
+                // Same hierarchy (both int or both float) and actual is narrower.
+                let same_chain = (a < 10) == (b < 10);
+                same_chain && a < b
+            }
+            _ => false,
+        }
+    }
+
     fn unify(
         &mut self,
         left: InferType,
@@ -1109,6 +1247,15 @@ impl TypeChecker {
             (InferType::Var(a), InferType::Var(b)) if a == b => Ok(()),
             (InferType::Var(a), ty) | (ty, InferType::Var(a)) => self.bind_var(a, ty, span),
             (InferType::Con(a), InferType::Con(b)) if a == b => Ok(()),
+            // Implicit numeric widening: Int8 → Int32, Float32 → Float64, etc.
+            // We accept the narrower `actual` wherever the wider `expected` is
+            // required; the inverse (widening the expected) is not allowed so
+            // that we don't silently truncate.
+            (InferType::Con(ref expected), InferType::Con(ref actual))
+                if Self::can_widen_to(actual, expected) =>
+            {
+                Ok(())
+            }
             (InferType::FixedArray(a_elem, a_len), InferType::FixedArray(b_elem, b_len))
                 if a_len == b_len =>
             {
@@ -1317,6 +1464,58 @@ mod tests {
     #[test]
     fn arithmetic_i8_rejects() {
         assert!(check("fn addi8() -> Int32 { return 1i8 + 2i8; }").is_err());
+    }
+
+    #[test]
+    fn widening_i8_to_i32_in_call_accepts() {
+        // Passing an Int8 where Int32 is expected should be allowed via widening.
+        let source = "fn take_i32(x: Int32) -> Int32 { return x; } \
+                      fn f() -> Int32 { return take_i32(1i8); }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn widening_i8_to_i64_in_call_accepts() {
+        let source = "fn take_i64(x: Int64) -> Int64 { return x; } \
+                      fn f() -> Int64 { return take_i64(1i8); }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn widening_float32_to_float64_accepts() {
+        let source = "fn take_f64(x: Float64) -> Float64 { return x; } \
+                      fn f() -> Float64 { return take_f64(1.0f32); }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn widening_does_not_cross_int_float_boundary() {
+        // Int32 → Float64 must not be allowed implicitly.
+        let source = "fn take_f64(x: Float64) -> Float64 { return x; } \
+                      fn f() -> Float64 { return take_f64(1); }";
+        assert!(check(source).is_err());
+    }
+
+    #[test]
+    fn widening_does_not_narrow() {
+        // Int32 → Int8 must not be allowed.
+        let source = "fn take_i8(x: Int8) -> Int8 { return x; } \
+                      fn f() -> Int8 { return take_i8(1); }";
+        assert!(check(source).is_err());
+    }
+
+    #[test]
+    fn binary_i8_plus_i32_yields_i32() {
+        // Mixed-width arithmetic: result should be the wider type.
+        let source = "fn f() -> Int32 { return 1i8 + 2; }";
+        assert!(check(source).is_ok());
+    }
+
+    #[test]
+    fn binary_i8_plus_i8_rejects_i32_return() {
+        // Two Int8 operands → Int8 result, not Int32.
+        let source = "fn f() -> Int32 { return 1i8 + 2i8; }";
+        assert!(check(source).is_err());
     }
 
     #[test]

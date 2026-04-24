@@ -191,7 +191,7 @@ A few catches / limitations right now:
     - [x] I/O operations transparently yield coroutines
     - [x] Polling driver uses scheduler waitlists for read/write readiness
 - [ ] Capability Model
-    - [ ] Generate `Network` token at `main` entry point
+    - [x] Generate `Network` token at `main` entry point
     - [ ] Enforce token linearity during `net.listen` / `net.accept`
 - [ ] Networking Implementation
     - [ ] `LinearSocket` with single-owner semantics

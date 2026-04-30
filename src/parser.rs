@@ -1054,19 +1054,24 @@ impl Parser {
             TokenType::Let => {
                 self.advance_token();
                 let mutable = self.match_token(TokenType::Mut);
-                let name = self.identifier_with_span()?;
+                let pattern = self.parse_pattern()?;
                 let mut type_annotation = None;
                 if self.match_token(TokenType::Colon) {
                     type_annotation = Some(self.parse_type()?);
                 }
                 self.consume(TokenType::Assign, "Expected '='")?;
                 let initializer = self.expression()?;
+                let mut else_block = None;
+                if self.match_token(TokenType::Else) {
+                    else_block = Some(self.block()?);
+                }
                 self.match_token(TokenType::Semicolon);
                 Ok(Some(self.make_stmt(StatementKind::LetBinding {
                     mutable,
-                    name,
+                    pattern,
                     type_annotation,
                     initializer,
+                    else_block,
                 })))
             }
             TokenType::Return => {
@@ -1094,12 +1099,27 @@ impl Parser {
                     let then_branch = self.block()?;
                     let mut else_branch = None;
                     if self.match_token(TokenType::Else) {
-                        // else must be an expression for IfLet; use block or nested if-let later.
-                        let block = self.block()?;
-                        let span = block.span;
-                        else_branch = Some(Box::new(
-                            self.make_spanned_with_span(ExpressionKind::Block(block), span),
-                        ));
+                        if self.peek_token().token_type == TokenType::If {
+                            let else_if_stmt =
+                                self.statement()?.ok_or("Expected else-if statement")?;
+                            // The `if-let` is currently parsed as an expression inside an `Expression` statement.
+                            // To support `else if`, we need a more flexible `ElseBranchKind` that works for both `if` and `if-let`.
+                            else_branch = Some(Box::new(self.make_spanned_with_span(
+                                ExpressionKind::Block(Block {
+                                    statements: vec![else_if_stmt.clone()],
+                                    trailing_expression: None,
+                                    span: else_if_stmt.span,
+                                    block_id: self.alloc_id(),
+                                }),
+                                else_if_stmt.span,
+                            )));
+                        } else {
+                            let block = self.block()?;
+                            let span = block.span;
+                            else_branch = Some(Box::new(
+                                self.make_spanned_with_span(ExpressionKind::Block(block), span),
+                            ));
+                        }
                     }
                     let span = token.span.join(self.last_token_span());
                     let expr = self.make_spanned_with_span(
@@ -1639,7 +1659,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_if_let_statement() {
+    fn test_parse_let_else() {
+        let source = "fn main() -> Int32 { let Ok(x) = foo() else { return 1; }; return 0; }";
+        let module = parse_source(source);
+        if let DeclarationKind::Function { body, .. } = &module.declarations[0].node {
+            if let StatementKind::LetBinding { else_block, .. } = &body.statements[0].node {
+                assert!(else_block.is_some());
+            } else {
+                panic!("Expected let binding");
+            }
+        } else {
+            panic!("Expected function declaration");
+        }
+    }
+
+    #[test]
+    fn test_parse_if_let_else_statement() {
         let source = "fn main() -> Int32 { if let Ok(x) = foo() { return 1; } else { return 2; } return 0; }";
         let module = parse_source(source);
         if let DeclarationKind::Function { body, .. } = &module.declarations[0].node {

@@ -580,4 +580,27 @@ mod tests {
         assert_eq!(tokens[8].token_type, TokenType::IntLit);
         assert_eq!(tokens[9].token_type, TokenType::Semicolon);
     }
+
+    #[test]
+    fn test_let_pattern_matching() {
+        let input = "let Some(x) = func()";
+        let mut lexer = Lexer::new(input.to_string());
+        let tokens = lexer.tokenize();
+
+        let expected = vec![
+            TokenType::Let,
+            TokenType::Identifier, // Some
+            TokenType::LParen,
+            TokenType::Identifier, // x
+            TokenType::RParen,
+            TokenType::Assign,
+            TokenType::Identifier, // func
+            TokenType::LParen,
+            TokenType::RParen,
+            TokenType::Eof,
+        ];
+        for (i, ty) in expected.iter().enumerate() {
+            assert_eq!(tokens[i].token_type, *ty, "Mismatch at index {}", i);
+        }
+    }
 }

@@ -411,9 +411,10 @@ impl TypeChecker {
     ) -> Result<(), TypeError> {
         match &stmt.node {
             StatementKind::LetBinding {
-                name,
+                pattern,
                 type_annotation,
                 initializer,
+                else_block,
                 mutable,
             } => {
                 let init_ty = self.infer_expression(initializer)?;
@@ -429,12 +430,28 @@ impl TypeChecker {
                         ty = InferType::App("Array".into(), vec![*elem]);
                     }
                 }
-                let scheme = if *mutable {
-                    Scheme::mono(self.apply(&ty))
+
+                if let Some(id) = pattern.get_identifier() {
+                    // Simple `let x = ...` / `let mut x = ...`: preserve generalization
+                    // so that e.g. `let xs = []` can be used at multiple types.
+                    let scheme = if *mutable {
+                        Scheme::mono(self.apply(&ty))
+                    } else {
+                        self.generalize(&ty, None)
+                    };
+                    self.insert_local(id.name.clone(), scheme);
                 } else {
-                    self.generalize(&ty, None)
-                };
-                self.insert_local(name.name.clone(), scheme);
+                    // EnumVariant pattern: let Ok(x) = expr else { ... }
+                    // Unwrap the payload type and bind the inner name as mono.
+                    // Generalization is not meaningful here — the payload type is
+                    // determined by the concrete Result/Option the RHS returns.
+                    let payload_ty = self.unwrap_enum_payload(pattern, &ty);
+                    self.bind_pattern(pattern, &payload_ty)?;
+                }
+
+                if let Some(else_blk) = else_block {
+                    let _ = self.check_block(else_blk, expected_return)?;
+                }
                 Ok(())
             }
             StatementKind::Expression(expr) => {
@@ -1331,6 +1348,19 @@ impl TypeChecker {
             }
             InferType::FixedArray(elem, _) => self.occurs_in(var, &elem),
         }
+    }
+
+    /// For an EnumVariant pattern like `Ok(x)` or `Some(i)`, unwrap the
+    /// corresponding payload type from a `Result<T,E>` or `Option<T>` so
+    /// that `bind_pattern` sees `T` rather than the whole wrapper.
+    /// For any other pattern shape the original type is returned unchanged.
+    fn unwrap_enum_payload(&self, pattern: &Pattern, ty: &InferType) -> InferType {
+        if let PatternKind::EnumVariant { variant_name, .. } = &pattern.node {
+            if let Some(payload) = result_variant_payload(&self.apply(ty), &variant_name.name) {
+                return payload;
+            }
+        }
+        self.apply(ty)
     }
 }
 

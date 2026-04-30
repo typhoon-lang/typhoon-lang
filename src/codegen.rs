@@ -736,13 +736,49 @@ impl<'a> IrBuilder<'a> {
                 true
             }
             StatementKind::LetBinding {
-                name,
+                pattern,
                 initializer,
                 type_annotation,
                 mutable,
-                ..
+                else_block,
             } => {
-                self.emit_let(name, initializer, type_annotation.as_ref(), *mutable);
+                // Simple identifier pattern: use the existing emit_let path unchanged.
+                if let Some(name) = pattern.get_identifier() {
+                    self.emit_let(name, initializer, type_annotation.as_ref(), *mutable);
+                    return false;
+                }
+
+                // EnumVariant pattern with an else block: let Ok(x) = expr else { ... }
+                // Emit the initializer, test the tag, bind the payload on the success
+                // path, and emit the else block on the failure path.
+                let match_val = self.emit_expr(initializer);
+                let then_lbl = self.label("letelse_ok");
+                let else_lbl = self.label("letelse_fail");
+                let merge_lbl = self.label("letelse_merge");
+
+                let ok = self.emit_pattern_test(pattern, initializer, &match_val);
+                self.emit(format!(
+                    "  br i1 {}, label %{}, label %{}",
+                    ok, then_lbl, else_lbl
+                ));
+
+                // Success path: bind the payload variable(s) into locals and fall through.
+                self.emit(format!("{}:", then_lbl));
+                self.bind_pattern_value(pattern, initializer, &match_val);
+                self.emit(format!("  br label %{}", merge_lbl));
+
+                // Failure path: emit the else block (typically diverges via return).
+                self.emit(format!("{}:", else_lbl));
+                let else_term = if let Some(else_blk) = else_block {
+                    self.emit_block_stmts(else_blk, ret_ty)
+                } else {
+                    false
+                };
+                if !else_term {
+                    self.emit(format!("  br label %{}", merge_lbl));
+                }
+
+                self.emit(format!("{}:", merge_lbl));
                 false
             }
             StatementKind::Expression(expr) => {
@@ -3232,8 +3268,10 @@ impl<'a> IrBuilder<'a> {
                 });
             }
             // Mark name as locally defined only after visiting initializer
-            if let StatementKind::LetBinding { name, .. } = &stmt.node {
-                defined.insert(name.name.clone());
+            if let StatementKind::LetBinding { pattern, .. } = &stmt.node {
+                if let Some(name) = pattern.get_identifier() {
+                    defined.insert(name.name.clone());
+                }
             }
         }
 

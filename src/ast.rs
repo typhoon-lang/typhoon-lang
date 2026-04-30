@@ -153,9 +153,10 @@ pub enum StatementKind {
     // Let binding
     LetBinding {
         mutable: bool,
-        name: Identifier,
+        pattern: Pattern,
         type_annotation: Option<Type>,
         initializer: Expression,
+        else_block: Option<Block>,
     },
     // Expression statement (e.g., function call for side effects)
     Expression(Expression),
@@ -282,6 +283,15 @@ pub enum PatternKind {
         pattern: Box<Pattern>,
         guard: Box<Expression>,
     },
+}
+
+impl Pattern {
+    pub fn get_identifier(&self) -> Option<&Identifier> {
+        match &self.node {
+            PatternKind::Identifier(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 pub type Declaration = Spanned<DeclarationKind>;

@@ -230,11 +230,11 @@ impl LiveAnalyzer {
     fn analyze_statement(&mut self, stmt: &Statement) -> Result<(), String> {
         match &stmt.node {
             StatementKind::LetBinding {
-                name,
+                pattern,
                 initializer,
                 mutable,
                 type_annotation,
-                ..
+                else_block,
             } => {
                 // Initializer expressions consume any bindings they reference (move semantics for let-initializers)
                 self.consume_identifiers_in_expression(initializer)?;
@@ -242,7 +242,23 @@ impl LiveAnalyzer {
                     .as_ref()
                     .map(|ty| is_ref_type(ty))
                     .unwrap_or(false);
-                self.insert_binding(name, "let binding", *mutable, shared)
+                // insert_pattern_bindings walks the full pattern tree via
+                // collect_pattern_binders, so Ok(x), Some(i), tuples, etc. all work.
+                // For mutable or shared bindings we still need the single-name fast path
+                // because insert_pattern_bindings always inserts as immutable/non-shared.
+                if *mutable || shared {
+                    if let Some(name) = pattern.get_identifier() {
+                        self.insert_binding(name, "let binding", *mutable, shared)?;
+                    }
+                } else {
+                    self.insert_pattern_bindings(pattern, "let binding")?;
+                }
+                // The else block runs when the pattern doesn't match — analyze it in a
+                // fresh scope so it can't see the bindings introduced by the pattern.
+                if let Some(else_blk) = else_block {
+                    self.analyze_block(else_blk)?;
+                }
+                Ok(())
             }
             StatementKind::Expression(expr) => self.consume_identifiers_in_expression(expr),
             StatementKind::Return(Some(expr)) => self.consume_identifiers_in_expression(expr),
@@ -667,10 +683,14 @@ impl LiveAnalyzer {
     ) {
         match &stmt.node {
             StatementKind::LetBinding {
-                name, initializer, ..
+                pattern,
+                initializer,
+                ..
             } => {
                 self.collect_free_in_expr(initializer, bound, free);
-                bound.insert(name.name.clone()); // binding comes into scope after initializer
+                if let Some(id) = pattern.get_identifier() {
+                    bound.insert(id.name.clone());
+                }
             }
             StatementKind::Expression(expr) | StatementKind::Return(Some(expr)) => {
                 self.collect_free_in_expr(expr, bound, free);
@@ -1038,12 +1058,16 @@ mod tests {
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
-                        name: mk_ident("value"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("value")),
+                            dummy_span(),
+                        ),
                         type_annotation: Some(mk_type("Int32")),
                         initializer: mk_expr(ExpressionKind::Literal(Literal {
                             kind: LiteralKind::Int(1, None),
                             span: dummy_span(),
                         })),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::If {
                         condition: mk_expr(ExpressionKind::Identifier(mk_ident("flag"))),
@@ -1086,12 +1110,16 @@ mod tests {
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
-                        name: mk_ident("token"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("token")),
+                            dummy_span(),
+                        ),
                         type_annotation: Some(mk_type("Int32")),
                         initializer: mk_expr(ExpressionKind::Literal(Literal {
                             kind: LiteralKind::Int(1, None),
                             span: dummy_span(),
                         })),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::Loop {
                         kind: Spanned::new_dummy(
@@ -1128,9 +1156,13 @@ mod tests {
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
-                        name: mk_ident("value"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("value")),
+                            dummy_span(),
+                        ),
                         type_annotation: Some(mk_type("Int32")),
                         initializer: lit_int(1),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::Conc {
                         body: mk_block(vec![mk_stmt(StatementKind::Expression(mk_expr(
@@ -1168,9 +1200,13 @@ mod tests {
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: true,
-                        name: mk_ident("counter"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("counter")),
+                            dummy_span(),
+                        ),
                         type_annotation: Some(mk_type("Int32")),
                         initializer: lit_int(1),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::Expression(mk_expr(
                         ExpressionKind::Identifier(mk_ident("counter")),
@@ -1250,13 +1286,20 @@ mod tests {
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
-                        name: mk_ident("node"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("node")),
+                            dummy_span(),
+                        ),
                         type_annotation: Some(ref_node_type),
                         initializer: mk_expr(ExpressionKind::Placeholder("node".into())),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
-                        name: mk_ident("updated"),
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("updated")),
+                            dummy_span(),
+                        ),
                         type_annotation: None,
                         initializer: mk_expr(ExpressionKind::MergeExpression {
                             base: Some(Box::new(mk_expr(ExpressionKind::Identifier(mk_ident(
@@ -1267,6 +1310,7 @@ mod tests {
                                 mk_expr(ExpressionKind::Identifier(mk_ident("node"))),
                             )],
                         }),
+                        else_block: None,
                     }),
                     mk_stmt(StatementKind::Return(Some(lit_int(0)))),
                 ]),

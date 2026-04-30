@@ -863,9 +863,14 @@ impl Desugar {
                 statements.push(self.mk_stmt(
                     StatementKind::LetBinding {
                         mutable: false,
-                        name: buf_id.clone(),
+                        pattern: Pattern {
+                            node: PatternKind::Identifier(buf_id.clone()),
+                            span: *span,
+                            id: crate::ast::NodeId(self.next_id),
+                        },
                         type_annotation: None,
                         initializer: buf_new,
+                        else_block: None,
                     },
                     *span,
                 ));

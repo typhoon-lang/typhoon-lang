@@ -39,32 +39,25 @@ fn handle_connection(socket: Socket) {
   }
   let mut loop = true;
   while loop {
-    match ch.try_recv() {
-      Some(i) => {
-        let n = p.check(i);
-        printf("Result: %d\r\n", n);
-      }
-      None => { loop = false; }
-    }
+    let Some(i) = ch.try_recv() else { loop = false; }
+    let n = p.check(i);
+    printf("Result: %d\r\n", n);
   }
   socket.close();
 }
 
 fn main(net: Network) -> Int32 {
-  match net.listen("0.0.0.0:8080") {
-    Ok(listener) => {
-      println("Listening on :8080")
-      let mut loop = true;
-      while loop {
-        match listener.accept() {
-          Ok(socket) => {
-            conc { handle_connection(socket); }
-          }
-          Err(_) => { loop = false; }
-        }
-      }
-    }
-    Err(_) => { println("Listen failed\r\n") }
+  let Ok(listener) = net.listen("0.0.0.0:8080") else {
+    println("Listen failed\r\n");
+    return 0;
+  };
+  println("Listening on :8080");
+
+  let mut loop = true;
+  while loop {
+    let Ok(socket) = listener.accept() else { loop = false; };
+    conc { handle_connection(socket); }
+    return 0;
   }
   return 0;
 }

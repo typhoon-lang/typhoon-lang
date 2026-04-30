@@ -306,16 +306,21 @@ impl Resolver {
     fn resolve_statement(&mut self, scope: ScopeId, stmt: &Statement) -> Result<(), String> {
         match &stmt.node {
             StatementKind::LetBinding {
-                name,
+                pattern,
                 initializer,
                 type_annotation,
+                else_block,
                 ..
             } => {
-                self.declare(scope, name.clone())?;
                 if let Some(ty) = type_annotation {
                     self.resolve_type(scope, ty, &HashSet::new())?;
                 }
                 self.resolve_expression(scope, initializer)?;
+                if let Some(else_blk) = else_block {
+                    let else_scope = self.enter_scope(Some(scope));
+                    self.resolve_block(else_scope, else_blk)?;
+                }
+                self.declare_pattern(scope, pattern)?;
                 Ok(())
             }
             StatementKind::Expression(expr) => self.resolve_expression(scope, expr),

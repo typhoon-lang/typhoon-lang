@@ -175,8 +175,9 @@ struct TyChan* ty_chan_new(size_t elem_size, size_t cap);
 void ty_chan_send(SlabArena* arena, struct TyChan* chan, void* elem);
 
 /* Receive into `out` (pointer to elem_size bytes) from chan.
+ * Returns 1 if received, 0 if currently empty, -1 if closed and drained.
  * Blocks (cooperative) if the channel is empty. */
-void ty_chan_recv(SlabArena* arena, struct TyChan* chan, void* out);
+int ty_chan_recv(SlabArena* arena, struct TyChan* chan, void* out);
 
 /* Try receive into `out`.
  * Returns 1 if received, 0 if currently empty, -1 if closed and drained.

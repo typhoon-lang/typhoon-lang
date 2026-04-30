@@ -319,27 +319,6 @@ void __ty_method__Listener__accept(void* task, TyListener* self, TyResult_Socket
     return;
 }
 
-TyResult_i32_i32 __ty_method__Socket__read(void* task, TySocket* self, char* buf, int32_t len) {
-    (void)task;
-    TyResult_i32_i32 out;
-    out.ok = 0;
-    out.value = 0;
-    out.err = -1;
-
-    if (!self || !buf) return out;
-
-    int r = recv(self->sock, buf, len, 0);
-    if (r < 0) {
-        out.err = ty_net_last_error();
-        return out;
-    }
-
-    out.ok = 1;
-    out.value = r;
-    out.err = 0;
-    return out;
-}
-
 static void socket_consumer_coro(void* task, void* arg) {
     /* arg: [TySocket*, TyChan*] */
     void** pair = (void**)arg;
@@ -348,16 +327,34 @@ static void socket_consumer_coro(void* task, void* arg) {
     char buf[1024];
 
     while (1) {
-        int r = recv(sock->sock, buf, 1024, 0);
-        if (r <= 0) break;
-        /* The channel element size is 1 byte (Char/i8).  Send each byte
-         * individually so the write matches the slot size.  Passing a
-         * char* pointer value into a 1-byte slot would write 8 bytes into
-         * a 1-byte region and corrupt adjacent channel memory. */
+        int r = recv(sock->sock, buf, sizeof(buf), 0);
+        if (r < 0) {
+            /* A real error (not EAGAIN/EWOULDBLOCK — socket is blocking).
+             * Treat as EOF so the reader's recv()/try_recv() loop terminates
+             * cleanly rather than spinning forever on a broken socket. */
+            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
+                ty_net_last_error(),
+#if defined(_WIN32)
+                "winsock"
+#else
+                strerror(ty_net_last_error())
+#endif
+            );
+            break;
+        }
+        if (r == 0) {
+            /* Orderly remote close (EOF). */
+            break;
+        }
+        /* Send each byte individually — channel slot is 1 byte (Int8/Char).
+         * Passing a pointer into a 1-byte slot would corrupt channel memory. */
         for (int i = 0; i < r; i++) {
             ty_chan_send(task, chan, &buf[i]);
         }
     }
+    /* Closing the channel is the EOF signal to both recv() and try_recv():
+     *   recv()     — blocking wait returns None
+     *   try_recv() — non-blocking poll returns None */
     ty_chan_close(chan);
     free(pair);
 }
@@ -370,7 +367,79 @@ void __ty_method__Socket__consume(void* task, TySocket* self, struct TyChan* cha
     }
     pair[0] = self;
     pair[1] = chan;
-    ty_spawn(task, socket_consumer_coro, pair);  /* fix #1: pass task, not NULL */
+    ty_spawn(task, socket_consumer_coro, pair);
+}
+
+/*
+ * Socket__recv — blocking receive.
+ *
+ * Blocks the calling coroutine until a byte arrives on the channel or the
+ * channel is closed (remote EOF / error).  Returns:
+ *   ok=1, value=byte   — byte received, connection still open
+ *   ok=0, err=0        — channel closed (EOF), caller should stop reading
+ *   ok=0, err=-1       — self or chan is NULL (programming error)
+ *
+ * Maps to:  let Some(i) = ch.recv() else { break; }
+ */
+TyResult_i32_i32 __ty_method__Socket__recv(void* task, TySocket* self, struct TyChan* chan) {
+    TyResult_i32_i32 out;
+    out.ok = 0;
+    out.value = 0;
+    out.err = -1;
+
+    if (!self || !chan) return out;
+
+    int8_t byte = 0;
+    /* ty_chan_recv now returns 1 (data) or -1 (closed/EOF). */
+    int status = ty_chan_recv(task, chan, &byte);
+    if (status == -1) {
+        /* Channel closed — signal EOF cleanly, not as an error. */
+        out.err = 0;
+        return out;
+    }
+
+    out.ok = 1;
+    out.value = (int32_t)(uint8_t)byte;
+    out.err = 0;
+    return out;
+}
+
+/*
+ * Socket__try_recv — non-blocking receive.
+ *
+ * Returns immediately whether or not a byte is available:
+ *   ok=1, value=byte   — byte received
+ *   ok=0, err=1        — would block (no data yet, connection still open)
+ *   ok=0, err=0        — channel closed (EOF)
+ *   ok=0, err=-1       — self or chan is NULL
+ *
+ * Maps to:  let Some(i) = ch.try_recv() else { break; }
+ * Callers MUST distinguish err=1 (retry later) from err=0 (stop reading).
+ */
+TyResult_i32_i32 __ty_method__Socket__try_recv(void* task, TySocket* self, struct TyChan* chan) {
+    TyResult_i32_i32 out;
+    out.ok = 0;
+    out.value = 0;
+    out.err = -1;
+
+    if (!self || !chan) return out;
+
+    int8_t byte = 0;
+    /* ty_chan_try_recv returns:
+     *   1   — data received          (TY_CHAN_OK)
+     *   0   — empty, still open      (TY_CHAN_EMPTY)  → err=1 (would block)
+     *  -1   — channel closed (EOF)   (TY_CHAN_CLOSED) → err=0 */
+    int status = ty_chan_try_recv(task, chan, &byte);
+    if (status == 1) {
+        out.ok = 1;
+        out.value = (int32_t)(uint8_t)byte;
+        out.err = 0;
+    } else if (status == 0) {
+        out.err = 1; /* would block — not an error, not EOF */
+    } else {
+        out.err = 0; /* -1 == closed — EOF */
+    }
+    return out;
 }
 
 TyResult_i32_i32 __ty_method__Socket__write(void* task, TySocket* self, char* buf, int32_t len) {

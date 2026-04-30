@@ -1190,7 +1190,15 @@ void ty_chan_send(struct SlabArena* arena, struct TyChan* ch, void* elem) {
     // }
 }
 
-void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
+/* ty_chan_recv — blocking receive.
+ *
+ * Returns:
+ *   1   — element received, channel still open
+ *  -1   — channel closed (EOF); *out is zeroed
+ *
+ * Previously void; the return value is the only way for Socket__recv to
+ * distinguish a real zero byte from a closed-channel EOF signal. */
+int ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
     (void)arena;
     ty_mutex_lock(&ch->lock);
     Worker* w = current_worker();
@@ -1210,9 +1218,10 @@ void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
         } else {
             ty_mutex_unlock(&ch->lock);
         }
-        return;
+        return 1;
     }
     if (!me) {
+        /* Non-coroutine caller: spin-wait. */
         ty_mutex_unlock(&ch->lock);
         for (;;) {
             ty_mutex_lock(&ch->lock);
@@ -1231,7 +1240,7 @@ void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
                 } else {
                     ty_mutex_unlock(&ch->lock);
                 }
-                return;
+                return 1;
             }
             if (ch->send_q) {
                 WaitNode* s = ch->send_q;
@@ -1239,12 +1248,12 @@ void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
                 memcpy(out, s->elem, ch->elem_size);
                 ty_mutex_unlock(&ch->lock);
                 sched_enqueue_wake(s->coro);
-                return;
+                return 1;
             }
             if (ch->closed) {
                 memset(out, 0, ch->elem_size);
                 ty_mutex_unlock(&ch->lock);
-                return;
+                return -1; /* EOF */
             }
             ty_mutex_unlock(&ch->lock);
             ty_sleep_ns(1000);
@@ -1256,14 +1265,22 @@ void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
         memcpy(out, s->elem, ch->elem_size);
         ty_mutex_unlock(&ch->lock);
         sched_enqueue_wake(s->coro);
-        return;
+        return 1;
     }
     if (ch->closed) {
         memset(out, 0, ch->elem_size);
         ty_mutex_unlock(&ch->lock);
-        return;
+        return -1; /* EOF */
     }
+    /* Park until a sender wakes us or the channel is closed.
+     * ty_chan_close zeroes r->elem before waking us, so *out is already
+     * zeroed on wakeup-by-close.  Re-check closed flag to return -1. */
     chan_park(ch, &ch->recv_q, out, &ch->lock);
+
+    ty_mutex_lock(&ch->lock);
+    int closed = ch->closed;
+    ty_mutex_unlock(&ch->lock);
+    return closed ? -1 : 1;
 }
 
 int ty_chan_try_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {

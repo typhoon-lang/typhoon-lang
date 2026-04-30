@@ -105,6 +105,22 @@ impl Parser {
             TokenType::Interface => self.interface_decl(),
             TokenType::Impl => self.impl_decl(),
             TokenType::Extend => self.extend_decl(),
+            TokenType::Const => {
+                self.advance_token();
+                let name = self.identifier_with_span()?;
+                let mut type_annotation = None;
+                if self.match_token(TokenType::Colon) {
+                    type_annotation = Some(self.parse_type()?);
+                }
+                self.consume(TokenType::Assign, "Expected '='")?;
+                let initializer = self.expression()?;
+                self.match_token(TokenType::Semicolon);
+                Ok(self.make_decl(DeclarationKind::Const {
+                    name,
+                    type_annotation,
+                    initializer,
+                }))
+            }
             TokenType::Use => {
                 self.advance_token();
                 let path = self.use_path()?;
@@ -1074,6 +1090,22 @@ impl Parser {
                     else_block,
                 })))
             }
+            TokenType::Const => {
+                self.advance_token();
+                let name = self.identifier_with_span()?;
+                let mut type_annotation = None;
+                if self.match_token(TokenType::Colon) {
+                    type_annotation = Some(self.parse_type()?);
+                }
+                self.consume(TokenType::Assign, "Expected '='")?;
+                let initializer = self.expression()?;
+                self.match_token(TokenType::Semicolon);
+                Ok(Some(self.make_stmt(StatementKind::Const {
+                    name,
+                    type_annotation,
+                    initializer,
+                })))
+            }
             TokenType::Return => {
                 self.advance_token();
                 let mut expr = None;
@@ -1084,6 +1116,16 @@ impl Parser {
                 }
                 self.match_token(TokenType::Semicolon);
                 Ok(Some(self.make_stmt(StatementKind::Return(expr))))
+            }
+            TokenType::Break => {
+                self.advance_token();
+                self.match_token(TokenType::Semicolon);
+                Ok(Some(self.make_stmt(StatementKind::Break)))
+            }
+            TokenType::Continue => {
+                self.advance_token();
+                self.match_token(TokenType::Semicolon);
+                Ok(Some(self.make_stmt(StatementKind::Continue)))
             }
             TokenType::Conc => {
                 self.advance_token();
@@ -1681,6 +1723,39 @@ mod tests {
             assert!(matches!(
                 body.statements[0].node,
                 StatementKind::Expression(_)
+            ));
+        } else {
+            panic!("Expected function declaration");
+        }
+    }
+
+    #[test]
+    fn test_parse_const_declaration_global() {
+        let source = "const X: Int32 = 42; fn main() -> Int32 { return X; }";
+        let module = parse_source(source);
+        let mut found_main = false;
+        for decl in &module.declarations {
+            if let DeclarationKind::Function { name, body, .. } = &decl.node {
+                if name.name == "main" {
+                    assert!(matches!(
+                        body.statements[0].node,
+                        StatementKind::Return(..)
+                    ));
+                    found_main = true;
+                }
+            }
+        }
+        assert!(found_main, "Expected function main");
+    }
+
+    #[test]
+    fn test_parse_const_declaration_local() {
+        let source = "fn main() -> Int32 { const X: Int32 = 42; return X; }";
+        let module = parse_source(source);
+        if let DeclarationKind::Function { body, .. } = &module.declarations[0].node {
+            assert!(matches!(
+                body.statements[0].node,
+                StatementKind::Const { .. }
             ));
         } else {
             panic!("Expected function declaration");

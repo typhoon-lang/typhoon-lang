@@ -263,6 +263,7 @@ impl LiveAnalyzer {
             StatementKind::Expression(expr) => self.consume_identifiers_in_expression(expr),
             StatementKind::Return(Some(expr)) => self.consume_identifiers_in_expression(expr),
             StatementKind::Return(None) => Ok(()),
+            StatementKind::Break | StatementKind::Continue => Ok(()),
             StatementKind::If {
                 condition,
                 then_branch,

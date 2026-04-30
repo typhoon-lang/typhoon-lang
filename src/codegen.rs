@@ -140,12 +140,11 @@ struct IrBuilder<'a> {
     entry_allocas: Vec<String>,
     next_tmp: usize,
     next_label: usize,
+    loop_labels: Vec<(String, String)>, // (start, end)
     current_fn_name: Option<String>,
     current_fn_ret_ty: String,
     locals: HashMap<String, String>,
     locals_type: HashMap<String, String>,
-    parent_locals: HashMap<String, String>, // captured variables from parent scope
-    parent_types: HashMap<String, String>,  // types of captured variables
     mutable_vars: std::collections::HashSet<String>, // track mutable variables for capture
     type_decls: Vec<String>,
     struct_fields: HashMap<String, Vec<(String, String)>>,
@@ -165,12 +164,11 @@ impl<'a> IrBuilder<'a> {
             entry_allocas: Vec::new(),
             next_tmp: 0,
             next_label: 0,
+            loop_labels: Vec::new(),
             current_fn_name: None,
             current_fn_ret_ty: "void".to_string(),
             locals: HashMap::new(),
             locals_type: HashMap::new(),
-            parent_locals: HashMap::new(),
-            parent_types: HashMap::new(),
             mutable_vars: std::collections::HashSet::new(),
             type_decls: Vec::new(),
             struct_fields: HashMap::new(),
@@ -735,6 +733,16 @@ impl<'a> IrBuilder<'a> {
                 self.emit("  ret void".to_string());
                 true
             }
+            StatementKind::Break => {
+                let (_, end) = self.loop_labels.last().unwrap();
+                self.emit(format!("  br label %{}", end));
+                true
+            }
+            StatementKind::Continue => {
+                let (start, _) = self.loop_labels.last().unwrap();
+                self.emit(format!("  br label %{}", start));
+                true
+            }
             StatementKind::LetBinding {
                 pattern,
                 initializer,
@@ -752,11 +760,19 @@ impl<'a> IrBuilder<'a> {
                 // Emit the initializer, test the tag, bind the payload on the success
                 // path, and emit the else block on the failure path.
                 let match_val = self.emit_expr(initializer);
+                // Use the actual LLVM type of the emitted value, not the expression's
+                // inferred type. These diverge when recv() returns Option<T> but the
+                // type inferencer records the call site as T.
+                let match_ty = if let Some(infer) = self.actual_inferred_type(initializer) {
+                    self.lower_infer_type(&infer)
+                } else {
+                    self.expr_llvm_type(initializer)
+                };
                 let then_lbl = self.label("letelse_ok");
                 let else_lbl = self.label("letelse_fail");
                 let merge_lbl = self.label("letelse_merge");
 
-                let ok = self.emit_pattern_test(pattern, initializer, &match_val);
+                let ok = self.emit_pattern_test_typed(pattern, &match_ty, &match_val, initializer);
                 self.emit(format!(
                     "  br i1 {}, label %{}, label %{}",
                     ok, then_lbl, else_lbl
@@ -764,7 +780,7 @@ impl<'a> IrBuilder<'a> {
 
                 // Success path: bind the payload variable(s) into locals and fall through.
                 self.emit(format!("{}:", then_lbl));
-                self.bind_pattern_value(pattern, initializer, &match_val);
+                self.bind_pattern_typed(pattern, &match_val, &match_ty, Some(initializer));
                 self.emit(format!("  br label %{}", merge_lbl));
 
                 // Failure path: emit the else block (typically diverges via return).
@@ -1115,6 +1131,38 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
+    fn emit_pattern_test_typed(
+        &mut self,
+        pattern: &Pattern,
+        ty: &str,
+        scrutinee_val: &str,
+        scrutinee_expr: &Expression,
+    ) -> String {
+        let actual_ty = if let Some(infer) = self.actual_inferred_type(scrutinee_expr) {
+            self.lower_infer_type(&infer)
+        } else {
+            ty.to_string()
+        };
+        match &pattern.node {
+            PatternKind::Wildcard => "1".to_string(),
+            PatternKind::EnumVariant { variant_name, .. } => {
+                if let Some(tag) = enum_variant_tag(&variant_name.name) {
+                    let loaded = self.tmp();
+                    let cmp = self.tmp();
+                    self.emit(format!(
+                        "  {} = extractvalue {} {}, 0",
+                        loaded, actual_ty, scrutinee_val
+                    ));
+                    self.emit(format!("  {} = icmp eq i1 {}, {}", cmp, loaded, tag));
+                    cmp
+                } else {
+                    "1".to_string()
+                }
+            }
+            _ => "1".to_string(),
+        }
+    }
+
     /// Emit a `slab_free` call for the named local, if it was slab-allocated.
     /// Looks up the typed pointer in `locals` and the LLVM type in `locals_type`
     /// to reconstruct the size class.
@@ -1352,6 +1400,7 @@ impl<'a> IrBuilder<'a> {
                 let start = self.label("while_start");
                 let body_lbl = self.label("while_body");
                 let end = self.label("while_end");
+                self.loop_labels.push((start.clone(), end.clone()));
                 self.emit(format!("  br label %{}", start));
                 self.emit(format!("{}:", start));
                 let cond = self.emit_expr(condition);
@@ -1364,6 +1413,7 @@ impl<'a> IrBuilder<'a> {
                     self.emit(format!("  br label %{}", start));
                 }
                 self.emit(format!("{}:", end));
+                self.loop_labels.pop();
             }
             LoopKindKind::For {
                 pattern, iterator, ..
@@ -1390,6 +1440,7 @@ impl<'a> IrBuilder<'a> {
                 let start = self.label("for_start");
                 let body_lbl = self.label("for_body");
                 let end = self.label("for_end");
+                self.loop_labels.push((start.clone(), end.clone()));
                 self.emit(format!("  br label %{}", start));
                 self.emit(format!("{}:", start));
 
@@ -1439,15 +1490,20 @@ impl<'a> IrBuilder<'a> {
                     self.emit(format!("  br label %{}", start));
                 }
                 self.emit(format!("{}:", end));
+                self.loop_labels.pop();
             }
             LoopKindKind::Block(b) => {
                 let start = self.label("loop_start");
+                let end = self.label("loop_end");
+                self.loop_labels.push((start.clone(), end.clone()));
                 self.emit(format!("  br label %{}", start));
                 self.emit(format!("{}:", start));
                 if !self.emit_block_stmts(b, ret_ty) {
                     self.emit("  call void @ty_safepoint()".to_string());
                     self.emit(format!("  br label %{}", start));
                 }
+                self.emit(format!("{}:", end));
+                self.loop_labels.pop();
             }
         }
     }
@@ -1987,13 +2043,15 @@ impl<'a> IrBuilder<'a> {
                         if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
                             let elem_ty = self.lower_infer_type(&ty);
                             self.ensure_option(&elem_ty);
+                            let opt_ty =
+                                format!("%struct.Option__{}", mangle_llvm_type_name(&elem_ty));
 
                             let out_slot = self.tmp();
-                            self.emit_alloca(&out_slot, &elem_ty);
+                            self.emit_alloca(&out_slot, &opt_ty);
                             let out_raw = self.tmp();
                             self.emit(format!(
                                 "  {} = bitcast {}* {} to i8*",
-                                out_raw, elem_ty, out_slot
+                                out_raw, opt_ty, out_slot
                             ));
                             {
                                 let _tv = self.emit_task_load();
@@ -2005,7 +2063,7 @@ impl<'a> IrBuilder<'a> {
                             let loaded = self.tmp();
                             self.emit(format!(
                                 "  {} = load {}, {}* {}",
-                                loaded, elem_ty, elem_ty, out_slot
+                                loaded, opt_ty, opt_ty, out_slot
                             ));
                             return loaded;
                         }
@@ -2474,7 +2532,11 @@ impl<'a> IrBuilder<'a> {
         scrutinee_expr: &Expression,
         scrutinee_val: &str,
     ) -> String {
-        let ty = self.expr_llvm_type(scrutinee_expr);
+        let actual_ty = if let Some(infer) = self.actual_inferred_type(scrutinee_expr) {
+            self.lower_infer_type(&infer)
+        } else {
+            self.expr_llvm_type(scrutinee_expr)
+        };
         match &pattern.node {
             PatternKind::Wildcard => "1".to_string(),
             PatternKind::Identifier(id) => {
@@ -2485,7 +2547,7 @@ impl<'a> IrBuilder<'a> {
                         .locals_type
                         .get(&id.name)
                         .cloned()
-                        .unwrap_or_else(|| ty.clone());
+                        .unwrap_or_else(|| actual_ty.clone());
                     let loaded = self.tmp();
                     self.emit(format!(
                         "  {} = load {}, {}* {}",
@@ -2494,7 +2556,7 @@ impl<'a> IrBuilder<'a> {
                     let cmp = self.tmp();
                     self.emit(format!(
                         "  {} = icmp eq {} {}, {}",
-                        cmp, ty, scrutinee_val, loaded
+                        cmp, actual_ty, scrutinee_val, loaded
                     ));
                     cmp
                 } else {
@@ -2506,7 +2568,7 @@ impl<'a> IrBuilder<'a> {
                     let tmp = self.tmp();
                     self.emit(format!(
                         "  {} = icmp eq {} {}, {}",
-                        tmp, ty, scrutinee_val, v
+                        tmp, actual_ty, scrutinee_val, v
                     ));
                     tmp
                 }
@@ -2528,7 +2590,7 @@ impl<'a> IrBuilder<'a> {
                     let cmp = self.tmp();
                     self.emit(format!(
                         "  {} = extractvalue {} {}, 0",
-                        loaded, ty, scrutinee_val
+                        loaded, actual_ty, scrutinee_val
                     ));
                     self.emit(format!("  {} = icmp eq i1 {}, {}", cmp, loaded, tag));
                     cmp
@@ -2578,7 +2640,7 @@ impl<'a> IrBuilder<'a> {
                 if let Some(idx) = enum_variant_payload_index(&variant_name.name) {
                     let payload_ty = scrutinee_expr
                         .and_then(|e| {
-                            let inferred = self.inferred_expr_type(e)?.clone();
+                            let inferred = self.actual_inferred_type(e)?;
                             Some(self.payload_type_from_infer(&inferred, &variant_name.name, idx))
                         })
                         .unwrap_or_else(|| "i32".to_string());
@@ -2866,7 +2928,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
         // Type checker inference
-        if let Some(ty) = self.inferred_expr_type(expr).cloned() {
+        if let Some(ty) = self.actual_inferred_type(expr) {
             return self.lower_infer_type(&ty);
         }
         // Syntactic fallback
@@ -2937,6 +2999,29 @@ impl<'a> IrBuilder<'a> {
             ExpressionKind::TryOperator { expr } => self.expr_llvm_type(expr),
             _ => "i32".to_string(),
         }
+    }
+
+    fn actual_inferred_type(&self, expr: &Expression) -> Option<InferType> {
+        let ty = self.inferred_expr_type(expr)?.clone();
+        // recv() and try_recv() are only callable on channels. If the field name
+        // matches, we know the IR will produce an Option<T> struct regardless of
+        // what the type-checker recorded for the call site (it records T for recv,
+        // and may or may not have a type-map entry for the base identifier).
+        // Do NOT rely on inferred_expr_type(base) — the type map may not contain
+        // identifier expression nodes at all.
+        if let ExpressionKind::Call { func, .. } = &expr.node {
+            if let ExpressionKind::FieldAccess { field, .. } = &func.node {
+                if matches!(field.name.as_str(), "recv" | "try_recv") {
+                    // Wrap in Option unless the type checker already did so.
+                    let wrapped = match &ty {
+                        InferType::App(n, _) if n == "Option" => ty,
+                        _ => InferType::App("Option".to_string(), vec![ty]),
+                    };
+                    return Some(wrapped);
+                }
+            }
+        }
+        Some(ty)
     }
 
     fn inferred_expr_type(&self, expr: &'a Expression) -> Option<&'a InferType> {

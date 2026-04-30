@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub enum TokenType {
     Let,
     Mut,
+    Const,
     Fn,
     Struct,
     Enum,
@@ -23,6 +24,8 @@ pub enum TokenType {
     Conc,
     Select,
     Recv,
+    Break,
+    Continue,
     Unsafe,
     Use,
     True,
@@ -107,6 +110,7 @@ impl Lexer {
         let kw_list = [
             ("let", TokenType::Let),
             ("mut", TokenType::Mut),
+            ("const", TokenType::Const),
             ("fn", TokenType::Fn),
             ("struct", TokenType::Struct),
             ("enum", TokenType::Enum),
@@ -126,6 +130,8 @@ impl Lexer {
             ("conc", TokenType::Conc),
             ("select", TokenType::Select),
             ("recv", TokenType::Recv),
+            ("break", TokenType::Break),
+            ("continue", TokenType::Continue),
             ("unsafe", TokenType::Unsafe),
             ("use", TokenType::Use),
             ("true", TokenType::True),
@@ -453,12 +459,13 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let input = "let mut fn struct enum interface impl extend newtype match if else for while return in where conc select recv unsafe use true false as";
+        let input = "let mut const fn struct enum interface impl extend newtype match if else for while return in where conc select recv unsafe use true false as";
         let mut lexer = Lexer::new(input.to_string());
         let tokens = lexer.tokenize();
         let expected = vec![
             TokenType::Let,
             TokenType::Mut,
+            TokenType::Const,
             TokenType::Fn,
             TokenType::Struct,
             TokenType::Enum,

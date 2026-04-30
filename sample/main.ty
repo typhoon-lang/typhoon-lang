@@ -22,7 +22,7 @@ impl Popcount {
 
     let mut count = 0;
     while sent > 0 {
-      let value = ch.recv();
+      let Some(value) = ch.recv() else { break; }
       count += value;
       sent -= 1;
     }
@@ -37,9 +37,9 @@ fn handle_connection(socket: Socket) {
   let p: Popcount = Popcount {
     ar: [1, 2, 4, 8, 16, 32, 64, 128],
   }
-  let mut loop = true;
-  while loop {
-    let Some(i) = ch.try_recv() else { loop = false; }
+
+  while true {
+    let Some(i) = ch.recv() else { break; }  // None = channel closed = EOF
     let n = p.check(i);
     printf("Result: %d\r\n", n);
   }

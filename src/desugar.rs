@@ -457,7 +457,18 @@ impl Desugar {
             StatementKind::Return(Some(expr)) => self.rename_expression(expr, aliases),
             StatementKind::Return(None) => {}
             StatementKind::Conc { body } => self.rename_block(body, aliases),
+            StatementKind::Break | StatementKind::Continue => {}
             StatementKind::UseDeclaration(_) => {}
+            StatementKind::Const {
+                type_annotation,
+                initializer,
+                ..
+            } => {
+                if let Some(ty) = type_annotation {
+                    self.rename_type(ty, aliases);
+                }
+                self.rename_expression(initializer, aliases);
+            }
             StatementKind::Loop { kind, body } => {
                 self.rename_loop_kind(kind, aliases);
                 self.rename_block(body, aliases);
@@ -654,7 +665,9 @@ impl Desugar {
             StatementKind::Expression(expr) => self.desugar_expression(expr),
             StatementKind::Return(Some(expr)) => self.desugar_expression(expr),
             StatementKind::Return(None) => Ok(()),
+            StatementKind::Break | StatementKind::Continue => Ok(()),
             StatementKind::Conc { body } => self.desugar_block(body),
+            StatementKind::Const { initializer, .. } => self.desugar_expression(initializer),
             StatementKind::Loop { kind, body } => {
                 match &mut kind.node {
                     LoopKindKind::Block(b) => self.desugar_block(b)?,

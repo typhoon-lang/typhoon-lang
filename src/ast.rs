@@ -160,6 +160,12 @@ pub enum StatementKind {
     },
     // Expression statement (e.g., function call for side effects)
     Expression(Expression),
+    /// Local constant declaration: const NAME: Type = Expression;
+    Const {
+        name: Identifier,
+        type_annotation: Option<Type>,
+        initializer: Expression,
+    },
     // Return statement
     Return(Option<Expression>),
     /// `Conc` block — body is `Block` so the scope has a NodeId.
@@ -184,6 +190,9 @@ pub enum StatementKind {
         expr: Expression,
         arms: Vec<MatchArm>,
     },
+    // Break / Continue
+    Break,
+    Continue,
     // Empty statement
     Empty,
 }
@@ -314,6 +323,11 @@ pub enum DeclarationKind {
         name: Identifier,
         generics: Vec<GenericParam>,
         variants: Vec<EnumVariant>,
+    },
+    Const {
+        name: Identifier,
+        type_annotation: Option<Type>,
+        initializer: Expression,
     },
     Newtype {
         name: Identifier,

@@ -458,6 +458,22 @@ impl TypeChecker {
                 let _ = self.infer_expression(expr)?;
                 Ok(())
             }
+            StatementKind::Const {
+                name,
+                type_annotation,
+                initializer,
+            } => {
+                let init_ty = self.infer_expression(initializer)?;
+                let ty = if let Some(annotation) = type_annotation {
+                    let annotated = self.lower_type(annotation, &HashMap::new())?;
+                    self.unify(init_ty, annotated.clone(), Some(initializer.span))?;
+                    annotated
+                } else {
+                    init_ty
+                };
+                self.insert_local(name.name.clone(), Scheme::mono(self.apply(&ty)));
+                Ok(())
+            }
             StatementKind::Return(Some(expr)) => {
                 let ty = self.infer_expression(expr)?;
                 let expected = expected_return
@@ -541,6 +557,7 @@ impl TypeChecker {
                 }
                 Ok(())
             }
+            StatementKind::Break | StatementKind::Continue => Ok(()),
             StatementKind::Empty | StatementKind::UseDeclaration(_) => Ok(()),
         }
     }

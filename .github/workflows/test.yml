@@ -6,7 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  RUST_BACKTRACE: full
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -31,31 +31,6 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Generate library build (POSIX)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p build
-          cd build
-          cmake -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer" ..
-
-      - name: Generate library build (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. -G "Visual Studio 17 2022" -A x64
-
-      - name: Build library (POSIX)
-        if: runner.os != 'Windows'
-        run: |
-          cd build
-          make
-
-      - name: Build library (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          msbuild build\Typhoon.sln -t:rebuild -verbosity:diag -property:Configuration=Debug
-
       - name: Set up Clang
         if: runner.os != 'macOS'
         uses: egor-tensin/setup-clang@v2
@@ -69,51 +44,6 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      # - name: Enable core dumps and run
-      #   run: |
-      #     # 1. Compile the source
-      #     cargo run --verbose -- sample/main.ty main
-
-      #     ulimit -c unlimited
-      #     ./main || true
-      #     if compgen -G "core*" > /dev/null; then
-      #         gdb -batch \
-      #             -ex "file ./main" \
-      #             -ex "core-file core" \
-      #             -ex "bt full" \
-      #             -ex "info registers" \
-      #             -ex "x/20gx \$rsp" \
-      #             core
-      #     fi
-      - name: Build sample binary
-        # This will use the default shell (PowerShell on Windows),
-        # avoiding the Git Bash PATH conflict.
-        run: cargo build --verbose
-
       - name: Run sample tests
         shell: bash
-        run: |
-          # 1. We already built it, so cargo run will just execute or
-          # we can call the binary directly.
-          cargo run --verbose -- sample/main.ty main
-
-          # 2. Determine the binary name (Windows appends .exe automatically)
-          if [ -f "./main.exe" ]; then
-            TARGET="./main.exe"
-          else
-            TARGET="./main"
-            chmod +x "$TARGET"
-          fi
-
-          echo "--- Starting Execution: $TARGET ---"
-
-          # 3. Execute and force stream capturing
-          # We use 'stdbuf' on Linux to prevent buffering issues
-          # and 'cat' to ensure the pipe stays open for all output
-          if command -v stdbuf &> /dev/null; then
-            stdbuf -oL -eL "$TARGET" 2>&1 | cat
-          else
-            "$TARGET" 2>&1 | cat
-          fi
-
-          echo "--- Execution Finished ---"
+        run: cargo run --verbose -- run sample/main.ty

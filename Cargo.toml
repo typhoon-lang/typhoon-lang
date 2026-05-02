@@ -1,7 +1,21 @@
-[package]
-name = "typhoon-lang"
+[workspace]
+resolver = "2"
+members = [
+  "crates/compiler",
+  "crates/runtime",
+  "crates/cli",
+]
+
+[workspace.package]
 version = "0.0.1"
 edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Afrizal Fikri"]
+repository = "https://github.com/typhoon-lang/typhoon-lang"
+rust-version = "1.90"
 
-[dependencies]
-# No external dependencies for now
+[workspace.dependencies]
+
+# Common internal dependencies
+typhoon-compiler = { path = "crates/compiler" }
+typhoon-runtime = { path = "crates/runtime" }

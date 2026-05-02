@@ -1,0 +1,17 @@
+[package]
+name = "typhoon-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Typhoon lang CLI"
+
+[[bin]]
+name = "tyc"
+path = "src/main.rs"
+
+[dependencies]
+typhoon-compiler = { workspace = true }
+typhoon-runtime = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "typhoon-compiler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Typhoon lang compiler engine"
+
+[lib]
+doctest = false
+
+[dependencies]
+# No external dependencies for now

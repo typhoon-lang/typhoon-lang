@@ -11,11 +11,16 @@
  */
 
 /* macOS prefixes C symbols with '_'; Linux does not.
- * Emit both labels so the same file links on both. */
+ * SYM(name)       — the platform-canonical label (e.g. _foo on macOS, foo on Linux)
+ * SYM_ALIAS(name) — the unprefixed alias, emitted ONLY on macOS where it differs
+ *                   from SYM(name).  On Linux the two would be identical, which
+ *                   causes "symbol already defined" assembler errors. */
 #if defined(__APPLE__)
-#  define SYM(name)  _ ## name
+#  define SYM(name)        _ ## name
+#  define SYM_ALIAS(name)  name:
 #else
-#  define SYM(name)  name
+#  define SYM(name)        name
+#  define SYM_ALIAS(name)  /* nothing — SYM(name) already is 'name' */
 #endif
 
 /* ── x86-64 ──────────────────────────────────────────────────────────── */
@@ -23,15 +28,13 @@
 
 .data
 .globl SYM(ty__entry_rsp)
-.globl ty__entry_rsp
+SYM_ALIAS(ty__entry_rsp)
 SYM(ty__entry_rsp):
-ty__entry_rsp:
     .quad 0
 
 .globl SYM(ty__entry_top)
-.globl ty__entry_top
+SYM_ALIAS(ty__entry_top)
 SYM(ty__entry_top):
-ty__entry_top:
     .quad 0
 
 .text
@@ -44,11 +47,10 @@ ty__entry_top:
  *   [32] r12   [40] rbx   [48] rbp   [56] rip
  */
 .globl SYM(ty_ctx_swap)
-.globl ty_ctx_swap
+SYM_ALIAS(ty_ctx_swap)
 SYM(ty_ctx_swap):
-ty_ctx_swap:
-    movq (%rsp), %rax     /* read return addr pushed by 'call ty_ctx_swap' */
-    movq %rax,  56(%rdi)  /* save it as the true resume RIP                */
+    movq (%rsp), %rax      /* read return addr pushed by 'call ty_ctx_swap' */
+    movq %rax,  56(%rdi)   /* save it as the true resume RIP                */
     leaq 8(%rsp), %rax    /* compute post-call RSP (past the return addr)   */
     movq %rax,   0(%rdi)  /* save adjusted RSP                             */
     movq %r15,   8(%rdi)
@@ -78,9 +80,8 @@ ty_ctx_swap:
  *   [rsp+16]  lo
  */
 .globl SYM(ty__coro_entry)
-.globl ty__coro_entry
+SYM_ALIAS(ty__coro_entry)
 SYM(ty__coro_entry):
-ty__coro_entry:
     popq %rax                   /* tramp → scratch register    */
     popq %rdi                   /* hi   → first  arg (uint32_t) */
     popq %rsi                   /* lo   → second arg (uint32_t) */
@@ -101,9 +102,8 @@ ty__coro_entry:
  *   [96] sp   [104] pad
  */
 .globl SYM(ty_ctx_swap)
-.globl ty_ctx_swap
+SYM_ALIAS(ty_ctx_swap)
 SYM(ty_ctx_swap):
-ty_ctx_swap:
     stp x19, x20, [x0,  #0]
     stp x21, x22, [x0, #16]
     stp x23, x24, [x0, #32]
@@ -140,9 +140,8 @@ ty_ctx_swap:
  *   x19 = tramp   x20 = hi (uint32_t)   x21 = lo (uint32_t)
  */
 .globl SYM(ty__coro_entry)
-.globl ty__coro_entry
+SYM_ALIAS(ty__coro_entry)
 SYM(ty__coro_entry):
-ty__coro_entry:
     mov  x9,  x19               /* tramp → scratch (x19 is callee-saved) */
     mov  w0,  w20               /* hi → first  arg                     */
     mov  w1,  w21               /* lo → second arg                     */

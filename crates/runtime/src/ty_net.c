@@ -229,12 +229,10 @@ void __ty_method__Network__listen(void* task, TyNetwork* self, char* addr, TyRes
     #if defined(_WIN32)
     if (s == INVALID_SOCKET) {
         out.err = last_err ? last_err : ty_net_last_error();
-#if defined(_WIN32)
         char msg[256];
         TY_DEBUG("[net] listen failed addr=\"%s\" wsa=%ld (%s)\n",
             addr ? addr : "(null)", (long)out.err,
             ty_net_errstr_win32(out.err, msg, sizeof(msg)));
-#endif
         *outp = out;
         return;
     }
@@ -332,14 +330,13 @@ static void socket_consumer_coro(void* task, void* arg) {
             /* A real error (not EAGAIN/EWOULDBLOCK — socket is blocking).
              * Treat as EOF so the reader's recv()/try_recv() loop terminates
              * cleanly rather than spinning forever on a broken socket. */
-            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
-                ty_net_last_error(),
 #if defined(_WIN32)
-                "winsock"
+            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
+                ty_net_last_error(), "winsock");
 #else
-                strerror(ty_net_last_error())
+            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
+                ty_net_last_error(), strerror(ty_net_last_error()));
 #endif
-            );
             break;
         }
         if (r == 0) {

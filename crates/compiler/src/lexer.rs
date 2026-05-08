@@ -27,6 +27,7 @@ pub enum TokenType {
     Break,
     Continue,
     Unsafe,
+    Extern,
     Use,
     True,
     False,
@@ -133,6 +134,7 @@ impl Lexer {
             ("break", TokenType::Break),
             ("continue", TokenType::Continue),
             ("unsafe", TokenType::Unsafe),
+            ("extern", TokenType::Extern),
             ("use", TokenType::Use),
             ("true", TokenType::True),
             ("false", TokenType::False),
@@ -459,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let input = "let mut const fn struct enum interface impl extend newtype match if else for while return in where conc select recv unsafe use true false as";
+        let input = "let mut const fn struct enum interface impl extend newtype match if else for while return in where conc select recv unsafe extern use true false as";
         let mut lexer = Lexer::new(input.to_string());
         let tokens = lexer.tokenize();
         let expected = vec![
@@ -485,6 +487,7 @@ mod tests {
             TokenType::Select,
             TokenType::Recv,
             TokenType::Unsafe,
+            TokenType::Extern,
             TokenType::Use,
             TokenType::True,
             TokenType::False,

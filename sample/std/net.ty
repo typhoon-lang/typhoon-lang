@@ -1,0 +1,39 @@
+namespace std::net
+
+use std::result::Result;
+use std::option::Option;
+
+struct Network {}
+
+impl Network {
+  fn listen(self: Network, addr: Str) -> Result<Listener, Int32> {
+    return __ty_rt__Network__listen(self, addr);
+  }
+}
+
+struct Listener {}
+
+impl Listener {
+  fn accept(self: Listener) -> Result<Socket, Int32> {
+    return __ty_rt__Listener__accept(self);
+  }
+}
+
+struct Socket {}
+
+impl Socket {
+  fn consume(self: Socket, chan: ref chan<Int8>) {
+    __ty_rt__Socket__consume(self, chan);
+  }
+
+  fn close(self: Socket) {
+    __ty_rt__Socket__close(self);
+  }
+}
+
+extern "C" {
+    fn __ty_rt__Network__listen(self: Network, addr: Str) -> Result<Listener, Int32>
+    fn __ty_rt__Listener__accept(self: Listener) -> Result<Socket, Int32>
+    fn __ty_rt__Socket__consume(self: Socket, chan: chan<Int8>)
+    fn __ty_rt__Socket__close(self: Socket)
+}

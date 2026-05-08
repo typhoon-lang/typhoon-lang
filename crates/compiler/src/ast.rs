@@ -393,16 +393,7 @@ pub type UnsafeOrExtern = Spanned<UnsafeOrExternKind>;
 pub enum UnsafeOrExternKind {
     Extern {
         abi: String,
-        declarations: Vec<FFIDeclaration>,
+        declarations: Vec<FunctionSignature>,
     },
     UnsafeBlock(Block),
-}
-
-pub type FFIDeclaration = Spanned<FFIDeclarationKind>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FFIDeclarationKind {
-    pub fn_name: Identifier,
-    pub params: Vec<Type>,
-    pub return_type: Type,
 }

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeVarId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InferType {
     Var(TypeVarId),
     Con(String),
@@ -48,6 +48,7 @@ pub enum TypeError {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct TypeChecker {
     next_var: usize,
     subst: HashMap<TypeVarId, InferType>,
@@ -57,6 +58,11 @@ pub struct TypeChecker {
     types: HashMap<NodeId, InferType>,
     struct_fields: HashMap<String, HashMap<String, InferType>>,
     newtype_alias: HashMap<String, InferType>,
+    pub specializations: HashMap<(String, Vec<InferType>), String>,
+    enum_variants: HashMap<String, (String, Vec<TypeVarId>, Option<InferType>)>,
+    option_type_name: Option<String>,
+    result_type_name: Option<String>,
+    pub extern_fns: HashSet<String>,
 }
 
 impl TypeChecker {
@@ -70,20 +76,31 @@ impl TypeChecker {
             types: HashMap::new(),
             struct_fields: HashMap::new(),
             newtype_alias: HashMap::new(),
+            specializations: HashMap::new(),
+            enum_variants: HashMap::new(),
+            option_type_name: None,
+            result_type_name: None,
+            extern_fns: HashSet::new(),
         }
     }
 
     pub fn check_module(&mut self, module: &Module) -> Result<(), TypeError> {
+        // eprintln!("Type checking module...");
+        // for decl in &module.declarations {
+        //     eprintln!("Declaration: {:?}", decl.node);
+        // }
         self.reset();
         self.collect_type_info(module)?;
         self.predeclare_functions(module)?;
         for decl in &module.declarations {
-            if let DeclarationKind::Function { name, .. } = &decl.node {
-                self.check_function(name, decl)?;
+            // eprintln!("Checking decl: {:?}", decl.node);
+            match &decl.node {
+                DeclarationKind::Function { name, .. } => {
+                    self.check_function(name, decl)?;
+                }
+                _ => {}
             }
         }
-        // Freeze inferred expression types by applying final substitutions.
-        // Codegen reads this map directly and expects concrete types.
         self.finalize_types();
         Ok(())
     }
@@ -99,6 +116,10 @@ impl TypeChecker {
         self.struct_fields.clear();
         self.newtype_alias.clear();
         self.seed_builtins();
+        self.enum_variants.clear();
+        self.option_type_name = None;
+        self.result_type_name = None;
+        self.extern_fns.clear();
     }
 
     pub fn types(&self) -> &HashMap<NodeId, InferType> {
@@ -136,154 +157,51 @@ impl TypeChecker {
                 Box::new(InferType::Con("Str".into())),
             )),
         );
-
-        let t = self.fresh_var_id();
-        let e = self.fresh_var_id();
-        self.set_global(
-            "__ty_result_err".into(),
-            Scheme {
-                vars: vec![t, e],
-                ty: InferType::Fn(
-                    vec![InferType::Var(e)],
-                    Box::new(InferType::App(
-                        "Result".into(),
-                        vec![InferType::Var(t), InferType::Var(e)],
-                    )),
-                ),
-            },
-        );
-
-        // ── Networking (runtime-provided methods) ───────────────────────────
-        // net.listen(addr: Str) -> Result<Listener, Int32>
-        self.set_global(
-            "__ty_method__Network__listen".into(),
-            Scheme::mono(InferType::Fn(
-                vec![
-                    InferType::Con("Network".into()),
-                    InferType::Con("Str".into()),
-                ],
-                Box::new(InferType::App(
-                    "Result".into(),
-                    vec![
-                        InferType::Con("Listener".into()),
-                        InferType::Con("Int32".into()),
-                    ],
-                )),
-            )),
-        );
-        // listener.accept() -> Result<Socket, Int32>
-        self.set_global(
-            "__ty_method__Listener__accept".into(),
-            Scheme::mono(InferType::Fn(
-                vec![InferType::Con("Listener".into())],
-                Box::new(InferType::App(
-                    "Result".into(),
-                    vec![
-                        InferType::Con("Socket".into()),
-                        InferType::Con("Int32".into()),
-                    ],
-                )),
-            )),
-        );
-        // socket.consume(ch: chan) -> Unit
-        self.set_global(
-            "__ty_method__Socket__consume".into(),
-            Scheme::mono(InferType::Fn(
-                vec![
-                    InferType::Con("Socket".into()),
-                    InferType::App(
-                        "Ref".into(),
-                        vec![InferType::App(
-                            "Chan".into(),
-                            vec![InferType::Con("Int8".into())],
-                        )],
-                    ),
-                ],
-                Box::new(InferType::Con("Unit".into())),
-            )),
-        );
-        // socket.close() -> Unit
-        self.set_global(
-            "__ty_method__Socket__close".into(),
-            Scheme::mono(InferType::Fn(
-                vec![InferType::Con("Socket".into())],
-                Box::new(InferType::Con("Unit".into())),
-            )),
-        );
-
-        let t2 = self.fresh_var_id();
-        let e2 = self.fresh_var_id();
-        self.set_global(
-            "__ty_result_ok".into(),
-            Scheme {
-                vars: vec![t2, e2],
-                ty: InferType::Fn(
-                    vec![InferType::Var(t2)],
-                    Box::new(InferType::App(
-                        "Result".into(),
-                        vec![InferType::Var(t2), InferType::Var(e2)],
-                    )),
-                ),
-            },
-        );
-
-        // User-facing constructors (used by desugaring and future parsing)
-        let t3 = self.fresh_var_id();
-        let e3 = self.fresh_var_id();
-        self.set_global(
-            "Ok".into(),
-            Scheme {
-                vars: vec![t3, e3],
-                ty: InferType::Fn(
-                    vec![InferType::Var(t3)],
-                    Box::new(InferType::App(
-                        "Result".into(),
-                        vec![InferType::Var(t3), InferType::Var(e3)],
-                    )),
-                ),
-            },
-        );
-        let t4 = self.fresh_var_id();
-        let e4 = self.fresh_var_id();
-        self.set_global(
-            "Err".into(),
-            Scheme {
-                vars: vec![t4, e4],
-                ty: InferType::Fn(
-                    vec![InferType::Var(e4)],
-                    Box::new(InferType::App(
-                        "Result".into(),
-                        vec![InferType::Var(t4), InferType::Var(e4)],
-                    )),
-                ),
-            },
-        );
-        let t5 = self.fresh_var_id();
-        self.set_global(
-            "Some".into(),
-            Scheme {
-                vars: vec![t5],
-                ty: InferType::Fn(
-                    vec![InferType::Var(t5)],
-                    Box::new(InferType::App("Option".into(), vec![InferType::Var(t5)])),
-                ),
-            },
-        );
-        let t6 = self.fresh_var_id();
-        self.set_global(
-            "None".into(),
-            Scheme {
-                vars: vec![t6],
-                ty: InferType::App("Option".into(), vec![InferType::Var(t6)]),
-            },
-        );
     }
 
     fn predeclare_functions(&mut self, module: &Module) -> Result<(), TypeError> {
         for decl in &module.declarations {
-            if let DeclarationKind::Function { name, .. } = &decl.node {
-                let (scheme, _, _, _) = self.lower_function_signature(decl)?;
-                self.set_global(name.name.clone(), scheme);
+            match &decl.node {
+                DeclarationKind::Function { name, .. } => {
+                    // eprintln!("Registering function: {}", name.name);
+                    let (scheme, _, _, _) = self.lower_function_signature(decl)?;
+                    self.set_global(name.name.clone(), scheme);
+                }
+                DeclarationKind::UnsafeOrExtern(uoe) => {
+                    if let UnsafeOrExternKind::Extern { declarations, .. } = &uoe.node {
+                        for sig in declarations {
+                            let FunctionSignatureKind {
+                                name,
+                                generics,
+                                params,
+                                return_type,
+                            } = &sig.node;
+
+                            let mut generic_vars = HashMap::new();
+                            for g in generics {
+                                if let InferType::Var(id) = self.fresh_rigid_var() {
+                                    generic_vars.insert(g.node.name.name.clone(), id);
+                                }
+                            }
+
+                            let param_tys: Vec<InferType> = params
+                                .iter()
+                                .map(|p| self.lower_type(&p.type_annotation, &generic_vars))
+                                .collect::<Result<_, _>>()?;
+
+                            let ret_ty = match return_type {
+                                Some(ty) => self.lower_type(ty, &generic_vars)?,
+                                None => InferType::Con("Unit".into()),
+                            };
+
+                            let fn_ty = InferType::Fn(param_tys.clone(), Box::new(ret_ty.clone()));
+                            let scheme = self.generalize(&fn_ty, None);
+                            self.set_global(name.name.clone(), scheme);
+                            self.extern_fns.insert(name.name.clone());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -300,7 +218,7 @@ impl TypeChecker {
                 } => {
                     let mut generic_vars = HashMap::new();
                     for g in generics {
-                        if let InferType::Var(id) = self.fresh_rigid_var() {
+                        if let InferType::Var(id) = self.fresh_var() {
                             generic_vars.insert(g.node.name.name.clone(), id);
                         }
                     }
@@ -315,6 +233,90 @@ impl TypeChecker {
                     let alias = self.lower_type(type_alias, &HashMap::new())?;
                     self.newtype_alias.insert(name.name.clone(), alias);
                 }
+                DeclarationKind::Enum {
+                    name,
+                    generics,
+                    variants,
+                } => {
+                    let mut generic_vars = HashMap::new();
+                    for g in generics {
+                        if let InferType::Var(id) = self.fresh_var() {
+                            generic_vars.insert(g.node.name.name.clone(), id);
+                        }
+                    }
+                    let ordered_vars = generics
+                        .iter()
+                        .filter_map(|g| generic_vars.get(&g.node.name.name).copied())
+                        .collect::<Vec<_>>();
+                    let enum_ty = if generic_vars.is_empty() {
+                        InferType::Con(name.name.clone())
+                    } else {
+                        InferType::App(
+                            name.name.clone(),
+                            ordered_vars.iter().map(|id| InferType::Var(*id)).collect(),
+                        )
+                    };
+
+                    // Register canonical Option/Result type names (post-mangling) by shape.
+                    // This avoids hard-coding "Option"/"Result" strings elsewhere.
+                    let variant_names = variants
+                        .iter()
+                        .map(|v| v.node.name.name.as_str())
+                        .collect::<Vec<_>>();
+                    if variant_names.iter().any(|&v| v == "Some")
+                        && variant_names.iter().any(|&v| v == "None")
+                    {
+                        self.option_type_name = Some(name.name.clone());
+                    }
+                    if variant_names.iter().any(|&v| v == "Ok")
+                        && variant_names.iter().any(|&v| v == "Err")
+                    {
+                        self.result_type_name = Some(name.name.clone());
+                    }
+
+                    for variant in variants {
+                        let variant_name = variant.node.name.name.clone();
+                        let payload_ty = match &variant.node.payload {
+                            None => None,
+                            Some(p) => match &p.node {
+                                EnumVariantPayloadKind::Tuple(types) if types.len() == 1 => {
+                                    Some(self.lower_type(&types[0], &generic_vars)?)
+                                }
+                                EnumVariantPayloadKind::Tuple(types) => {
+                                    // Multi-field tuple variant: not yet fully supported in
+                                    // pattern binding, but register a fresh var as placeholder.
+                                    let _ = types;
+                                    Some(self.fresh_var())
+                                }
+                                EnumVariantPayloadKind::Struct(_) => Some(self.fresh_var()),
+                                // WTF is Enum Unit? For now, register a fresh var as placeholder too
+                                EnumVariantPayloadKind::Unit(_) => Some(self.fresh_var()),
+                            },
+                        };
+                        self.enum_variants.insert(
+                            variant_name.clone(),
+                            (name.name.clone(), ordered_vars.clone(), payload_ty.clone()),
+                        );
+
+                        // Seed a constructor function so call-site inference works.
+                        // e.g. `Ok(val)` is a call whose return type is Result<T, E>.
+                        if let Some(ref inner) = payload_ty {
+                            self.set_global(
+                                variant_name.clone(),
+                                Scheme {
+                                    vars: ordered_vars.clone(),
+                                    ty: InferType::Fn(
+                                        vec![inner.clone()],
+                                        Box::new(enum_ty.clone()),
+                                    ),
+                                },
+                            );
+                        } else {
+                            // Unit variant: bind as the enum type itself.
+                            self.set_global(variant_name.clone(), Scheme::mono(enum_ty.clone()));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -322,11 +324,13 @@ impl TypeChecker {
     }
 
     fn check_function(&mut self, name: &Identifier, decl: &Declaration) -> Result<(), TypeError> {
+        // eprintln!("Checking function: {}", name.name);
         let (scheme, param_tys, ret_ty, fn_ty) = self.lower_function_signature(decl)?;
         self.set_global(name.name.clone(), scheme);
 
         let body = match &decl.node {
             DeclarationKind::Function { params, body, .. } => {
+                // eprintln!("Function body: {:?}", body.statements.len());
                 self.current_return = Some(ret_ty.clone());
                 self.push_scope();
                 for (param, ty) in params.iter().zip(param_tys.iter()) {
@@ -354,6 +358,15 @@ impl TypeChecker {
         &mut self,
         decl: &Declaration,
     ) -> Result<(Scheme, Vec<InferType>, InferType, InferType), TypeError> {
+        // Accept an extra `outer_generics` slice for extend-block type params
+        self.lower_function_signature_with_outer(decl, &[])
+    }
+
+    fn lower_function_signature_with_outer(
+        &mut self,
+        decl: &Declaration,
+        outer_generics: &[String], // e.g. ["T"] from `extend<T> Option<T>`
+    ) -> Result<(Scheme, Vec<InferType>, InferType, InferType), TypeError> {
         let (generics, params, return_type) = match &decl.node {
             DeclarationKind::Function {
                 generics,
@@ -365,11 +378,19 @@ impl TypeChecker {
         };
 
         let mut generic_vars = HashMap::new();
-        for generic in generics {
+        for name in outer_generics {
             if let InferType::Var(id) = self.fresh_rigid_var() {
+                generic_vars.insert(name.clone(), id);
+            }
+        }
+
+        // Then the method's own generics
+        for generic in generics {
+            if let InferType::Var(id) = self.fresh_var() {
                 generic_vars.insert(generic.node.name.name.clone(), id);
             }
         }
+        // eprintln!("Generic vars: {:?}", generic_vars);
 
         let mut param_tys = Vec::new();
         for param in params {
@@ -378,7 +399,7 @@ impl TypeChecker {
 
         let ret_ty = match return_type {
             Some(ty) => self.lower_type(ty, &generic_vars)?,
-            None => self.fresh_var(),
+            None => InferType::Con("Unit".into()), // was: self.fresh_var()
         };
 
         let fn_ty = InferType::Fn(param_tys.clone(), Box::new(ret_ty.clone()));
@@ -409,6 +430,7 @@ impl TypeChecker {
         stmt: &Statement,
         expected_return: Option<&InferType>,
     ) -> Result<(), TypeError> {
+        // eprintln!("Checking statement: {:?}", stmt.node);
         match &stmt.node {
             StatementKind::LetBinding {
                 pattern,
@@ -417,6 +439,7 @@ impl TypeChecker {
                 else_block,
                 mutable,
             } => {
+                // eprintln!("LetBinding pattern: {:?}", pattern.node);
                 let init_ty = self.infer_expression(initializer)?;
                 let mut ty = if let Some(annotation) = type_annotation {
                     let annotated = self.lower_type(annotation, &HashMap::new())?;
@@ -442,11 +465,19 @@ impl TypeChecker {
                     self.insert_local(id.name.clone(), scheme);
                 } else {
                     // EnumVariant pattern: let Ok(x) = expr else { ... }
-                    // Unwrap the payload type and bind the inner name as mono.
-                    // Generalization is not meaningful here — the payload type is
-                    // determined by the concrete Result/Option the RHS returns.
-                    let payload_ty = self.unwrap_enum_payload(pattern, &ty);
-                    self.bind_pattern(pattern, &payload_ty)?;
+                    // `ty` is the full wrapper type e.g. Result<Listener, Int32>.
+                    // Extract the Ok/Some payload and bind the inner pattern to it directly.
+                    if let PatternKind::EnumVariant {
+                        payload: Some(inner_pat),
+                        ..
+                    } = &pattern.node
+                    {
+                        let payload_ty = self.unwrap_enum_payload(pattern, &ty);
+                        self.bind_pattern(inner_pat, &payload_ty)?;
+                    } else {
+                        // Unit variant or bare enum pattern — nothing to bind
+                        self.bind_pattern(pattern, &ty)?;
+                    }
                 }
 
                 if let Some(else_blk) = else_block {
@@ -568,7 +599,10 @@ impl TypeChecker {
             ExpressionKind::Identifier(id) => {
                 if id.name.as_str() == "chan" {
                     // chan has a generic return type that depends on context
-                    return Ok(InferType::Con("Chan".into()));
+                    return Ok(InferType::App(
+                        "Chan".into(),
+                        vec![InferType::Var(self.fresh_var_id())],
+                    ));
                 }
 
                 if self.try_inner_func(id.name.clone()) {
@@ -606,7 +640,7 @@ impl TypeChecker {
                 if let ExpressionKind::Identifier(id) = &func.node {
                     if id.name == "chan" {
                         let elem_ty = self.fresh_var();
-                        // chan() always produces a shared channel — wrap in Ref
+                        // chan() produces a shared channel — wrap in Ref
                         return Ok(InferType::App(
                             "Ref".into(),
                             vec![InferType::App("Chan".into(), vec![elem_ty])],
@@ -643,8 +677,26 @@ impl TypeChecker {
                                     }
                                     InferType::Con("Unit".into())
                                 }
+                                "consume" => {
+                                    if let Some(first) = arg_tys.first().cloned() {
+                                        let unwrapped = match self.apply(&first) {
+                                            InferType::App(name, args)
+                                                if name == "Ref" && args.len() == 1 =>
+                                            {
+                                                self.apply(&args[0])
+                                            }
+                                            other => other,
+                                        };
+                                        self.unify(
+                                            unwrapped,
+                                            InferType::App("Chan".into(), vec![elem]),
+                                            Some(expr.span),
+                                        )?;
+                                    }
+                                    InferType::Con("Unit".into())
+                                }
                                 "recv" => elem,
-                                "try_recv" => InferType::App("Option".into(), vec![elem]),
+                                "try_recv" => self.make_option_ty(elem),
                                 _ => {
                                     let method_name =
                                         format!("__ty_method__{}__{}", name, field.name);
@@ -729,6 +781,21 @@ impl TypeChecker {
                     for arg in args {
                         arg_tys.push(self.infer_expression(arg)?);
                     }
+
+                    // Track specialization for monomorphization
+                    if let ExpressionKind::Identifier(id) = &func.node {
+                        if !self.extern_fns.contains(&id.name) {
+                            let concrete_args =
+                                arg_tys.iter().map(|t| self.apply(t)).collect::<Vec<_>>();
+                            let key = (id.name.clone(), concrete_args);
+                            if !self.specializations.contains_key(&key) {
+                                let name =
+                                    format!("{}_spec_{}", id.name, self.specializations.len());
+                                self.specializations.insert(key, name);
+                            }
+                        }
+                    }
+
                     let ret = self.fresh_var();
                     self.unify(
                         callee,
@@ -764,7 +831,8 @@ impl TypeChecker {
                 let index_ty = self.infer_expression(index)?;
                 self.unify(index_ty, InferType::Con("Int32".into()), Some(index.span))?;
                 if let Some(elem) = self.array_elem_type(&base_ty) {
-                    InferType::App("Option".into(), vec![elem])
+                    // Use the stdlib-registered Option type name rather than a literal string.
+                    self.make_option_ty(elem)
                 } else {
                     self.fresh_var()
                 }
@@ -773,6 +841,21 @@ impl TypeChecker {
                 for (_, field_expr) in fields {
                     let _ = self.infer_expression(field_expr)?;
                 }
+
+                // Track specialization for generic structs
+                // Note: name.name holds the struct name. Need to access generic args if present.
+                // Assuming struct name follows a naming convention or we can infer them.
+                // For now, track based on name and fields.
+                let concrete_fields = fields
+                    .iter()
+                    .map(|(_, e)| self.apply(&self.types.get(&e.id).cloned().unwrap()))
+                    .collect::<Vec<_>>();
+                let key = (name.name.clone(), concrete_fields);
+                if !self.specializations.contains_key(&key) {
+                    let spec_name = format!("{}_spec_{}", name.name, self.specializations.len());
+                    self.specializations.insert(key, spec_name);
+                }
+
                 InferType::Con(name.name.clone())
             }
             ExpressionKind::MergeExpression { base, fields } => {
@@ -979,7 +1062,7 @@ impl TypeChecker {
                 payload: Some(payload),
                 ..
             } => {
-                if let Some(inner) = result_variant_payload(expected, &variant_name.name) {
+                if let Some(inner) = self.enum_variant_payload(expected, &variant_name.name) {
                     self.bind_pattern(payload, &inner)
                 } else {
                     self.bind_pattern(payload, expected)
@@ -1034,13 +1117,34 @@ impl TypeChecker {
         }
     }
 
+    // Construct `Option<T>` using the registered stdlib name if available,
+    // falling back to the literal string "Option" for bootstrapping.
+    fn make_option_ty(&self, inner: InferType) -> InferType {
+        let name = self
+            .option_type_name
+            .clone()
+            .unwrap_or_else(|| "Option".into());
+        InferType::App(name, vec![inner])
+    }
+
     fn try_inner_type(&self, ty: &InferType) -> Option<InferType> {
         match self.apply(ty) {
-            InferType::App(name, args) if name == "Result" && args.len() == 2 => {
-                Some(args[0].clone())
-            }
-            InferType::App(name, args) if name == "Option" && args.len() == 1 => {
-                Some(args[0].clone())
+            // Generalised: unwrap the Ok/Some payload for any enum whose first
+            // variant carries a single-field tuple payload.  For now we still
+            // special-case the names so the logic is identical to before, but
+            // this can be replaced by an enum_variants table lookup once the
+            // stdlib is fully loaded.
+            InferType::App(ref name, ref args) => {
+                if let Some((_, _, payload)) = self
+                    .enum_variants
+                    .values()
+                    .find(|(enum_name, _, _)| enum_name == name)
+                {
+                    // Return the payload of the first registered variant that
+                    // matches this enum type.
+                    return payload.clone();
+                }
+                None
             }
             _ => None,
         }
@@ -1071,16 +1175,12 @@ impl TypeChecker {
         ty: &Type,
         generic_vars: &HashMap<String, TypeVarId>,
     ) -> Result<InferType, TypeError> {
-        if let Some(var) = generic_vars.get(&ty.node.name) {
-            if !ty.node.generic_args.is_empty() {
-                return Err(TypeError::TypeMismatch {
-                    expected: InferType::Var(*var),
-                    actual: InferType::App(ty.node.name.clone(), Vec::new()),
-                    context: "generic type application".into(),
-                    span: Some(ty.span),
-                });
-            }
-            return Ok(InferType::Var(*var));
+        // Special case: function types written as Fn<Arg, Ret> or T -> U
+        // are represented with name "Fn" and 2 generic args [param, ret]
+        if ty.node.name == "Fn" && ty.node.generic_args.len() == 2 {
+            let param = self.lower_type(&ty.node.generic_args[0], generic_vars)?;
+            let ret = self.lower_type(&ty.node.generic_args[1], generic_vars)?;
+            return Ok(InferType::Fn(vec![param], Box::new(ret)));
         }
 
         let args = ty
@@ -1090,7 +1190,11 @@ impl TypeChecker {
             .map(|arg| self.lower_type(arg, generic_vars))
             .collect::<Result<Vec<_>, _>>()?;
         if args.is_empty() {
-            Ok(InferType::Con(ty.node.name.clone()))
+            if let Some(id) = generic_vars.get(&ty.node.name) {
+                Ok(InferType::Var(*id))
+            } else {
+                Ok(InferType::Con(ty.node.name.clone()))
+            }
         } else {
             Ok(InferType::App(ty.node.name.clone(), args))
         }
@@ -1321,12 +1425,28 @@ impl TypeChecker {
                 }
                 self.unify(*a_ret, *b_ret, span)
             }
-            (expected, actual) => Err(TypeError::TypeMismatch {
-                expected,
-                actual,
-                context: "unification".into(),
-                span,
-            }),
+            (expected, actual) => {
+                eprintln!("Unify: {:?} {:?}", expected, actual);
+                eprintln!("next_var: {:?}", self.next_var);
+                eprintln!("subst: {:?}", self.subst);
+                eprintln!("rigid: {:?}", self.rigid);
+                eprintln!("scopes: {:?}", self.scopes);
+                eprintln!("current_return: {:?}", self.current_return);
+                eprintln!("types: {:?}", self.types);
+                eprintln!("struct_fields: {:?}", self.struct_fields);
+                eprintln!("newtype_alias: {:?}", self.newtype_alias);
+                eprintln!("specializations: {:?}", self.specializations);
+                eprintln!("enum_variants: {:?}", self.enum_variants);
+                eprintln!("option_type_name: {:?}", self.option_type_name);
+                eprintln!("result_type_name: {:?}", self.result_type_name);
+                eprintln!("extern_fns: {:?}", self.extern_fns);
+                Err(TypeError::TypeMismatch {
+                    expected,
+                    actual,
+                    context: "unification".into(),
+                    span,
+                })
+            }
         }
     }
 
@@ -1341,6 +1461,7 @@ impl TypeChecker {
             return Ok(());
         }
         if self.rigid.contains(&var) {
+            eprintln!("Rigid {:?} {:?}", var, ty);
             return Err(TypeError::TypeMismatch {
                 expected: InferType::Var(var),
                 actual: ty,
@@ -1367,33 +1488,83 @@ impl TypeChecker {
         }
     }
 
-    /// For an EnumVariant pattern like `Ok(x)` or `Some(i)`, unwrap the
-    /// corresponding payload type from a `Result<T,E>` or `Option<T>` so
-    /// that `bind_pattern` sees `T` rather than the whole wrapper.
-    /// For any other pattern shape the original type is returned unchanged.
+    /// Given an enum name and the concrete type args it was instantiated with
+    /// at the call site (e.g. `Option<TypeVarId(37)>`), returns a substitution
+    /// mapping from the registration-time generic vars to those concrete args.
+    fn build_enum_var_mapping(
+        &self,
+        enum_name: &str,
+        concrete_args: &[InferType],
+    ) -> HashMap<TypeVarId, InferType> {
+        // Find any variant that belongs to this enum to retrieve the ordered vars.
+        // All variants of the same enum share the same ordered_vars list.
+        let ordered_vars = self
+            .enum_variants
+            .values()
+            .find(|(name, _, _)| name == enum_name)
+            .map(|(_, vars, _)| vars.as_slice())
+            .unwrap_or(&[]);
+
+        ordered_vars
+            .iter()
+            .zip(concrete_args.iter())
+            .map(|(var_id, concrete)| (*var_id, concrete.clone()))
+            .collect()
+    }
+
+    /// Returns the payload type for an enum variant, substituting the
+    /// registration-time generic vars with the concrete args from the scrutinee.
+    fn enum_variant_payload(&self, scrutinee: &InferType, variant: &str) -> Option<InferType> {
+        let (enum_name, _, stored_payload) = self.enum_variants.get(variant)?;
+        let stored_payload = stored_payload.as_ref()?;
+
+        if let InferType::App(sname, sargs) = self.apply(scrutinee) {
+            if &sname == enum_name {
+                let mapping = self.build_enum_var_mapping(&sname, &sargs);
+                return Some(Self::substitute_ty(stored_payload, &mapping));
+            }
+        }
+
+        // Scrutinee is not a generic App (e.g. a plain Con), or enum name
+        // doesn't match — return the stored payload as-is.
+        Some(stored_payload.clone())
+    }
+
+    fn substitute_ty(ty: &InferType, mapping: &HashMap<TypeVarId, InferType>) -> InferType {
+        match ty {
+            InferType::Var(var) => mapping.get(var).cloned().unwrap_or(InferType::Var(*var)),
+            InferType::Con(name) => InferType::Con(name.clone()),
+            InferType::App(name, args) => InferType::App(
+                name.clone(),
+                args.iter()
+                    .map(|a| Self::substitute_ty(a, mapping))
+                    .collect(),
+            ),
+            InferType::Fn(params, ret) => InferType::Fn(
+                params
+                    .iter()
+                    .map(|p| Self::substitute_ty(p, mapping))
+                    .collect(),
+                Box::new(Self::substitute_ty(ret, mapping)),
+            ),
+            InferType::FixedArray(elem, n) => {
+                InferType::FixedArray(Box::new(Self::substitute_ty(elem, mapping)), *n)
+            }
+        }
+    }
+
+    // For an EnumVariant pattern like `Ok(x)` or `Some(i)`, unwrap the
+    // corresponding payload type from a `Result<T,E>` or `Option<T>` so
+    // that `bind_pattern` sees `T` rather than the whole wrapper.
+    // For any other pattern shape the original type is returned unchanged.
     fn unwrap_enum_payload(&self, pattern: &Pattern, ty: &InferType) -> InferType {
+        let applied = self.apply(ty);
         if let PatternKind::EnumVariant { variant_name, .. } = &pattern.node {
-            if let Some(payload) = result_variant_payload(&self.apply(ty), &variant_name.name) {
+            if let Some(payload) = self.enum_variant_payload(&applied, &variant_name.name) {
                 return payload;
             }
         }
-        self.apply(ty)
-    }
-}
-
-fn result_variant_payload(expected: &InferType, variant: &str) -> Option<InferType> {
-    match expected {
-        InferType::App(name, args) if name == "Result" && args.len() == 2 => match variant {
-            "Ok" => Some(args[0].clone()),
-            "Err" => Some(args[1].clone()),
-            _ => None,
-        },
-        InferType::App(name, args) if name == "Option" && args.len() == 1 => match variant {
-            "Some" => Some(args[0].clone()),
-            "None" => None,
-            _ => None,
-        },
-        _ => None,
+        applied
     }
 }
 
@@ -1412,6 +1583,12 @@ mod tests {
 
     fn normalize_source(source: &str) -> String {
         let mut body = source.trim().to_string();
+        if !body.contains("enum Option") {
+            body = format!(
+                "enum Option<T> {{ Some(T), None }} enum Result<T, E> {{ Ok(T), Err(E) }}\n{}",
+                body
+            );
+        }
         if !body.starts_with("namespace main") {
             body = format!("namespace main\n{}", body);
         }
@@ -1576,5 +1753,27 @@ mod tests {
         let var = checker.fresh_var();
         let infinite = InferType::Fn(vec![var.clone()], Box::new(InferType::Con("Int32".into())));
         assert!(checker.unify(var, infinite, None).is_err());
+    }
+
+    #[test]
+    fn tracks_generic_struct_instantiations() {
+        let source = "
+            struct Gen<T> { val: T }
+            fn main() -> Int32 {
+                let g1 = Gen { val: 1 };
+                let g2 = Gen { val: 1.0f32 };
+                return 0;
+            }";
+        let module = Parser::new(Lexer::new(normalize_source(source)).tokenize())
+            .parse_module()
+            .unwrap();
+        let mut resolver = Resolver::new();
+        resolver.resolve_module(&module).unwrap();
+        let mut checker = TypeChecker::new();
+        checker.check_module(&module).unwrap();
+
+        // Check for unique struct instantiations
+        // The previous test already adds 2 entries. This one adds 2 more.
+        assert!(checker.specializations.len() >= 2);
     }
 }

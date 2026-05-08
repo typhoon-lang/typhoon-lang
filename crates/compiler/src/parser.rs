@@ -69,9 +69,9 @@ impl Parser {
         let mut name = None;
         if self.match_token(TokenType::Namespace) {
             let ns = self.namespace_path()?;
-            if ns != "main" {
-                return Err("Only 'namespace main' is allowed".to_string());
-            }
+            // if ns != "main" {
+            //     return Err(format!("Only 'main' namespace is supported, got '{}'", ns));
+            // }
             name = Some(ns);
         }
         while !self.is_at_end() && self.peek_token().token_type != TokenType::Eof {
@@ -126,6 +126,71 @@ impl Parser {
                 let path = self.use_path()?;
                 self.consume(TokenType::Semicolon, "Expected ';' after use")?;
                 Ok(self.make_decl(DeclarationKind::Use(path)))
+            }
+            TokenType::Extern => {
+                self.advance_token(); // consume `extern`
+                                      // parse optional ABI string: extern "C" { ... }
+                let abi = if let Token {
+                    token_type: TokenType::StrLit,
+                    lexeme,
+                    ..
+                } = self.peek_token()
+                {
+                    let s = lexeme.clone();
+                    self.advance_token();
+                    s
+                } else {
+                    "C".to_string() // default ABI
+                };
+                self.consume(TokenType::LBrace, "Expected '{' after 'extern'")?;
+                let mut methods = Vec::new();
+                while self.peek_token().token_type != TokenType::RBrace {
+                    self.consume(TokenType::Fn, "Expected 'fn' in 'extern'")?;
+                    let method_name = self.identifier_with_span()?;
+                    let method_generics = self.parse_generics()?;
+                    self.consume(TokenType::LParen, "Expected '('")?;
+                    let mut params = Vec::new();
+                    while self.peek_token().token_type != TokenType::RParen {
+                        let p_name = self.identifier_with_span()?;
+                        self.consume(TokenType::Colon, "Expected ':'")?;
+                        let p_type = self.parse_type()?;
+                        params.push(Parameter {
+                            name: p_name,
+                            type_annotation: p_type,
+                            span: self.last_token_span(),
+                        });
+                        if !self.match_token(TokenType::Comma) {
+                            break;
+                        }
+                    }
+                    self.consume(TokenType::RParen, "Expected ')'")?;
+                    let mut return_type = None;
+                    if self.match_token(TokenType::ReturnType) {
+                        return_type = Some(self.parse_type()?);
+                    }
+                    let span = method_name.span.join(self.last_token_span());
+                    methods.push(Spanned::new(
+                        FunctionSignatureKind {
+                            name: method_name,
+                            generics: method_generics,
+                            params,
+                            return_type,
+                        },
+                        span,
+                        self.alloc_id(),
+                    ));
+                }
+                let end = self
+                    .consume(TokenType::RBrace, "Expected '}' after 'extern'")?
+                    .span;
+                Ok(self.make_decl(DeclarationKind::UnsafeOrExtern(Spanned::new(
+                    UnsafeOrExternKind::Extern {
+                        abi,
+                        declarations: methods,
+                    },
+                    end,
+                    self.alloc_id(),
+                ))))
             }
             _ => Err(format!("Unexpected token in declaration: {:?}", token)),
         }
@@ -271,6 +336,8 @@ impl Parser {
                 payload,
             };
             variants.push(self.make_spanned(variant));
+            // Allow optional commas between variants (Rust-like style).
+            self.match_token(TokenType::Comma);
         }
         self.consume(TokenType::RBrace, "Expected '}'")?;
         Ok(self.make_decl(DeclarationKind::Enum {
@@ -895,8 +962,8 @@ impl Parser {
 
     fn extend_decl(&mut self) -> Result<Declaration, String> {
         self.advance_token();
+        let generics = self.parse_generics()?;
         let type_constraint = self.parse_type()?;
-        let generics = Vec::new();
         self.consume(TokenType::LBrace, "Expected '{' after extend type")?;
         self.self_type_stack.push(type_constraint.clone());
         let mut methods = Vec::new();
@@ -1019,7 +1086,7 @@ impl Parser {
             }));
         }
 
-        let name = self.identifier_with_span()?.name;
+        let mut name = self.identifier_with_span()?.name;
         let mut generic_args = Vec::new();
         if self.match_token(TokenType::LessThan) {
             loop {
@@ -1030,6 +1097,16 @@ impl Parser {
             }
             self.consume(TokenType::GreaterThan, "Expected '>' after type arguments")?;
         }
+
+        // Handle function type `T -> U`
+        if self.match_token(TokenType::ReturnType) {
+            let ret = self.parse_type()?;
+            return Ok(self.make_type(TypeKind {
+                name: "Fn".to_string(),
+                generic_args: vec![self.make_type(TypeKind { name, generic_args }), ret],
+            }));
+        }
+
         Ok(self.make_type(TypeKind { name, generic_args }))
     }
 
@@ -1299,40 +1376,49 @@ impl Parser {
                 if id.name == "_" {
                     return Ok(self.make_pattern(PatternKind::Wildcard));
                 }
-                if id.name == "Ok" || id.name == "Err" || id.name == "Some" {
-                    if self.match_token(TokenType::LParen) {
-                        let inner = self.parse_pattern()?;
-                        self.consume(TokenType::RParen, "Expected ')' after variant pattern")?;
-                        let enum_name = if id.name == "Some" {
-                            "Option"
-                        } else {
-                            "Result"
-                        };
-                        return Ok(self.make_pattern(PatternKind::EnumVariant {
+                // An uppercase-leading identifier followed by `(` or `{` is an
+                // enum variant pattern (e.g. `Ok(x)`, `Some(v)`, `Red`).
+                let is_variant = id
+                    .name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false);
+                if is_variant && self.peek_token().token_type == TokenType::LParen {
+                    let start = id.span;
+                    self.advance_token(); // consume `(`
+                    let payload = if self.peek_token().token_type == TokenType::RParen {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_pattern()?))
+                    };
+                    let end = self
+                        .consume(TokenType::RParen, "Expected ')' after variant payload")?
+                        .span;
+                    return Ok(self.make_spanned_with_span(
+                        PatternKind::EnumVariant {
                             enum_name: Identifier {
-                                name: enum_name.to_string(),
+                                name: "".to_string(),
                                 span: id.span,
                             },
-                            variant_name: Identifier {
-                                name: id.name,
-                                span: id.span,
-                            },
-                            payload: Some(Box::new(inner)),
-                        }));
-                    }
+                            variant_name: id,
+                            payload,
+                        },
+                        start.join(end),
+                    ));
                 }
-                if id.name == "None" {
-                    return Ok(self.make_pattern(PatternKind::EnumVariant {
-                        enum_name: Identifier {
-                            name: "Option".to_string(),
-                            span: id.span,
+                if is_variant {
+                    return Ok(self.make_spanned_with_span(
+                        PatternKind::EnumVariant {
+                            enum_name: Identifier {
+                                name: "".to_string(),
+                                span: id.span,
+                            },
+                            variant_name: id.clone(),
+                            payload: None,
                         },
-                        variant_name: Identifier {
-                            name: "None".to_string(),
-                            span: id.span,
-                        },
-                        payload: None,
-                    }));
+                        id.span,
+                    ));
                 }
                 Ok(self.make_pattern(PatternKind::Identifier(id)))
             }
@@ -1737,10 +1823,7 @@ mod tests {
         for decl in &module.declarations {
             if let DeclarationKind::Function { name, body, .. } = &decl.node {
                 if name.name == "main" {
-                    assert!(matches!(
-                        body.statements[0].node,
-                        StatementKind::Return(..)
-                    ));
+                    assert!(matches!(body.statements[0].node, StatementKind::Return(..)));
                     found_main = true;
                 }
             }

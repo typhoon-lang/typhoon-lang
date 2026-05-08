@@ -44,6 +44,9 @@ fn parse_file(path: &Path) -> Result<Module, String> {
 }
 
 fn mangle(ns: &str, name: &str) -> String {
+    if ns.starts_with("std") {
+        return name.to_string();
+    }
     let ns = ns.replace("::", "__");
     format!("{}__{}", ns, name)
 }
@@ -329,25 +332,39 @@ fn method_symbol(type_name: &Type, method_name: &str) -> String {
 fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
     match decl.node {
         DeclarationKind::Impl {
-            type_name, methods, ..
+            type_name,
+            generics: ext_generics,
+            methods,
+            ..
         } => methods
             .into_iter()
             .map(|mut m| {
-                if let DeclarationKind::Function { name, .. } = &mut m.node {
+                if let DeclarationKind::Function { name, generics, .. } = &mut m.node {
                     name.name = method_symbol(&type_name, &name.name);
+                    // Prepend the impl's generics so T, E etc. are in scope
+                    // for resolver and type checker
+                    let mut merged = ext_generics.clone();
+                    merged.extend(generics.drain(..));
+                    *generics = merged;
                 }
                 m
             })
             .collect(),
         DeclarationKind::Extension {
             type_constraint,
+            generics: ext_generics,
             methods,
             ..
         } => methods
             .into_iter()
             .map(|mut m| {
-                if let DeclarationKind::Function { name, .. } = &mut m.node {
+                if let DeclarationKind::Function { name, generics, .. } = &mut m.node {
                     name.name = method_symbol(&type_constraint, &name.name);
+                    // Prepend the extension's generics so T, E etc. are in scope
+                    // for resolver and type checker
+                    let mut merged = ext_generics.clone();
+                    merged.extend(generics.drain(..));
+                    *generics = merged;
                 }
                 m
             })
@@ -364,9 +381,11 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
         )]
     })?;
 
-    let files = collect_ty_files(root).map_err(|e| vec![e])?;
+    let mut files = collect_ty_files(root).map_err(|e| vec![e])?;
+    files.sort();
+    files.dedup();
 
-    println!("<<<< {:?}", files);
+    eprintln!("<<<< {:?}", files);
     let mut modules = Vec::new();
     let mut errors = Vec::new();
     for file in files {
@@ -379,7 +398,19 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
         return Err(errors);
     }
 
-    let units = extract_namespace_units(modules)?;
+    let mut units = extract_namespace_units(modules)?;
+
+    // Inject synthetic stdlib namespace with builtin types.
+    // Merge with any parsed files in the `std` namespace.
+    let std_unit = units
+        .entry("std".to_string())
+        .or_insert_with(|| NamespaceUnit {
+            name: "std".to_string(),
+            declarations: Vec::new(),
+            uses: Vec::new(),
+        });
+    std_unit.declarations.extend(parse_stdlib_prelude());
+
     let entry_module =
         parse_file(entry_file).map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
     let entry_ns = entry_module.name.clone().ok_or_else(|| {
@@ -415,4 +446,18 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
         declarations: all_decls,
         span: Span::default(),
     })
+}
+
+fn parse_stdlib_prelude() -> Vec<Declaration> {
+    let source = r#"
+        namespace std
+        struct Buf {}
+        extern "C" {
+            fn __ty_buf_new() -> Buf
+            fn __ty_buf_push_str(b: Buf, s: Str) -> Unit
+            fn __ty_buf_into_str(b: Buf) -> Str
+        }
+    "#;
+    let tokens = Lexer::new(source.trim().to_string()).tokenize();
+    Parser::new(tokens).parse_module().unwrap().declarations
 }

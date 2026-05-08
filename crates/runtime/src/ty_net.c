@@ -146,7 +146,7 @@ static int split_host_port(const char* addr, char** host_out, char** port_out) {
     return 1;
 }
 
-void __ty_method__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* outp) {
+void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* outp) {
     (void)task;
     (void)self;
 
@@ -268,7 +268,7 @@ void __ty_method__Network__listen(void* task, TyNetwork* self, char* addr, TyRes
     return;
 }
 
-void __ty_method__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* outp) {
+void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* outp) {
     (void)task;
     TyResult_Socket_i32 out;
     out.ok = 0;
@@ -356,7 +356,7 @@ static void socket_consumer_coro(void* task, void* arg) {
     free(pair);
 }
 
-void __ty_method__Socket__consume(void* task, TySocket* self, struct TyChan* chan) {
+void __ty_rt__Socket__consume(void* task, TySocket* self, struct TyChan* chan) {
     void** pair = (void**)malloc(sizeof(void*) * 2);
     if (!pair) {
         TY_DEBUG("[net] Socket__consume OOM allocating coroutine arg\n");
@@ -378,7 +378,7 @@ void __ty_method__Socket__consume(void* task, TySocket* self, struct TyChan* cha
  *
  * Maps to:  let Some(i) = ch.recv() else { break; }
  */
-TyResult_i32_i32 __ty_method__Socket__recv(void* task, TySocket* self, struct TyChan* chan) {
+TyResult_i32_i32 __ty_rt__Socket__recv(void* task, TySocket* self, struct TyChan* chan) {
     TyResult_i32_i32 out;
     out.ok = 0;
     out.value = 0;
@@ -413,7 +413,7 @@ TyResult_i32_i32 __ty_method__Socket__recv(void* task, TySocket* self, struct Ty
  * Maps to:  let Some(i) = ch.try_recv() else { break; }
  * Callers MUST distinguish err=1 (retry later) from err=0 (stop reading).
  */
-TyResult_i32_i32 __ty_method__Socket__try_recv(void* task, TySocket* self, struct TyChan* chan) {
+TyResult_i32_i32 __ty_rt__Socket__try_recv(void* task, TySocket* self, struct TyChan* chan) {
     TyResult_i32_i32 out;
     out.ok = 0;
     out.value = 0;
@@ -439,7 +439,7 @@ TyResult_i32_i32 __ty_method__Socket__try_recv(void* task, TySocket* self, struc
     return out;
 }
 
-TyResult_i32_i32 __ty_method__Socket__write(void* task, TySocket* self, char* buf, int32_t len) {
+TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, int32_t len) {
     (void)task;
     TyResult_i32_i32 out;
     out.ok = 0;
@@ -460,7 +460,7 @@ TyResult_i32_i32 __ty_method__Socket__write(void* task, TySocket* self, char* bu
     return out;
 }
 
-void __ty_method__Socket__close(void* task, TySocket* self) {
+void __ty_rt__Socket__close(void* task, TySocket* self) {
     (void)task;
     if (!self) return;
 

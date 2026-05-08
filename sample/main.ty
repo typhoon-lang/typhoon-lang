@@ -1,5 +1,9 @@
 namespace main
 
+use std::net::Network;
+use std::net::Socket;
+use std::net::Listener;
+
 struct Popcount {
   ar: [Int32],
 }

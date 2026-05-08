@@ -424,6 +424,9 @@ impl Desugar {
     }
 
     fn rename_type(&self, ty: &mut Type, aliases: &HashMap<String, String>) {
+        if ["Network", "Listener", "Socket"].contains(&ty.node.name.as_str()) {
+            return;
+        }
         if let Some(n) = aliases.get(&ty.node.name) {
             ty.node.name = n.clone();
         }

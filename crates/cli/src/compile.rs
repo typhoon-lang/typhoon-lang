@@ -13,14 +13,18 @@ pub fn compile(input: &str, output: &str) {
     let module = match compile_project(Path::new(input)) {
         Ok(m) => m,
         Err(errs) => {
-            for e in errs { eprintln!("Compile error: {}", e); }
+            for e in errs {
+                eprintln!("Compile error: {}", e);
+            }
             std::process::exit(1);
         }
     };
 
     let mut resolver = Resolver::new();
     if let Err(errors) = resolver.resolve_module(&module) {
-        for err in errors { eprintln!("Resolve error: {}", err); }
+        for err in errors {
+            eprintln!("Resolve error: {}", err);
+        }
         std::process::exit(1);
     }
 
@@ -34,12 +38,14 @@ pub fn compile(input: &str, output: &str) {
     let result = match liveness.analyze_module(&module) {
         Ok(drop_map) => drop_map,
         Err(errors) => {
-            for err in errors { eprintln!("Liveness error: {}", err); }
+            for err in errors {
+                eprintln!("Liveness error: {}", err);
+            }
             std::process::exit(1);
         }
     };
 
-    let ir = Codegen::lower_module(&module, checker.types(), result);
+    let ir = Codegen::lower_module(&module, checker.types(), &checker.specializations, result);
     let ir_text = ir.to_llvm_ir();
 
     let ll_path = Path::new(output).with_extension("ll");
@@ -66,8 +72,12 @@ pub fn compile(input: &str, output: &str) {
         cmd.arg("-Wl,/NODEFAULTLIB:LIBCMTD");
         cmd.arg("-lWs2_32");
     } else {
-        cmd.arg("-lm").arg("-lpthread").arg("-fno-omit-frame-pointer");
-        if cfg!(target_os = "linux") { cmd.arg("-ldl"); }
+        cmd.arg("-lm")
+            .arg("-lpthread")
+            .arg("-fno-omit-frame-pointer");
+        if cfg!(target_os = "linux") {
+            cmd.arg("-ldl");
+        }
     }
 
     cmd.arg("-o").arg(output);

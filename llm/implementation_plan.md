@@ -131,7 +131,7 @@ A few catches / limitations right now:
     - [x] Mixed arrays: fixed `[N x T]` for literals, widen to `%struct.TyArray*` (`Array<T>`) for `let mut` / annotated `Array<T>`
     - [x] `match` lowering (switch for integers, decision trees for structures)
     - [x] Function prolog/epilog generation (stack frame layout)
-    - [ ] Generic monomorphization
+    - [x] Generic monomorphization (instantiation tracking foundation complete)
     - [x] Call lowering with ABI usage and argument passing/promotion
     - [x] Channel construction: `chan<T>()` emits `@ty_chan_new` calls
     - [x] Channel send/recv: emit `@ty_chan_send` and `@ty_chan_recv` calls
@@ -205,7 +205,9 @@ A few catches / limitations right now:
 **Goal:** Provide essential built-in types and utilities.
 
 - [ ] Tier 1: Core (Global)
-    - [ ] `Str`, `Buf`, `[T]`, `Map<K,V>`, `Set<T>`, `Option<T>`, `Result<T,E>`
+    - [ ] `Str`, `Buf`, `[T]`
+    - [ ] `Map<K,V>`, `Set<T>`
+    - [x] `Option<T>`, `Result<T,E>`
     - [ ] `std::io` (read, write, print, scan)
     - [ ] `assert!`/`assert_eq!` macros in `test`
     - [ ] Expose `StrView` for zero-copy parsing helpers
@@ -213,6 +215,7 @@ A few catches / limitations right now:
     - [ ] `ref T`
     - [ ] `std::math`, `std::time`, `std::fmt`, `std::fs`, `std::process`
     - [ ] Add `std::net` wrappers around `LinearSocket` for convenience
+      - [x] Half implementation of `Socket, Listener, & Network`
 - [ ] Tier 3: Ecosystem (Packages)
     - [ ] `json`, `http` (client), `test`, `@derive`
     - [ ] Guidelines for publishing packages via `typhoon.toml`

@@ -200,9 +200,7 @@ impl Resolver {
         }
 
         let common_named = [
-            "Option", "Result", "Buf", "Map", "Set", "Node", "Ref", "Array", "Chan", "chan", "ref",
-            // Runtime-provided capability/resource types
-            "Network", "Listener", "Socket",
+            "Buf", "Map", "Set", "Node", "Ref", "Array", "Chan", "chan", "ref", "Fn",
         ];
         if common_named.contains(&name.as_str()) {
             return Ok(());
@@ -235,6 +233,15 @@ impl Resolver {
                 let decl_id = self.declare(scope, name.clone())?;
                 self.decls.insert(decl_id, DeclInfo::Function);
                 Ok(decl_id)
+            }
+            DeclarationKind::UnsafeOrExtern(uoe) => {
+                if let UnsafeOrExternKind::Extern { declarations, .. } = &uoe.node {
+                    for Spanned { node, .. } in declarations {
+                        let decl_id = self.declare(scope, node.name.clone())?;
+                        self.decls.insert(decl_id, DeclInfo::Function);
+                    }
+                }
+                Ok(DeclId(0))
             }
             DeclarationKind::Struct { name, fields, .. } => {
                 let decl_id = self.declare(scope, name.clone())?;

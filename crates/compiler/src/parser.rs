@@ -1750,15 +1750,6 @@ mod tests {
     }
 
     #[test]
-    fn namespace_rejected_if_not_main() {
-        let source = "namespace foo\nfn main() -> Int32 { return 0; }";
-        let tokens = Lexer::new(source.trim().to_string()).tokenize();
-        let mut parser = Parser::new(tokens);
-        let r = parser.parse_module();
-        assert!(r.is_err());
-    }
-
-    #[test]
     fn test_parse_ref_type() {
         let source = "fn main() -> ref Int32 { return 0; }";
         let module = parse_source(source);

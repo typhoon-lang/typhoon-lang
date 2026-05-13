@@ -50,9 +50,27 @@ impl Resolver {
         }
     }
 
-    pub fn resolve_module(&mut self, module: &Module) -> Result<(), Vec<String>> {
+    pub fn resolve_module(
+        &mut self,
+        module: &Module,
+        imports: &HashMap<String, DeclInfo>,
+    ) -> Result<(), Vec<String>> {
+        println!(
+            "resolve_module '{}' imports: {:?}",
+            module.name.as_deref().unwrap_or("?"),
+            imports.keys().collect::<Vec<_>>()
+        );
         let mut errors = Vec::new();
         let root = self.enter_scope(None);
+
+        // Pre-declare imported symbols
+        for (name, info) in imports {
+            let decl_id = DeclId(self.next_decl_id);
+            self.next_decl_id += 1;
+            self.scopes[root.0].symbols.insert(name.clone(), decl_id);
+            self.decls.insert(decl_id, info.clone());
+        }
+
         for decl in &module.declarations {
             if let Err(err) = self.declare_from_decl(root, decl) {
                 errors.push(err);
@@ -168,7 +186,8 @@ impl Resolver {
         let internal = [
             // flow control
             "break", "continue", // type
-            "Ok", "Err", "Some", "None", "chan", // stdio
+            // "Ok", "Err", "Some", "None",
+            "chan", // stdio
             "print", "println", "printf", "fprint", "fprintln", "fprintf", "sprint", "sprintln",
             "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
         ];
@@ -499,7 +518,7 @@ mod tests {
             .parse_module()
             .unwrap();
         let mut resolver = Resolver::new();
-        resolver.resolve_module(&module).unwrap();
+        resolver.resolve_module(&module, &HashMap::new()).unwrap();
         resolver
     }
 
@@ -519,7 +538,9 @@ mod tests {
                 .tokenize();
         let module = Parser::new(tokens).parse_module().unwrap();
         let mut resolver = Resolver::new();
-        let err = resolver.resolve_module(&module).unwrap_err();
+        let err = resolver
+            .resolve_module(&module, &HashMap::new())
+            .unwrap_err();
         assert!(err
             .iter()
             .any(|msg| msg.contains("Unresolved identifier 'missing'")));
@@ -536,7 +557,9 @@ mod tests {
         .tokenize();
         let module = Parser::new(tokens).parse_module().unwrap();
         let mut resolver = Resolver::new();
-        let err = resolver.resolve_module(&module).unwrap_err();
+        let err = resolver
+            .resolve_module(&module, &HashMap::new())
+            .unwrap_err();
         assert!(err.iter().any(|msg| msg.contains("Duplicate declaration")));
     }
 

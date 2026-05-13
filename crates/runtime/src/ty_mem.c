@@ -55,7 +55,7 @@ static inline uint8_t* align_up(uint8_t* ptr, size_t align) {
     return (uint8_t*)((p + a - 1) & ~(a - 1));
 }
 
-static inline int32_t size_to_class(size_t size) {
+int32_t size_to_class(size_t size) {
     for (int32_t i = 0; i < NUM_SIZE_CLASSES; i++)
         if (size <= (size_t)SIZE_CLASS_BYTES[i]) return i;
     return NUM_SIZE_CLASSES; /* oversized */

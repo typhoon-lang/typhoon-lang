@@ -94,6 +94,10 @@ struct TypeRegistry {
     string_pool: HashMap<String, (String, usize)>,
     enum_defs: HashMap<String, EnumDef>,
     enum_layouts: HashMap<String, EnumLayout>,
+    /// Tracks every symbol name (type or function) already emitted into the
+    /// preamble so that neither `register_runtime_decls` nor
+    /// `register_module_sigs` ever emits a duplicate `declare` or `type` line.
+    declared_syms: HashSet<String>,
 }
 
 impl TypeRegistry {
@@ -107,6 +111,29 @@ impl TypeRegistry {
             string_pool: HashMap::new(),
             enum_defs: HashMap::new(),
             enum_layouts: HashMap::new(),
+            declared_syms: HashSet::new(),
+        }
+    }
+
+    /// Push a `declare …` line into `extra_preamble` only if `sym` has not
+    /// been declared before.  Returns `true` when the line was actually added.
+    fn push_declare(&mut self, sym: &str, line: String) -> bool {
+        if self.declared_syms.insert(sym.to_string()) {
+            self.extra_preamble.push(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Push a type-definition line into `type_decls` only if `sym` has not
+    /// been declared before.  Returns `true` when the line was actually added.
+    fn push_type_decl(&mut self, sym: &str, line: String) -> bool {
+        if self.declared_syms.insert(sym.to_string()) {
+            self.type_decls.push(line);
+            true
+        } else {
+            false
         }
     }
 
@@ -402,10 +429,23 @@ impl<'a> IrBuilder<'a> {
         self.reg = TypeRegistry::new();
         self.adt_structs.clear();
 
-        self.reg.type_decls.extend([
-            "%struct.Buf = type { i8*, i64, i64 }".to_string(),
+        // self.reg
+        //     .push_type_decl("Buf", "%struct.Buf = type { i8*, i64, i64 }".to_string());
+        self.reg.push_type_decl(
+            "TyArray",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }".to_string(),
-        ]);
+        );
+        // Networking structs are opaque runtime handles. They must be declared
+        // here — before collect_enum_defs tries to pre-generate
+        // Result<Listener,…> / Result<Socket,…> layouts — so that the payload
+        // type names (%struct.Listener*, %struct.Socket*) are already known
+        // and ty_net_global's %struct.Network* return type resolves correctly.
+        // self.reg
+        //     .push_type_decl("Network", "%struct.Network  = type opaque".to_string());
+        // self.reg
+        //     .push_type_decl("Listener", "%struct.Listener = type opaque".to_string());
+        // self.reg
+        //     .push_type_decl("Socket", "%struct.Socket   = type opaque".to_string());
 
         self.collect_enum_defs(module);
         self.register_runtime_decls();
@@ -468,6 +508,7 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_sched_run      ()",
             "declare void @ty_sched_shutdown ()",
             "declare i8*  @ty_spawn          (i8*, i8*, i8*)", // task, fn_ptr, arg
+            "declare i8*  @ty_spawn_closure  (i8*, i8*, i8*, i64)", // task, fn_ptr, closure_ptr, size
             "declare void @ty_yield          ()",
             "declare void @ty_safepoint      ()",
             "declare void @ty_await          (i8*, i8*)", // task, coro_handle
@@ -476,10 +517,6 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_chan_recv      (i8*, i8*, i8*)", // task, chan, out_ptr
             "declare i32  @ty_chan_try_recv  (i8*, i8*, i8*)", // task, chan, out_ptr -> i32 (0/1)
             "declare void @ty_chan_close     (i8*)",      // chan
-            // ── Buf (all now take task first) ──
-            "declare %struct.Buf* @ty_buf_new      (i8* %task)",
-            "declare void         @ty_buf_push_str (i8*, %struct.Buf*, i8*)",
-            "declare i8*          @ty_buf_into_str (i8*, %struct.Buf*)",
             // ── TyArray (all now take task first) ──
             "declare %struct.TyArray* @ty_array_from_fixed (i8*, i8*, i64, i64, i64)",
             "declare void             @ty_array_push       (i8*, %struct.TyArray*, i8*)",
@@ -518,7 +555,17 @@ impl<'a> IrBuilder<'a> {
             "declare i32  @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)",
         ];
         for d in decls {
-            self.reg.extra_preamble.push(d.to_string());
+            // Extract the symbol name from "declare <ret> @name(...)" so we
+            // can deduplicate against anything already pushed by
+            // register_module_sigs or a previous call.
+            let sym = d
+                .split('@')
+                .nth(1)
+                .and_then(|s| s.split('(').next())
+                .unwrap_or(d)
+                .trim()
+                .to_string();
+            self.reg.push_declare(&sym, d.to_string());
         }
 
         // func_sigs for buf/array/scheduler
@@ -528,6 +575,7 @@ impl<'a> IrBuilder<'a> {
             ("__ty_buf_into_str", "i8*", &["%struct.Buf*"]),
             ("ty_array_push", "void", &["%struct.TyArray*", "i8*"]),
             ("ty_spawn", "i8*", &["i8*", "i8*"]),
+            ("ty_spawn_closure", "i8*", &["i8*", "i8*", "i64"]),
             ("ty_await", "void", &["i8*"]),
             ("ty_yield", "void", &[]),
             ("ty_safepoint", "void", &[]),
@@ -590,20 +638,28 @@ impl<'a> IrBuilder<'a> {
                         field_types.push(lt.clone());
                         field_map.push((id.name.clone(), lt));
                     }
-                    self.reg.type_decls.push(format!(
-                        "%struct.{} = type {{ {} }}",
+                    let line = format!(
+                        "%struct.{} = type {}",
                         name.name,
-                        field_types.join(", ")
-                    ));
+                        if field_types.is_empty() {
+                            "opaque".to_string()
+                        } else {
+                            format!("{{ {} }}", field_types.join(", "))
+                        }
+                    );
+                    // Only emit the type line if this struct hasn't already been
+                    // declared (e.g. Buf / TyArray are pre-declared as concrete
+                    // layout types in collect_types and must not be overwritten
+                    // with an opaque stub from the source-level `struct Buf {}`).
+                    self.reg.push_type_decl(&name.name, line);
                     self.reg.struct_fields.insert(name.name.clone(), field_map);
                 }
                 DeclarationKind::Enum { name, .. } => {
                     self.reg
-                        .type_decls
-                        .push(format!("%enum.{} = type opaque", name.name));
+                        .push_type_decl(&name.name, format!("%enum.{} = type opaque", name.name));
                 }
                 DeclarationKind::Newtype { name, type_alias } => {
-                    self.reg.type_decls.push(format!(
+                    let line = format!(
                         "%newtype.{} = type {}",
                         name.name,
                         Self::lower_type(
@@ -611,7 +667,8 @@ impl<'a> IrBuilder<'a> {
                             &self.option_enum_name(),
                             &self.result_enum_name()
                         )
-                    ));
+                    );
+                    self.reg.push_type_decl(&name.name, line);
                 }
                 DeclarationKind::Function {
                     name,
@@ -671,12 +728,13 @@ impl<'a> IrBuilder<'a> {
                                 })
                                 .collect();
                             // Emit the LLVM declare (no task prefix for raw FFI)
-                            self.reg.extra_preamble.push(format!(
+                            let decl_line = format!(
                                 "declare {} @{}({})",
                                 ret_ty,
                                 name.name,
                                 param_types.join(", ")
-                            ));
+                            );
+                            self.reg.push_declare(&name.name, decl_line);
                             // Register so call-sites resolve correctly
                             // Mark as no-task by NOT prepending i8* here
                             self.reg
@@ -837,7 +895,8 @@ impl<'a> IrBuilder<'a> {
                 if ret_ty == "void" {
                     self.emit("  ret void".to_string());
                 } else {
-                    self.emit(format!("  ret {} 0", ret_ty));
+                    let z = self.zero_value(ret_ty);
+                    self.emit(format!("  ret {} {}", ret_ty, z));
                 }
             }
         }
@@ -851,7 +910,8 @@ impl<'a> IrBuilder<'a> {
             if ret_ty == "void" {
                 self.emit("  ret void".to_string());
             } else {
-                self.emit(format!("  ret {} 0", ret_ty));
+                let z = self.zero_value(ret_ty);
+                self.emit(format!("  ret {} {}", ret_ty, z));
             }
         }
 
@@ -1087,21 +1147,27 @@ impl<'a> IrBuilder<'a> {
             "  {} = bitcast void(i8*, i8*)* @{} to i8*",
             fn_cast, tramp_name
         ));
-        let closure_arg = tramp_ir.1.unwrap_or_else(|| "null".to_string());
         let tv = self.emit_task_load();
-        self.emit(format!(
-            "  call i8* @ty_spawn(i8* {}, i8* {}, i8* {})",
-            tv, fn_cast, closure_arg
-        ));
+        if let Some((closure_arg, closure_size)) = tramp_ir.1 {
+            self.emit(format!(
+                "  call i8* @ty_spawn_closure(i8* {}, i8* {}, i8* {}, i64 {})",
+                tv, fn_cast, closure_arg, closure_size
+            ));
+        } else {
+            self.emit(format!(
+                "  call i8* @ty_spawn(i8* {}, i8* {}, i8* null)",
+                tv, fn_cast
+            ));
+        }
         self.conc_functions.push(tramp_ir.0);
     }
 
-    /// Returns (IrFunction, closure_raw_ptr).
+    /// Returns (IrFunction, optional (closure_i8_ptr, closure_size)).
     fn emit_conc_no_capture(
         &mut self,
         body: &Block,
         tramp_name: &str,
-    ) -> (IrFunction, Option<String>) {
+    ) -> (IrFunction, Option<(String, i64)>) {
         let ctx = self.save_context();
         self.current_fn_ret_ty = "void".to_string();
         self.current_fn_name = Some(tramp_name.to_string());
@@ -1134,7 +1200,7 @@ impl<'a> IrBuilder<'a> {
         body: &Block,
         tramp_name: &str,
         captured: &[(String, String, String, bool)],
-    ) -> (IrFunction, Option<String>) {
+    ) -> (IrFunction, Option<(String, i64)>) {
         let closure_ty = format!("%closure.{}", tramp_name);
         let closure_field_tys: Vec<String> = captured
             .iter()
@@ -1146,10 +1212,21 @@ impl<'a> IrBuilder<'a> {
                 }
             })
             .collect();
-        let closure_size: i64 = closure_field_tys
-            .iter()
-            .map(|ty| self.llvm_const_sizeof(ty))
-            .sum();
+        // Compute struct-like size with alignment/padding so it matches C sizeof(struct).
+        let mut offset: i64 = 0;
+        let mut max_align: i64 = 1;
+        for ty in &closure_field_tys {
+            let sz = self.llvm_const_sizeof(ty);
+            let al = self.llvm_const_alignof(ty);
+            if al > max_align { max_align = al; }
+            let pad = if offset % al == 0 { 0 } else { al - (offset % al) };
+            offset += pad;
+            offset += sz;
+        }
+        let closure_size: i64 = if max_align > 1 {
+            let rem = offset % max_align;
+            if rem == 0 { offset } else { offset + (max_align - rem) }
+        } else { offset };
         let class_id = get_size_class(closure_size);
 
         self.reg.type_decls.push(format!(
@@ -1158,24 +1235,15 @@ impl<'a> IrBuilder<'a> {
             closure_field_tys.join(", ")
         ));
 
-        // Allocate closure in parent
-        let tv = self.emit_task_load();
-        let closure_raw = self.tmp();
-        self.emit(format!(
-            "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
-            closure_raw, tv, class_id
-        ));
-        let closure_typed = self.tmp();
-        self.emit(format!(
-            "  {} = bitcast i8* {} to {}*",
-            closure_typed, closure_raw, closure_ty
-        ));
+        // Allocate closure staging buffer on the stack (entry alloca)
+        let closure_slot = self.tmp();
+        self.emit_alloca(&closure_slot, &closure_ty);
 
         for (idx, (_, slot, ty, is_mut)) in captured.iter().enumerate() {
             let gep = self.tmp();
             self.emit(format!(
                 "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
-                gep, closure_ty, closure_ty, closure_typed, idx
+                gep, closure_ty, closure_ty, closure_slot, idx
             ));
             if *is_mut && !ty.ends_with('*') {
                 self.emit(format!("  store {}* {}, {}** {}", ty, slot, ty, gep));
@@ -1190,6 +1258,10 @@ impl<'a> IrBuilder<'a> {
                 self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, gep));
             }
         }
+
+        // Bitcast closure slot to i8* for the spawn call
+        let closure_i8 = self.tmp();
+        self.emit(format!("  {} = bitcast {}* {} to i8*", closure_i8, closure_ty, closure_slot));
 
         // Emit trampoline in saved context
         let ctx = self.save_context();
@@ -1251,7 +1323,7 @@ impl<'a> IrBuilder<'a> {
         };
         self.restore_context(ctx);
         self.next_tmp = saved_tmp;
-        (ir, Some(closure_raw))
+        (ir, Some((closure_i8, closure_size)))
     }
 
     // ── Drop helpers ──────────────────────────────────────────────────────────
@@ -1828,8 +1900,12 @@ impl<'a> IrBuilder<'a> {
         }
 
         let ty = self.expr_llvm_type(left);
-        let lhs = self.emit_expr(left);
-        let rhs = self.emit_expr(right);
+        let lhs_raw = self.emit_expr(left);
+        let lhs_ty = self.expr_llvm_type(left);
+        let lhs = self.emit_widen(&lhs_raw, &lhs_ty, &ty);
+        let rhs_raw = self.emit_expr(right);
+        let rhs_ty = self.expr_llvm_type(right);
+        let rhs = self.emit_widen(&rhs_raw, &rhs_ty, &ty);
         let dst = self.tmp();
         let instr = self.arith_instr(op, &ty, &lhs, &rhs, &dst);
         self.emit(instr);
@@ -2409,27 +2485,32 @@ impl<'a> IrBuilder<'a> {
         }
         let tmp = self.tmp();
         if ret_ty == "void" {
+            // Only treat last param as out-pointer if it is an extra param
+            // beyond what arg_pairs already covers (task + self + explicit args).
+            let has_out_param = param_types.len() > arg_pairs.len();
             let last_param = param_types.last().cloned().unwrap_or_default();
-            if let Some(desired_ty) = last_param
-                .strip_suffix('*')
-                .filter(|t| t.starts_with("%struct."))
-                .map(|t| t.to_string())
-            {
-                let out_slot = self.tmp();
-                self.emit_alloca(&out_slot, &desired_ty);
-                arg_pairs.push(format!("{}* {}", desired_ty, out_slot));
-                self.emit(format!(
-                    "  call void @{}({})",
-                    runtime_name,
-                    arg_pairs.join(", ")
-                ));
-                let loaded = self.tmp();
-                self.emit(format!(
-                    "  {} = load {}, {}* {}",
-                    loaded, desired_ty, desired_ty, out_slot
-                ));
-                return loaded;
-            }
+            if has_out_param {
+                if let Some(desired_ty) = last_param
+                    .strip_suffix('*')
+                    .filter(|t| t.starts_with("%struct."))
+                    .map(|t| t.to_string())
+                {
+                    let out_slot = self.tmp();
+                    self.emit_alloca(&out_slot, &desired_ty);
+                    arg_pairs.push(format!("{}* {}", desired_ty, out_slot));
+                    self.emit(format!(
+                        "  call void @{}({})",
+                        runtime_name,
+                        arg_pairs.join(", ")
+                    ));
+                    let loaded = self.tmp();
+                    self.emit(format!(
+                        "  {} = load {}, {}* {}",
+                        loaded, desired_ty, desired_ty, out_slot
+                    ));
+                    return loaded;
+                }
+            } // if has_out_param
             self.emit(format!(
                 "  call void @{}({})",
                 runtime_name,
@@ -3132,6 +3213,9 @@ impl<'a> IrBuilder<'a> {
             "Buf" => "%struct.Buf*".to_string(),
             "Array" => "%struct.TyArray*".to_string(),
             "Chan" => "i8*".to_string(),
+            "Network" => "%struct.Network*".to_string(),
+            "Listener" => "%struct.Listener*".to_string(),
+            "Socket" => "%struct.Socket*".to_string(),
             "Option" => {
                 let args: Vec<_> = ty
                     .node
@@ -3166,6 +3250,9 @@ impl<'a> IrBuilder<'a> {
                 "Str" => "i8*".to_string(),
                 "Buf" => "%struct.Buf*".to_string(),
                 "Chan" => "i8*".to_string(),
+                "Network" => "%struct.Network*".to_string(),
+                "Listener" => "%struct.Listener*".to_string(),
+                "Socket" => "%struct.Socket*".to_string(),
                 n if n.starts_with("%") => n.to_string(), // already an LLVM type, pass through
                 n => format!("%struct.{}", n),
             },

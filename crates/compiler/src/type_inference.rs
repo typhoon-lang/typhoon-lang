@@ -1142,7 +1142,7 @@ impl TypeChecker {
                                         }
                                         InferType::Con("Unit".into())
                                     }
-                                    "recv" => elem,
+                                    "recv" => self.make_option_ty(elem),
                                     "try_recv" => self.make_option_ty(elem),
                                     _ => self.infer_method_call(
                                         &name,

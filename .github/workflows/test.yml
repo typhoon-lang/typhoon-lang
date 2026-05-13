@@ -42,8 +42,12 @@ jobs:
         uses: moonrepo/setup-rust@v1
 
       - name: Run tests
-        run: cargo test --verbose
+        run: |
+          cargo build -p typhoon-cli
+          cargo test --verbose
 
       - name: Run sample tests
         shell: bash
-        run: cargo run --verbose -- run sample/main.ty
+        run: |
+          cargo build -p typhoon-cli
+          cargo run --verbose -- run sample/main.ty

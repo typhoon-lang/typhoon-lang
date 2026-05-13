@@ -51,3 +51,10 @@ version = "0.0.1"
 dependencies = [
  "cmake",
 ]
+
+[[package]]
+name = "typhoon-stdlib"
+version = "0.0.1"
+dependencies = [
+ "typhoon-cli",
+]

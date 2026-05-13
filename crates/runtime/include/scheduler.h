@@ -135,6 +135,10 @@ void ty_sched_shutdown(void);
  * The new coroutine is pushed onto the current worker's deque. */
 TyCoro* ty_spawn(SlabArena* arena, void (*fn)(void* task, void* arg), void* arg);
 
+TyCoro* ty_spawn_closure(SlabArena* arena,
+                         void (*fn)(void*, void*),
+                         void* closure, size_t closure_size);
+
 /* Yield the current coroutine voluntarily.
  * The scheduler may resume another runnable coroutine. */
 void ty_yield(void);

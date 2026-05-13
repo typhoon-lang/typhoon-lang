@@ -3,6 +3,7 @@ use std::path::Path;
 
 mod compile;
 mod exec;
+mod link;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -16,23 +17,44 @@ fn main() {
     match command.as_str() {
         "build" => {
             if args.len() < 4 {
-                eprintln!("Error: 'build' requires <filename> and <output>");
+                eprintln!("Usage: tyc build <filename> <output> [--compile | --link]");
                 std::process::exit(1);
             }
             let filename = &args[2];
             let output = &args[3];
-            compile(filename, output);
+            let flag = args.get(4).map(|s| s.as_str());
+
+            match flag {
+                Some("--compile") => {
+                    compile::compile_to_ir(filename, output);
+                }
+                Some("--link") => {
+                    link::link_ir(filename, output);
+                }
+                None => {
+                    compile::compile(filename, output);
+                }
+                _ => {
+                    eprintln!("Unknown flag: {}", flag.unwrap());
+                    std::process::exit(1);
+                }
+            }
         }
         "run" => {
             let filename = &args[2];
-            // Create a temporary output name (e.g., "main.ty" -> "main")
             let output = Path::new(filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("temp_bin");
 
-            compile(filename, output);
-            exec::execute_binary(output);
+            let output_path = if cfg!(windows) {
+                format!("{}.exe", output)
+            } else {
+                output.to_string()
+            };
+
+            compile(filename, &output_path);
+            exec::execute_binary(&output_path);
         }
         _ => {
             print_usage();
@@ -47,6 +69,6 @@ fn compile(input: &str, output: &str) {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  tyc build <filename> <output>  - Compile to a specific output");
-    println!("  tyc run   <filename>           - Compile and run immediately");
+    println!("  tyc build <filename> <output> [--compile | --link] - Build, compile IR, or link");
+    println!("  tyc run   <filename>                                - Compile and run immediately");
 }

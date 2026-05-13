@@ -959,6 +959,30 @@ void ty_sched_init(void) {
 #endif
 }
 
+TyCoro* ty_spawn_closure(SlabArena* parent_arena,
+                         void (*fn)(void*, void*),
+                         void* closure, size_t closure_size)
+{
+    (void)parent_arena;
+    TyCoro* co = coro_new(fn, NULL);   /* arg=NULL for now */
+
+    /* Copy the closure into the child's own arena before it runs.
+     * The child's arena is freshly allocated in coro_new and will
+     * only be freed when the child itself exits, so this is safe
+     * regardless of when the parent dies. */
+    int32_t cls = size_to_class(closure_size);
+    void* child_copy = slab_alloc(co->arena, cls);
+    memcpy(child_copy, closure, closure_size);
+    co->arg = child_copy;
+
+    atomic_fetch_add_explicit(&dbg_spawned, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&active_coros, 1, memory_order_relaxed);
+    TY_DEBUG("[sched] spawn coro=%p active=%d\n", (void*)co,
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
+    sched_enqueue(co);
+    return co;
+}
+
 TyCoro* ty_spawn(SlabArena* arena, void (*fn)(void*, void*), void* arg) {
     (void)arena;
     TyCoro* co = coro_new(fn, arg);

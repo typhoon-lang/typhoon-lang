@@ -1,15 +1,15 @@
 namespace main
 
-use std::net::Network;
-use std::net::Socket;
-use std::net::Listener;
+//use std::net::Network;
+//use std::net::Socket;
+//use std::net::Listener;
 
 struct Popcount {
   ar: [Int32],
 }
 
 impl Popcount {
-  fn check(self, even: Int32) -> Int32 {
+  fn check(self, even: Int8) -> Int32 {
     let ch: ref chan<Int32> = chan<Int32>();
     let mut sent = 0;
     for x in self.ar {

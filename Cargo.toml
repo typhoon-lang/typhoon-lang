@@ -4,6 +4,7 @@ members = [
   "crates/compiler",
   "crates/runtime",
   "crates/cli",
+  "crates/stdlib",
 ]
 
 [workspace.package]
@@ -19,3 +20,4 @@ rust-version = "1.90"
 # Common internal dependencies
 typhoon-compiler = { path = "crates/compiler" }
 typhoon-runtime = { path = "crates/runtime" }
+typhoon-cli = { path = "crates/cli" }

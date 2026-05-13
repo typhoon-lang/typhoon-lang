@@ -14,9 +14,16 @@ struct NamespaceUnit {
     uses: Vec<UsePath>,
 }
 
-fn collect_ty_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn collect_ty_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = Vec::new();
+
+    if path.is_dir() {
+        stack.push(path.to_path_buf());
+    } else {
+        out.push(path.to_path_buf());
+    }
+
     while let Some(dir) = stack.pop() {
         let entries =
             fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
@@ -66,16 +73,36 @@ fn extract_namespace_units(
             }
         };
 
-        let entry = units.entry(ns.clone()).or_insert_with(|| NamespaceUnit {
-            name: ns.clone(),
-            declarations: Vec::new(),
-            uses: Vec::new(),
+        let mut entry = units.entry(ns.clone()).or_insert_with(|| {
+            println!("Creating new NamespaceUnit for: {}", ns);
+            NamespaceUnit {
+                name: ns.clone(),
+                declarations: Vec::new(),
+                uses: Vec::new(),
+            }
         });
+
+        let mut existing_decls = entry
+            .declarations
+            .iter()
+            .filter_map(decl_name)
+            .map(|i| i.name.clone())
+            .collect::<HashSet<_>>();
+        println!("Existing decls in {}: {:?}", ns, existing_decls);
 
         for decl in module.declarations {
             match decl.node {
                 DeclarationKind::Use(path) => entry.uses.push(path),
-                _ => entry.declarations.push(decl),
+                _ => {
+                    if let Some(id) = decl_name(&decl) {
+                        if existing_decls.contains(&id.name) {
+                            println!("Skipping duplicate: {} in {}", id.name, ns);
+                            continue;
+                        }
+                        existing_decls.insert(id.name.clone());
+                    }
+                    entry.declarations.push(decl);
+                }
             }
         }
     }
@@ -373,24 +400,31 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
     }
 }
 
-pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
-    let root = entry_file.parent().ok_or_else(|| {
-        vec![format!(
-            "Entry file has no parent: {}",
-            entry_file.display()
-        )]
-    })?;
-
-    let mut files = collect_ty_files(root).map_err(|e| vec![e])?;
+pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
+    let mut files = collect_ty_files(path).map_err(|e| vec![e])?;
     files.sort();
     files.dedup();
 
-    eprintln!("<<<< {:?}", files);
+    let entry_file = if path.is_file() {
+        path.to_path_buf()
+    } else {
+        // Assume main.ty exists in directory if passed folder
+        path.join("main.ty")
+    };
+
     let mut modules = Vec::new();
     let mut errors = Vec::new();
+    let mut parsed_files = HashSet::new();
+
     for file in files {
+        if parsed_files.contains(&file) {
+            continue;
+        }
         match parse_file(&file) {
-            Ok(m) => modules.push(m),
+            Ok(m) => {
+                parsed_files.insert(file.clone());
+                modules.push(m)
+            }
             Err(e) => errors.push(format!("{}: {}", file.display(), e)),
         }
     }
@@ -398,36 +432,166 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
         return Err(errors);
     }
 
+    // Load stdlib from .ll file and inject as synthetic parsed module
+    // Look next to the binary, then next to cwd
+    let stdlib_ll_path = std::env::current_exe()
+        .ok() // Convert Result to Option
+        .and_then(|p| p.parent()?.parent()?.parent()?.to_owned().into())
+        // 1st parent: executable folder (e.g., debug/)
+        // 2nd parent: build folder (e.g., target/)
+        // 3rd parent: project root
+        .map(|d| d.join("typhoon-stdlib.ll"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("typhoon-stdlib.ll"));
+    println!("Exe {:?}", std::env::current_exe());
+    println!("Path {:?}", stdlib_ll_path);
+    if stdlib_ll_path.exists() {
+        let ll_source =
+            fs::read_to_string(stdlib_ll_path).map_err(|e| vec![format!("read stdlib: {}", e)])?;
+        let ty_source = parse_ll_as_ty_source(&ll_source);
+
+        // Parse the generated .ty source as a module
+        let tokens = crate::lexer::Lexer::new(ty_source).tokenize();
+        match crate::parser::Parser::new(tokens).parse_module() {
+            Ok(m) => modules.push(m),
+            Err(e) => return Err(vec![format!("stdlib parse error: {}", e)]),
+        }
+    }
+    println!(
+        "modules count: {}, namespaces: {:?}",
+        modules.len(),
+        modules
+            .iter()
+            .filter_map(|m| m.name.as_deref())
+            .collect::<Vec<_>>()
+    );
+
     let mut units = extract_namespace_units(modules)?;
 
-    // Inject synthetic stdlib namespace with builtin types.
-    // Merge with any parsed files in the `std` namespace.
-    let std_unit = units
-        .entry("std".to_string())
+    // Find entry namespace by looking up which unit came from a file named
+    // after the entry file's stem — or just read the namespace line only
+    let entry_ns = {
+        let source = fs::read_to_string(&entry_file)
+            .map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
+        // Grab `namespace <name>` without full parse — no AST, no declarations
+        source
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("namespace ")
+                    .map(|n| n.trim().to_string())
+            })
+            .ok_or_else(|| vec!["Could not find entry namespace".to_string()])?
+    };
+
+    // Ensure entry unit exists (safety fallback only — or_insert_with is a no-op if already present)
+    units
+        .entry(entry_ns.clone())
         .or_insert_with(|| NamespaceUnit {
-            name: "std".to_string(),
+            name: entry_ns.clone(),
             declarations: Vec::new(),
             uses: Vec::new(),
         });
-    std_unit.declarations.extend(parse_stdlib_prelude());
-
-    let entry_module =
-        parse_file(entry_file).map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
-    let entry_ns = entry_module.name.clone().ok_or_else(|| {
-        vec![format!(
-            "Entry file missing `namespace`: {}",
-            entry_file.display()
-        )]
-    })?;
-
     let decl_maps = build_namespace_decl_maps(&units)?;
     let order = compute_transitive(&units, &entry_ns)?;
 
-    // Build per-namespace alias maps and then rename + desugar declarations.
+    // 1. First, collect all declarations from all namespaces (global index).
+    let mut global_symbols = HashMap::new();
+    for (ns, unit) in &units {
+        for decl in &unit.declarations {
+            if let Some(id) = decl_name(decl) {
+                let info = match &decl.node {
+                    DeclarationKind::Struct { fields, .. } => {
+                        let mut field_map = HashMap::new();
+                        for (f_id, f_ty) in fields {
+                            field_map.insert(f_id.name.clone(), f_ty.node.clone());
+                        }
+                        crate::resolver::DeclInfo::Struct { fields: field_map }
+                    }
+                    DeclarationKind::Enum { variants, .. } => {
+                        let mut variant_map = HashMap::new();
+                        for v in variants {
+                            variant_map.insert(
+                                v.node.name.name.clone(),
+                                crate::resolver::EnumVariantInfo {
+                                    name: v.node.name.name.clone(),
+                                    payload: v.node.payload.clone().map(|p| p.node),
+                                },
+                            );
+                        }
+                        crate::resolver::DeclInfo::Enum {
+                            variants: variant_map,
+                        }
+                    }
+                    _ => crate::resolver::DeclInfo::Unresolved,
+                };
+                global_symbols.insert(id.name.clone(), info);
+            }
+        }
+    }
+    println!(
+        "global_symbols keys: {:?}",
+        global_symbols.keys().collect::<Vec<_>>()
+    );
+
+    // Step 2: Resolve all namespaces using global context
+    let mut resolver = crate::resolver::Resolver::new();
+    for ns in &order {
+        let unit = units.get(ns).unwrap();
+        if ns == "std" {
+            continue;
+        }
+
+        let own_decl_names: HashSet<String> = unit
+            .declarations
+            .iter()
+            .filter_map(decl_name)
+            .map(|id| id.name.clone())
+            .collect();
+
+        let imports_for_ns: HashMap<String, crate::resolver::DeclInfo> = global_symbols
+            .iter()
+            .filter(|(name, _)| !own_decl_names.contains(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Expand impl/extension blocks so the resolver sees individual fn declarations
+        let expanded_decls: Vec<Declaration> = unit
+            .declarations
+            .iter()
+            .cloned()
+            .flat_map(|d| expand_impl_and_extension_decls(d))
+            .collect();
+
+        let module = Module {
+            name: Some(ns.clone()),
+            declarations: expanded_decls, // ← expanded, not raw
+            span: Span::default(),
+        };
+
+        resolver
+            .resolve_module(&module, &imports_for_ns)
+            .map_err(|e| e)?;
+    }
+
+    // Step 3: Build all_decls — always include std first, then ordered namespaces
     let mut all_decls = Vec::new();
     let mut desugar = Desugar::new();
 
+    // Always expand std into all_decls so type checker can find stdlib methods
+    // (temporary until explicit `use std::...` imports drive inclusion)
+    if let Some(std_unit) = units.get("std") {
+        for decl in std_unit.declarations.clone() {
+            for expanded in expand_impl_and_extension_decls(decl) {
+                all_decls.push(expanded);
+            }
+        }
+    }
+
     for ns in order {
+        if ns == "std" {
+            continue;
+        } // already added above
         let alias = build_alias_map(&ns, &units, &decl_maps)?;
         let unit = units.get(&ns).unwrap();
         for mut decl in unit.declarations.clone() {
@@ -448,16 +612,235 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
     })
 }
 
-fn parse_stdlib_prelude() -> Vec<Declaration> {
-    let source = r#"
-        namespace std
-        struct Buf {}
-        extern "C" {
-            fn __ty_buf_new() -> Buf
-            fn __ty_buf_push_str(b: Buf, s: Str) -> Unit
-            fn __ty_buf_into_str(b: Buf) -> Str
+fn ll_type_to_ty(ll: &str) -> &str {
+    let ll = ll.trim().trim_end_matches('*');
+    match ll {
+        "void" => "Unit",
+        "i8" | "i8*" => "Str", // opaque ptr / string
+        "i16" => "Int16",
+        "i32" => "Int32",
+        "i64" => "Int64",
+        "float" => "Float32",
+        "double" => "Float64",
+        s if s.starts_with("%struct.") => {
+            // "%struct.Buf*" -> "Buf", "%struct.TyArray" -> "TyArray"
+            s.trim_start_matches("%struct.")
         }
-    "#;
-    let tokens = Lexer::new(source.trim().to_string()).tokenize();
-    Parser::new(tokens).parse_module().unwrap().declarations
+        _ => "Str", // fallback: treat unknown ptrs as opaque
+    }
+}
+
+fn parse_ll_as_ty_source(ll_source: &str) -> String {
+    let mut struct_names = Vec::new();
+    let mut enum_decls = Vec::new();
+    let mut free_fns = Vec::new();
+    // (type_name, raw_ty_sig_line) — full Typhoon fn signature string,
+    // either from a `; @ty_sig:` annotation or inferred from LLVM types.
+    let mut methods: Vec<(String, String)> = Vec::new();
+    let mut pending_ty_sig: Option<String> = None;
+
+    for line in ll_source.lines() {
+        let line = line.trim();
+
+        // ; @ty_sig: fn consume(self, ch: ref chan<Int8>)
+        if let Some(sig) = line.strip_prefix("; @ty_sig:") {
+            pending_ty_sig = Some(sig.trim().to_string());
+            continue;
+        }
+
+        // %struct.Foo = type { ... }  OR  %struct.Foo = type opaque
+        if let Some(rest) = line.strip_prefix("%struct.") {
+            if let Some(name) = rest.split('=').next().map(|s| s.trim()) {
+                struct_names.push(name.to_string());
+            }
+            continue;
+        }
+
+        // %enum.Option<T> = type { Some(T), None }
+        // %enum.Result<T, E> = type { Ok(T), Err(E) }
+        if let Some(rest) = line.strip_prefix("%enum.") {
+            // Extract "Name<generics>" from before the '='
+            if let Some(lhs) = rest.split('=').next().map(|s| s.trim()) {
+                // Extract variants from inside "type { ... }"
+                if let Some(body) = rest.split('{').nth(1).and_then(|s| s.split('}').next()) {
+                    // lhs = "Option<T>" or "Result<T, E>"
+                    let (enum_name, generics) = if let Some(i) = lhs.find('<') {
+                        (&lhs[..i], &lhs[i..]) // ("Option", "<T>")
+                    } else {
+                        (lhs, "")
+                    };
+                    // body = " Some(T), None " or " Ok(T), Err(E) "
+                    let variants = body
+                        .split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    enum_decls.push(format!("enum {}{} {{ {} }}", enum_name, generics, variants));
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("declare ") {
+            if rest.contains("@__ty_rt__") {
+                let type_name = rest
+                    .split("@__ty_rt__")
+                    .nth(1)
+                    .and_then(|s| s.split("__").next())
+                    .map(|s| s.to_string());
+
+                if let Some(type_name) = type_name {
+                    if let Some(sig) = pending_ty_sig.take() {
+                        // Use the explicit Typhoon signature from the annotation
+                        methods.push((type_name, sig));
+                    } else if let Some((_, method_name, params, ret)) = parse_ll_method_decl(rest) {
+                        // Fall back to inferring from LLVM types
+                        let ret_str = if ret == "Unit" {
+                            String::new()
+                        } else {
+                            format!(" -> {}", ret)
+                        };
+                        let params_str = if params.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", params.join(", "))
+                        };
+                        let sig = format!("fn {}(self{}){} {{}}", method_name, params_str, ret_str);
+                        methods.push((type_name, sig));
+                    }
+                }
+            } else if let Some(sig) = parse_ll_declare_to_ty(rest) {
+                free_fns.push(sig);
+            }
+            pending_ty_sig = None;
+        } else if !line.starts_with(';') {
+            pending_ty_sig = None;
+        }
+    }
+
+    let mut out = String::from("namespace std\nextern \"C\" {\n");
+    for sig in &free_fns {
+        out.push_str(&format!("    {}\n", sig));
+    }
+    out.push_str("}\n");
+
+    // Emit struct declarations
+    let mut emitted = std::collections::HashSet::new();
+    for name in &struct_names {
+        let ty_name = if name == "TyArray" {
+            "Array"
+        } else {
+            name.as_str()
+        };
+        if emitted.insert(ty_name.to_string()) {
+            out.push_str(&format!("struct {} {{}}\n", ty_name));
+        }
+    }
+
+    // Emit enum declarations
+    for decl in &enum_decls {
+        out.push_str(&format!("{}\n", decl));
+    }
+
+    // Emit impl blocks grouped by type
+    let mut by_type: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (type_name, sig) in methods {
+        by_type.entry(type_name).or_default().push(sig);
+    }
+    for (type_name, sigs) in &by_type {
+        out.push_str(&format!("impl {} {{\n", type_name));
+        for sig in sigs {
+            // Ensure every method has a body — annotation may omit it
+            let line = if sig.contains('{') {
+                sig.clone()
+            } else {
+                format!("{} {{}}", sig)
+            };
+            out.push_str(&format!("    {}\n", line));
+        }
+        out.push_str("}\n");
+    }
+
+    println!("Output: {}", out);
+
+    out
+}
+
+fn extract_type_name_from_ll(rest: &str) -> Option<String> {
+    let after_at = rest.split("@__ty_rt__").nth(1)?;
+    let name = after_at.split("__").next()?;
+    Some(name.to_string())
+}
+
+// New helper for __ty_rt__Type__method declarations
+fn parse_ll_method_decl(rest: &str) -> Option<(String, String, Vec<String>, String)> {
+    // rest = "i8* @__ty_rt__Network__listen(%struct.Network*, i8*)"
+    let (ret_ll, after_at) = rest.split_once('@')?;
+    let ret_ty = ll_type_to_ty(ret_ll.trim()).to_string();
+
+    let (name, args_part) = after_at.split_once('(')?;
+    // name = "__ty_rt__Network__listen"
+    let name = name.trim().trim_start_matches("__ty_rt__");
+    // Split on first __ to get TypeName and method
+    let (type_name, method_name) = name.split_once("__")?;
+
+    let args_part = args_part.trim_end_matches(')');
+    let mut params = Vec::new();
+    // Skip first arg (self pointer = %struct.TypeName*)
+    let args: Vec<&str> = args_part.split(',').collect();
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        let arg = arg.trim();
+        if arg == "..." || arg.is_empty() {
+            continue;
+        }
+        let ll_ty = arg.split_whitespace().next()?;
+        let ty = ll_type_to_ty(ll_ty);
+        params.push(format!("arg{}: {}", i, ty));
+    }
+
+    Some((
+        type_name.to_string(),
+        method_name.to_string(),
+        params,
+        ret_ty,
+    ))
+}
+
+fn parse_ll_declare_to_ty(rest: &str) -> Option<String> {
+    // rest = "i32 @ty_net_listen(i8* %addr, i32 %port)"
+    let (ret_ll, after_at) = rest.split_once('@')?;
+    let ret_ty = ll_type_to_ty(ret_ll.trim());
+
+    let (name, args_part) = after_at.split_once('(')?;
+    let name = name.trim();
+    let args_part = args_part.trim_end_matches(')');
+
+    let mut params = Vec::new();
+    if !args_part.trim().is_empty() {
+        for (i, arg) in args_part.split(',').enumerate() {
+            let arg = arg.trim();
+            if arg == "..." || arg.is_empty() {
+                continue;
+            }
+            // "i8* %task"  or  "%struct.Buf* %out"  or  just "i8*"
+            let ll_ty = arg.split_whitespace().next()?;
+            let ty = ll_type_to_ty(ll_ty);
+            params.push(format!("arg{}: {}", i, ty));
+        }
+    }
+
+    let ret_annotation = if ret_ty == "Unit" {
+        String::new()
+    } else {
+        format!(" -> {}", ret_ty)
+    };
+
+    Some(format!(
+        "fn {}({}){}",
+        name,
+        params.join(", "),
+        ret_annotation
+    ))
 }

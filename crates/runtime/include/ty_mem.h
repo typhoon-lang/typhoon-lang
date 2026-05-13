@@ -24,6 +24,9 @@ typedef struct SlabArena SlabArena;
 SlabArena* slab_arena_new(void);
 void       slab_arena_free(SlabArena* arena);
 
+/* Helper: map allocation size to runtime size class (exported for scheduler) */
+int32_t    size_to_class(size_t size);
+
 /* ── Slab allocation (called from emitted LLVM IR) ──────────────────────────── */
 
 void* slab_alloc(SlabArena* arena, int32_t size_class);

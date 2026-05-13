@@ -1,15 +1,17 @@
-use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use typhoon_compiler::codegen::Codegen;
 use typhoon_compiler::driver::compile_project;
 use typhoon_compiler::liveness::LiveAnalyzer;
-use typhoon_compiler::resolver::Resolver;
 use typhoon_compiler::type_inference::TypeChecker;
 
 pub fn compile(input: &str, output: &str) {
+    let ir_path = compile_to_ir(input, output);
+    crate::link::link_ir(ir_path.to_str().unwrap(), output);
+}
+
+pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
     let module = match compile_project(Path::new(input)) {
         Ok(m) => m,
         Err(errs) => {
@@ -19,14 +21,6 @@ pub fn compile(input: &str, output: &str) {
             std::process::exit(1);
         }
     };
-
-    let mut resolver = Resolver::new();
-    if let Err(errors) = resolver.resolve_module(&module) {
-        for err in errors {
-            eprintln!("Resolve error: {}", err);
-        }
-        std::process::exit(1);
-    }
 
     let mut checker = TypeChecker::new();
     if let Err(err) = checker.check_module(&module) {
@@ -53,46 +47,5 @@ pub fn compile(input: &str, output: &str) {
         eprintln!("Failed to write IR file: {}", err);
         std::process::exit(1);
     }
-
-    let mut build_dir = env::current_exe()
-        .expect("Failed to get current exe path")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    build_dir.push("lib");
-
-    let mut cmd = Command::new("clang");
-    cmd.arg("-v").arg(ll_path.as_os_str());
-    cmd.arg("-x").arg("none");
-    cmd.arg("-L").arg(build_dir.as_os_str());
-    cmd.arg("-lruntime");
-
-    if cfg!(windows) {
-        cmd.arg("-fms-runtime-lib=static");
-        cmd.arg("-Wl,/NODEFAULTLIB:LIBCMTD");
-        cmd.arg("-lWs2_32");
-    } else {
-        cmd.arg("-lm")
-            .arg("-lpthread")
-            .arg("-fno-omit-frame-pointer");
-        if cfg!(target_os = "linux") {
-            cmd.arg("-ldl");
-        }
-    }
-
-    cmd.arg("-o").arg(output);
-
-    match cmd.status() {
-        Ok(status) if status.success() => {
-            println!("Compiled successfully to: {}", output);
-        }
-        Ok(status) => {
-            eprintln!("clang failed with status {}", status);
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("Failed to invoke clang: {}", err);
-            std::process::exit(1);
-        }
-    }
+    ll_path
 }

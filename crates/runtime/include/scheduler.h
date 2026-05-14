@@ -151,6 +151,8 @@ void ty_safepoint(void);
  * Behaves like cooperative await — the caller is re-queued when `coro` exits. */
 void ty_await(SlabArena* arena, TyCoro* coro);
 
+void ty_coro_set_blocked(void);
+
 /* Exit the current coroutine. Called automatically at function return. */
 void ty_coro_exit(void);
 

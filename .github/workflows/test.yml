@@ -2,6 +2,8 @@ name: Test
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 env:
@@ -17,15 +19,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-        # os: [ubuntu-latest]
+        os: [windows-2022, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.21.x'
+          cmake-version: "3.21.x"
 
       - name: Setup VS cmd
         if: runner.os == 'Windows'

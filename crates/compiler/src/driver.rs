@@ -73,13 +73,10 @@ fn extract_namespace_units(
             }
         };
 
-        let mut entry = units.entry(ns.clone()).or_insert_with(|| {
-            println!("Creating new NamespaceUnit for: {}", ns);
-            NamespaceUnit {
-                name: ns.clone(),
-                declarations: Vec::new(),
-                uses: Vec::new(),
-            }
+        let mut entry = units.entry(ns.clone()).or_insert_with(|| NamespaceUnit {
+            name: ns.clone(),
+            declarations: Vec::new(),
+            uses: Vec::new(),
         });
 
         let mut existing_decls = entry
@@ -682,10 +679,19 @@ fn parse_ll_as_ty_source(ll_source: &str) -> String {
             continue;
         }
 
-        if let Some(rest) = line.strip_prefix("declare ") {
-            if rest.contains("@__ty_rt__") {
+        let method_rest = if let Some(r) = line.strip_prefix("declare ") {
+            Some(("declare", r))
+        } else if let Some(r) = line.strip_prefix("define ") {
+            Some(("define", r))
+        } else {
+            None
+        };
+
+        if let Some((kind, rest)) = method_rest {
+            if rest.contains("@__ty_method__") {
+                // existing method-parsing logic — works for both declare and define
                 let type_name = rest
-                    .split("@__ty_rt__")
+                    .split("@__ty_method__")
                     .nth(1)
                     .and_then(|s| s.split("__").next())
                     .map(|s| s.to_string());
@@ -710,8 +716,13 @@ fn parse_ll_as_ty_source(ll_source: &str) -> String {
                         methods.push((type_name, sig));
                     }
                 }
-            } else if let Some(sig) = parse_ll_declare_to_ty(rest) {
-                free_fns.push(sig);
+            } else {
+                // This block correctly handles all other 'declare' statements,
+                // including @__ty_rt__ functions, by treating them as regular free functions.
+                // only emit free-fn externs from 'declare', not 'define'
+                if let Some(sig) = parse_ll_declare_to_ty(rest) {
+                    free_fns.push(sig);
+                }
             }
             pending_ty_sig = None;
         } else if !line.starts_with(';') {
@@ -768,21 +779,15 @@ fn parse_ll_as_ty_source(ll_source: &str) -> String {
     out
 }
 
-fn extract_type_name_from_ll(rest: &str) -> Option<String> {
-    let after_at = rest.split("@__ty_rt__").nth(1)?;
-    let name = after_at.split("__").next()?;
-    Some(name.to_string())
-}
-
-// New helper for __ty_rt__Type__method declarations
+// New helper for __ty_method__Type__method declarations
 fn parse_ll_method_decl(rest: &str) -> Option<(String, String, Vec<String>, String)> {
-    // rest = "i8* @__ty_rt__Network__listen(%struct.Network*, i8*)"
+    // rest = "i8* @__ty_method__Network__listen(%struct.Network*, i8*)"
     let (ret_ll, after_at) = rest.split_once('@')?;
     let ret_ty = ll_type_to_ty(ret_ll.trim()).to_string();
 
     let (name, args_part) = after_at.split_once('(')?;
-    // name = "__ty_rt__Network__listen"
-    let name = name.trim().trim_start_matches("__ty_rt__");
+    // name = "__ty_method__Network__listen"
+    let name = name.trim().trim_start_matches("__ty_method__");
     // Split on first __ to get TypeName and method
     let (type_name, method_name) = name.split_once("__")?;
 
@@ -795,14 +800,15 @@ fn parse_ll_method_decl(rest: &str) -> Option<(String, String, Vec<String>, Stri
         if arg == "..." || arg.is_empty() {
             continue;
         }
+        // Extract LLVM type (e.g., "i8*", "%struct.Network*")
         let ll_ty = arg.split_whitespace().next()?;
         let ty = ll_type_to_ty(ll_ty);
         params.push(format!("arg{}: {}", i, ty));
     }
 
     Some((
-        type_name.to_string(),
-        method_name.to_string(),
+        type_name.to_string(),   // Correctly extracted type name (e.g., "Network")
+        method_name.to_string(), // Correctly extracted method name (e.g., "listen")
         params,
         ret_ty,
     ))

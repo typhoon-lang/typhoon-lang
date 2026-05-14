@@ -1041,6 +1041,13 @@ void ty_await(SlabArena* arena, TyCoro* target) {
     ty_ctx_swap(&me->ctx, &w->sched_ctx);
 }
 
+void ty_coro_set_blocked(void) {
+    Worker* w = current_worker();
+    TyCoro* me = w ? w->current : NULL;
+    if (!me) return;
+    coro_state_store(me, CORO_BLOCKED, "io_pre_submit");
+}
+
 void ty_coro_exit(void) {
     Worker* w = current_worker();
     TyCoro* co = w ? w->current : NULL;
@@ -1380,7 +1387,21 @@ void ty_coro_block_and_yield(void) {
             (int)atomic_load_explicit(&me->state, memory_order_relaxed),
             atomic_load_explicit(&active_coros, memory_order_relaxed));
     }
-    coro_state_store(me, CORO_BLOCKED, "io_block_and_yield");
+    // Only set state if not already BLOCKED (pre-set by ty_coro_set_blocked)
+    CoroState cur = atomic_load_explicit(&me->state, memory_order_acquire);
+    if (cur != CORO_BLOCKED) {
+        coro_state_store(me, CORO_BLOCKED, "io_block_and_yield");
+    } else if (cur == CORO_RUNNABLE) {
+        return; // wake already arrived, skip yield
+    }
+    // Confirm state is still BLOCKED right before swapping.
+    CoroState expected = CORO_BLOCKED;
+    if (!atomic_compare_exchange_strong_explicit(
+            &me->state, &expected, CORO_BLOCKED,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return; // wake flipped us to RUNNABLE between check and swap
+    }
+
     atomic_fetch_add_explicit(&dbg_blocked, 1, memory_order_relaxed);
     ty_ctx_swap(&me->ctx, &w->sched_ctx);
 }

@@ -429,23 +429,10 @@ impl<'a> IrBuilder<'a> {
         self.reg = TypeRegistry::new();
         self.adt_structs.clear();
 
-        // self.reg
-        //     .push_type_decl("Buf", "%struct.Buf = type { i8*, i64, i64 }".to_string());
         self.reg.push_type_decl(
             "TyArray",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }".to_string(),
         );
-        // Networking structs are opaque runtime handles. They must be declared
-        // here — before collect_enum_defs tries to pre-generate
-        // Result<Listener,…> / Result<Socket,…> layouts — so that the payload
-        // type names (%struct.Listener*, %struct.Socket*) are already known
-        // and ty_net_global's %struct.Network* return type resolves correctly.
-        // self.reg
-        //     .push_type_decl("Network", "%struct.Network  = type opaque".to_string());
-        // self.reg
-        //     .push_type_decl("Listener", "%struct.Listener = type opaque".to_string());
-        // self.reg
-        //     .push_type_decl("Socket", "%struct.Socket   = type opaque".to_string());
 
         self.collect_enum_defs(module);
         self.register_runtime_decls();
@@ -568,11 +555,8 @@ impl<'a> IrBuilder<'a> {
             self.reg.push_declare(&sym, d.to_string());
         }
 
-        // func_sigs for buf/array/scheduler
+        // func_sigs for array/scheduler
         let sigs: &[(&str, &str, &[&str])] = &[
-            ("__ty_buf_new", "%struct.Buf*", &[]),
-            ("__ty_buf_push_str", "void", &["%struct.Buf*", "i8*"]),
-            ("__ty_buf_into_str", "i8*", &["%struct.Buf*"]),
             ("ty_array_push", "void", &["%struct.TyArray*", "i8*"]),
             ("ty_spawn", "i8*", &["i8*", "i8*"]),
             ("ty_spawn_closure", "i8*", &["i8*", "i8*", "i64"]),
@@ -1218,15 +1202,27 @@ impl<'a> IrBuilder<'a> {
         for ty in &closure_field_tys {
             let sz = self.llvm_const_sizeof(ty);
             let al = self.llvm_const_alignof(ty);
-            if al > max_align { max_align = al; }
-            let pad = if offset % al == 0 { 0 } else { al - (offset % al) };
+            if al > max_align {
+                max_align = al;
+            }
+            let pad = if offset % al == 0 {
+                0
+            } else {
+                al - (offset % al)
+            };
             offset += pad;
             offset += sz;
         }
         let closure_size: i64 = if max_align > 1 {
             let rem = offset % max_align;
-            if rem == 0 { offset } else { offset + (max_align - rem) }
-        } else { offset };
+            if rem == 0 {
+                offset
+            } else {
+                offset + (max_align - rem)
+            }
+        } else {
+            offset
+        };
         let class_id = get_size_class(closure_size);
 
         self.reg.type_decls.push(format!(
@@ -1261,7 +1257,10 @@ impl<'a> IrBuilder<'a> {
 
         // Bitcast closure slot to i8* for the spawn call
         let closure_i8 = self.tmp();
-        self.emit(format!("  {} = bitcast {}* {} to i8*", closure_i8, closure_ty, closure_slot));
+        self.emit(format!(
+            "  {} = bitcast {}* {} to i8*",
+            closure_i8, closure_ty, closure_slot
+        ));
 
         // Emit trampoline in saved context
         let ctx = self.save_context();

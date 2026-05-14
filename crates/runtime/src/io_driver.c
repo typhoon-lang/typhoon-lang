@@ -737,8 +737,12 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
             req->coro = coro;
             req->is_write = is_write;
 
+            ty_coro_set_blocked();   // BLOCKED before kernel sees the SQE
+
+            // submit — poll thread may complete and wake us at any point after this
 #if defined(__linux__)
             uring_submit((UringDriver*)d->impl, req);
+            // poll thread may now fire, but state is already BLOCKED, so wake_enqueue BLOCKED->RUNNABLE is valid
 #elif defined(__APPLE__)
             kq_submit((KqDriver*)d->impl, req);
 #elif defined(_WIN32)
@@ -746,6 +750,8 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
 #endif
             TY_DEBUG("[io] park coro=%p fd=%d is_write=%d len=%zu\n",
                 coro, fd, is_write, len);
+
+            // now just does the ctx_swap, state already correct
             ty_io_park_coro(arena); /* yields; result stored by poll thread */
             return;
         }

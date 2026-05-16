@@ -824,10 +824,15 @@ fn parse_ll_declare_to_ty(rest: &str) -> Option<String> {
     let args_part = args_part.trim_end_matches(')');
 
     let mut params = Vec::new();
+    let mut variadic = false;
     if !args_part.trim().is_empty() {
         for (i, arg) in args_part.split(',').enumerate() {
             let arg = arg.trim();
-            if arg == "..." || arg.is_empty() {
+            if arg == "..." {
+                variadic = true;
+                continue;
+            }
+            if arg.is_empty() {
                 continue;
             }
             // "i8* %task"  or  "%struct.Buf* %out"  or  just "i8*"
@@ -835,6 +840,9 @@ fn parse_ll_declare_to_ty(rest: &str) -> Option<String> {
             let ty = ll_type_to_ty(ll_ty);
             params.push(format!("arg{}: {}", i, ty));
         }
+    }
+    if variadic {
+        params.push("...".to_string());
     }
 
     let ret_annotation = if ret_ty == "Unit" {

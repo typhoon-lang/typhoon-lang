@@ -44,6 +44,23 @@
 #  endif
 #endif
 
+#ifndef TY_ASSERT
+#  ifdef TY_DEBUG_ENABLED
+    // Prints the assertion failure, file, line number, and custom message, then aborts
+#    define TY_ASSERT(cond, fmt, ...) \
+        do { \
+            if (!(cond)) { \
+                fprintf(stderr, "Assertion failed: (%s), file %s, line %d\n", #cond, __FILE__, __LINE__); \
+                fprintf(stderr, "Message: " fmt "\n", ##__VA_ARGS__); \
+                abort(); \
+            } \
+        } while (0)
+#  else
+    // Completely compiled out when disabled
+#    define TY_ASSERT(cond, fmt, ...) ((void)0)
+#  endif
+#endif
+
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  POSIX path

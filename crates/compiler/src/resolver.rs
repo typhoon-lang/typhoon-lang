@@ -186,8 +186,7 @@ impl Resolver {
         let internal = [
             // flow control
             "break", "continue", // type
-            // "Ok", "Err", "Some", "None",
-            "chan", // stdio
+            "chan",     // stdio
             "print", "println", "printf", "fprint", "fprintln", "fprintf", "sprint", "sprintln",
             "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
         ];

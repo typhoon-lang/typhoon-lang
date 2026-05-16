@@ -31,3 +31,29 @@ install(TARGETS runtime
     ARCHIVE DESTINATION lib  # This creates the 'lib' folder
     LIBRARY DESTINATION lib
 )
+
+# 4. TEST PHASE
+option(BUILD_TESTS "Build C test suite" OFF)
+
+if(BUILD_TESTS)
+    # Add each test source file here. One entry = one test binary.
+    # The binary name is derived from the filename (without extension).
+    set(C_TEST_SOURCES
+        test/test_task01_dangling_ptr.c
+        test/test_task02_sscan_mutation.c
+        test/test_task03_double_close.c
+        test/test_task04_overflow.c
+    )
+
+    foreach(test_src ${C_TEST_SOURCES})
+        # Derive binary name from filename without extension
+        get_filename_component(test_name ${test_src} NAME_WE)
+
+        add_executable(${test_name} ${test_src})
+        target_include_directories(${test_name} PUBLIC include/)
+        target_link_libraries(${test_name} PRIVATE runtime)
+
+        # Install every test binary to bin/ so build.rs can find them
+        install(TARGETS ${test_name} DESTINATION bin)
+    endforeach()
+endif()

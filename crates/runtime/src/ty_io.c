@@ -608,30 +608,39 @@ static void ty_format_fixed(StackBuf* out, const char* fmt, uint64_t* args, int 
     }
 }
 
-void ty_printf(SlabArena* arena, char* fmt, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+int ty_printf(SlabArena* arena, char* fmt, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
     (void)arena;
     StackBuf buf;
     sbuf_init(&buf);
     uint64_t args[4] = { a1, a2, a3, a4 };
     ty_format_fixed(&buf, fmt, args, 4);
+    /* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
+    if (buf.overflow) return -1; /* signal truncation to caller */
     io_do_write(TY_STDOUT_FD, buf.data, buf.len);
+    return (int)buf.len;
 }
 
 /* ── ty_fprint / ty_fprintln / ty_fprintf
  * ────────────────────────────────────── */
 
-void ty_fprint(SlabArena* arena, int fd, char* s) {
+/* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
+int ty_fprint(SlabArena* arena, int fd, char* s) {
     (void)arena;
     if (!s) s = "";
-    io_do_write(fd, s, strlen(s));
+    size_t len = strlen(s);
+    if (len >= STACK_BUF_CAP) return -1; /* output would be truncated */
+    io_do_write(fd, s, len);
+    return (int)len;
 }
 
-void ty_fprintln(SlabArena* arena, int fd, char* s) {
-    ty_fprint(arena, fd, s);
+int ty_fprintln(SlabArena* arena, int fd, char* s) {
+    int r = ty_fprint(arena, fd, s);
+    if (r < 0) return r;
     io_do_write(fd, "\n", 1);
+    return r + 1;
 }
 
-void ty_fprintf(SlabArena* arena, int fd, char* fmt, ...) {
+int ty_fprintf(SlabArena* arena, int fd, char* fmt, ...) {
     (void)arena;
     StackBuf buf;
     sbuf_init(&buf);
@@ -639,7 +648,10 @@ void ty_fprintf(SlabArena* arena, int fd, char* fmt, ...) {
     va_start(ap, fmt);
     ty_vformat(&buf, fmt, ap);
     va_end(ap);
+    /* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
+    if (buf.overflow) return -1; /* signal truncation to caller */
     io_do_write(fd, buf.data, buf.len);
+    return (int)buf.len;
 }
 
 /* ── ty_sprint / ty_sprintln / ty_sprintf — write into a Buf
@@ -993,6 +1005,18 @@ static int sc_read_token(StrCursor* sc, char* buf, size_t cap) {
     return (int)i;
 }
 
+static int sc_read_token_len(StrCursor* sc, const char** out_start) {
+    int c = sc_skip_ws(sc);
+    if (c < 0) return 0;
+    *out_start = &sc->src[sc->pos - 1];
+    int len = 0;
+    while (c >= 0 && c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+        len++;
+        c = sc_read_char(sc);
+    }
+    return len;
+}
+
 /*
  * ty_sscan — reads one whitespace-delimited token from `src`.
  * Returns a pointer into the source string (not arena-allocated) or NULL.
@@ -1001,8 +1025,7 @@ static int sc_read_token(StrCursor* sc, char* buf, size_t cap) {
  * For simplicity we return the token as a null-terminated slice by mutating
  * the source string in-place (caller must own the string).
  */
-char* ty_sscan(void* task, char* src, char** rest_out) {
-    (void)task;
+char* ty_sscan(void* task, const char* src, const char** rest_out) {
     if (!src) {
         if (rest_out) *rest_out = NULL;
         return NULL;
@@ -1014,18 +1037,21 @@ char* ty_sscan(void* task, char* src, char** rest_out) {
         if (rest_out) *rest_out = src;
         return NULL;
     }
-    char* start = src;
+    const char* start = src;
     while (*src && *src != ' ' && *src != '\t' && *src != '\n' && *src != '\r')
         src++;
-    if (*src) {
-        *src = '\0';
-        src++;
-    }
+
+    size_t len = (size_t)(src - start);
+    int32_t cls = size_to_class(len + 1);
+    char* tok = task ? (char*)slab_alloc(task, cls) : (char*)malloc(len + 1);
+    memcpy(tok, start, len);
+    tok[len] = '\0';
+
     if (rest_out) *rest_out = src;
-    return start;
+    return tok;
 }
 
-static int ty_vsscanf(const char* src, const char* fmt, va_list ap) {
+static int ty_vsscanf(void* task, const char* src, const char* fmt, va_list ap) {
     StrCursor sc;
     sc.src = src;
     sc.pos = 0;
@@ -1073,12 +1099,16 @@ static int ty_vsscanf(const char* src, const char* fmt, va_list ap) {
 
         switch (spec) {
         case 's': {
-            char tok[1024];
-            int n = sc_read_token(&sc, tok, sizeof(tok));
+            const char* tok_start;
+            int n = sc_read_token_len(&sc, &tok_start);
             if (n == 0) return matched;
             if (!suppress) {
                 char** dst = va_arg(ap, char**);
-                *dst = tok;
+                int32_t cls = size_to_class(n + 1);
+                char* result = (char*)slab_alloc(task, cls);
+                memcpy(result, tok_start, n);
+                result[n] = '\0';
+                *dst = result;
                 matched++;
             }
             break;
@@ -1155,10 +1185,9 @@ static int ty_vsscanf(const char* src, const char* fmt, va_list ap) {
 }
 
 int ty_sscanf(void* task, char* src, char* fmt, ...) {
-    (void)task;
     va_list ap;
     va_start(ap, fmt);
-    int n = ty_vsscanf(src, fmt, ap);
+    int n = ty_vsscanf(task, src, fmt, ap);
     va_end(ap);
     return n;
 }
@@ -1170,10 +1199,10 @@ int ty_sscanf(void* task, char* src, char* fmt, ...) {
 
 declare void    @ty_print    (i8* %task, i8* %s)
 declare void    @ty_println  (i8* %task, i8* %s)
-declare void    @ty_printf   (i8* %task, i8* %fmt, ...)
-declare void    @ty_fprint   (i8* %task, i32 %fd, i8* %s)
-declare void    @ty_fprintln (i8* %task, i32 %fd, i8* %s)
-declare void    @ty_fprintf  (i8* %task, i32 %fd, i8* %fmt, ...)
+declare i32     @ty_printf   (i8* %task, i8* %fmt, ...)
+declare i32     @ty_fprint   (i8* %task, i32 %fd, i8* %s)
+declare i32     @ty_fprintln (i8* %task, i32 %fd, i8* %s)
+declare i32     @ty_fprintf  (i8* %task, i32 %fd, i8* %fmt, ...)
 declare void    @ty_sprint   (i8* %task, %struct.Buf* %out, i8* %s)
 declare void    @ty_sprintln (i8* %task, %struct.Buf* %out, i8* %s)
 declare void    @ty_sprintf  (i8* %task, %struct.Buf* %out, i8* %fmt, ...)

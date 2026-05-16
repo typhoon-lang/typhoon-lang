@@ -70,7 +70,7 @@ typedef struct TyResult_i32_i32 {
 
 struct TyNetwork { uint32_t _tag; };
 struct TyListener { ty_sock_t sock; struct TyListener* next; };
-struct TySocket { ty_sock_t sock; struct TySocket* next; };
+struct TySocket { ty_sock_t sock; int closed; struct TySocket* next; };
 
 static TyNetwork g_net = { 0x4E45544Eu }; /* 'NETN' */
 static TyMutex g_sock_lock;
@@ -463,6 +463,11 @@ TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, i
 void __ty_rt__Socket__close(void* task, TySocket* self) {
     (void)task;
     if (!self) return;
+
+#ifndef NDEBUG
+    TY_ASSERT(!self->closed, "Socket__close called twice — liveness checker bug");
+    self->closed = 1;
+#endif
 
     ty_mutex_lock(&g_sock_lock);
     struct TySocket* prev = NULL;

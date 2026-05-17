@@ -3,6 +3,8 @@ namespace main
 //use std::net::Network;
 //use std::net::Socket;
 //use std::net::Listener;
+//use std::option::Some;
+//use std::result::Ok;
 
 struct Popcount {
   ar: [Int32],
@@ -61,7 +63,6 @@ fn main(net: Network) -> Int32 {
   while loop {
     let Ok(socket) = listener.accept() else { loop = false; };
     conc { handle_connection(socket); }
-    return 0;
   }
   return 0;
 }

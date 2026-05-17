@@ -1060,17 +1060,32 @@ impl<'a> IrBuilder<'a> {
                     "  br i1 {}, label %{}, label %{}",
                     ok, then_lbl, else_lbl
                 ));
-                self.emit(format!("{}:", then_lbl));
-                self.bind_pattern_typed(pattern, &match_val, &match_ty, Some(initializer));
-                self.emit(format!("  br label %{}", merge_lbl));
+                // Emit else arm first to determine if it terminates.
                 self.emit(format!("{}:", else_lbl));
                 let else_term = else_block
                     .as_ref()
                     .map(|b| self.emit_block_stmts(b, ret_ty))
                     .unwrap_or(false);
                 if !else_term {
-                    self.emit(format!("  br label %{}", merge_lbl));
+                    // If we are inside a loop, branch back to the loop start
+                    // rather than falling into merge. This implements the correct
+                    // semantics of `let Ok(x) = expr else { ... }` inside a loop:
+                    // when the pattern fails, run the else block then skip the
+                    // rest of the loop body (continue). Without this, any conc{}
+                    // or other statement after the let-else would execute even
+                    // on the failure path — e.g. spawning handle_connection with
+                    // a null/stale socket when accept() fails.
+                    if let Some((loop_start, _)) = self.loop_labels.last().cloned() {
+                        self.emit(format!("  br label %{}", loop_start));
+                    } else {
+                        self.emit(format!("  br label %{}", merge_lbl));
+                    }
                 }
+                // Emit ok arm. Always br to merge — LLVM requires every
+                // basic block to end with an explicit terminator.
+                self.emit(format!("{}:", then_lbl));
+                self.bind_pattern_typed(pattern, &match_val, &match_ty, Some(initializer));
+                self.emit(format!("  br label %{}", merge_lbl));
                 self.emit(format!("{}:", merge_lbl));
                 false
             }

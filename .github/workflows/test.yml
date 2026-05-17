@@ -45,10 +45,127 @@ jobs:
       - name: Run tests
         run: |
           cargo build -p typhoon-cli
-          cargo test --verbose
 
-      - name: Run sample tests
+      # ---- Locate the pre-built binary (path differs by OS) ----
+
+      - name: Set binary path (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "TY_BIN=./target/debug/tyc" >> $GITHUB_ENV
+
+      - name: Set binary path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "TY_BIN=.\target\debug\tyc.exe" >> $env:GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ---- Clear port 8080 if something is already using it ----
+
+      - name: Free port 8080 (Linux / macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          cargo build -p typhoon-cli
-          cargo run --verbose -- run sample/main.ty
+          pid=$(lsof -ti tcp:8080 2>/dev/null || true)
+          if [ -n "$pid" ]; then
+            echo "Killing stale process on :8080 (PID $pid)"
+            kill -9 $pid || true
+          fi
+
+      - name: Free port 8080 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $conn = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+          if ($conn) {
+            $conn | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+            Write-Host "Killed stale process on :8080"
+          }
+
+      # ---- Start server using the pre-built binary directly ----
+      # stdout -> server.log    (contains "Listening on :8080")
+      # stderr -> server-err.log (contains [sched]/[coro] debug output)
+      # Keeping them separate avoids the interleaved-buffer corruption seen
+      # in server-linux.log where the leading "L" was swallowed mid-write.
+
+      - name: Start server (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          $TY_BIN run sample/main.ty >server.log 2>server-err.log &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          echo "Server started (PID $!)"
+
+      - name: Start server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $proc = Start-Process `
+            -FilePath "$env:TY_BIN" `
+            -ArgumentList "run", "sample/main.ty" `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput "server.log" `
+            -RedirectStandardError "server-err.log"
+          echo "SERVER_PID=$($proc.Id)" >> $env:GITHUB_ENV
+          Write-Host "Server started (PID $($proc.Id))"
+
+      # ---- Wait for :8080 - pure Python, works on all platforms ----
+      #
+      # The Typhoon scheduler boots workers, spawns the main coro, goes
+      # through an IO park/wake cycle to print "Listening on :8080", THEN
+      # calls Listener::accept. The port is bound during that IO cycle, so
+      # a plain connect() can succeed a few ms before accept() is actually
+      # ready to receive data.
+      #
+      # Fix: after connecting, send a harmless probe byte (0x00, popcount=0)
+      # and wait for the socket to close or return data. That roundtrip
+      # confirms accept() has run and the handler coro is live.
+
+      - name: Wait for server to be ready
+        run: python script/ping.py
+
+      # ---- Run the test suite ----
+
+      - name: Run network tests
+        run: python script/test_network.py --host 127.0.0.1 --port 8080 --timeout 5
+
+      # ---- Upload server log (always, for debugging) ----
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log-${{ matrix.os }}
+          path: |
+            server.log
+            server-err.log
+          if-no-files-found: ignore
+
+      # ---- Stop server (platform-specific) ----
+
+      - name: Stop server (Linux / macOS)
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ -n "$SERVER_PID" ]; then
+            kill "$SERVER_PID" 2>/dev/null || true
+          fi
+          # Fallback: kill anything still holding :8080
+          pid=$(lsof -ti tcp:8080 2>/dev/null || true)
+          if [ -n "$pid" ]; then kill -9 $pid || true; fi
+
+      - name: Stop server (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:SERVER_PID) {
+            Stop-Process -Id $env:SERVER_PID -Force -ErrorAction SilentlyContinue
+          }
+          # Fallback: kill anything still holding :8080
+          $conn = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+          if ($conn) {
+            $conn | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+          }

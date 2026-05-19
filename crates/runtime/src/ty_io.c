@@ -673,15 +673,40 @@ void ty_sprintln(SlabArena* arena, Buf* out, char* s) {
     ty_buf_push_str(arena, out, "\n");
 }
 
-void ty_sprintf(SlabArena* arena, Buf* out, char* fmt, ...) {
-    if (!out) return;
+/* ════════════════════════════════════════════════════════════════════════════
+ * TASK 0.4 — ty_sprintf overflow
+ *
+ * ty_sprintf currently formats into a StackBuf and then pushes the result
+ * into the caller's Buf with ty_buf_push_str.  If the formatted string
+ * exceeds STACK_BUF_CAP (4096 bytes), it is silently truncated.
+ *
+ * Fix: check buf.overflow after ty_vformat and return without pushing
+ * the truncated data.  The return type changes from void to int so the
+ * caller can detect truncation via the `?` operator.
+ *
+ * The LLVM IR declaration must be updated to match:
+ *   Before:  declare void @ty_sprintf(i8* %task, %struct.Buf* %out, i8* %fmt, ...)
+ *   After:   declare i32  @ty_sprintf(i8* %task, %struct.Buf* %out, i8* %fmt, ...)
+ *
+ * Callers that currently ignore the return value are unaffected (C allows
+ * discarding int returns).  Typhoon callers can propagate with `?`.
+ *
+ * NOTE: ty_sprintln has no format string, so overflow cannot occur there
+ * (it just appends "\n").  It is left as void.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
+int ty_sprintf(SlabArena* arena, Buf* out, char* fmt, ...) {
+    if (!out) return -1;
     StackBuf tmp;
     sbuf_init(&tmp);
     va_list ap;
     va_start(ap, fmt);
     ty_vformat(&tmp, fmt, ap);
     va_end(ap);
+    if (tmp.overflow) return -1;  /* signal truncation — do NOT push partial data */
     ty_buf_push_str(arena, out, tmp.data);
+    return (int)tmp.len;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1025,25 +1050,64 @@ static int sc_read_token_len(StrCursor* sc, const char** out_start) {
  * For simplicity we return the token as a null-terminated slice by mutating
  * the source string in-place (caller must own the string).
  */
+/* ════════════════════════════════════════════════════════════════════════════
+ * TASK 0.2 — ty_sscan
+ *
+ * Before (buggy):
+ *   - parameter was `const char* src` but comment said "caller must own
+ *     the string" implying mutation
+ *   - silent malloc fallback when task==NULL masked arena threading bugs
+ *   - slab_alloc size class chosen with `size_to_class(len+1)` which is
+ *     correct, but the malloc fallback bypassed it entirely
+ *
+ * After:
+ *   - src is `const char*` throughout — no mutation, safe on .rodata
+ *   - task==NULL is a hard abort (not a malloc fallback): callers must
+ *     thread the arena correctly; a silent malloc hides that they don't
+ *   - function signature matches the LLVM IR declaration exactly:
+ *       declare i8* @ty_sscan(i8* %task, i8* %src, i8** %rest_out)
+ * ════════════════════════════════════════════════════════════════════════════ */
+
 char* ty_sscan(void* task, const char* src, const char** rest_out) {
     if (!src) {
         if (rest_out) *rest_out = NULL;
         return NULL;
     }
-    /* skip leading whitespace */
+
+    /* task must be valid — no silent malloc fallback (see Task 0.2 rationale) */
+    if (!task) {
+        /* Callers outside a coroutine should not reach sscan.
+         * Trap in debug; return NULL in release to avoid crashing the process. */
+#ifndef NDEBUG
+        TY_TRAP();
+#endif
+        if (rest_out) *rest_out = src;
+        return NULL;
+    }
+
+    /* skip leading whitespace — never writes to src */
     while (*src == ' ' || *src == '\t' || *src == '\n' || *src == '\r')
         src++;
+
     if (!*src) {
         if (rest_out) *rest_out = src;
         return NULL;
     }
+
     const char* start = src;
     while (*src && *src != ' ' && *src != '\t' && *src != '\n' && *src != '\r')
         src++;
 
     size_t len = (size_t)(src - start);
+
+    /* slab-allocate — lives until slab_arena_free, never touches source */
     int32_t cls = size_to_class(len + 1);
-    char* tok = task ? (char*)slab_alloc(task, cls) : (char*)malloc(len + 1);
+    char* tok = (char*)slab_alloc((SlabArena*)task, cls);
+    if (!tok) {
+        /* Arena OOM — treated as EOF-like: return NULL, advance rest_out */
+        if (rest_out) *rest_out = src;
+        return NULL;
+    }
     memcpy(tok, start, len);
     tok[len] = '\0';
 
@@ -1205,7 +1269,7 @@ declare i32     @ty_fprintln (i8* %task, i32 %fd, i8* %s)
 declare i32     @ty_fprintf  (i8* %task, i32 %fd, i8* %fmt, ...)
 declare void    @ty_sprint   (i8* %task, %struct.Buf* %out, i8* %s)
 declare void    @ty_sprintln (i8* %task, %struct.Buf* %out, i8* %s)
-declare void    @ty_sprintf  (i8* %task, %struct.Buf* %out, i8* %fmt, ...)
+declare i32     @ty_sprintf  (i8* %task, %struct.Buf* %out, i8* %fmt, ...)
 declare i8*     @ty_scan     (i8* %task)
 declare i32     @ty_scanf    (i8* %task, i8* %fmt, ...)
 declare i8*     @ty_fscan    (i8* %task, i32 %fd)

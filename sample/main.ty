@@ -1,17 +1,17 @@
 namespace main
 
-//use std::net::Network;
-//use std::net::Socket;
-//use std::net::Listener;
-//use std::option::Some;
-//use std::result::Ok;
+use std::net::Network;
+use std::net::Socket;
+use std::net::Listener;
+use std::option::Some;
+use std::result::Ok;
 
 struct Popcount {
   ar: [Int32],
 }
 
 impl Popcount {
-  fn check(self, even: Int8) -> Int32 {
+  fn check(self, even: Int32) -> Int32 {
     let ch: ref chan<Int32> = chan<Int32>();
     let mut sent = 0;
     for x in self.ar {
@@ -59,9 +59,8 @@ fn main(net: Network) -> Int32 {
   };
   println("Listening on :8080");
 
-  let mut loop = true;
-  while loop {
-    let Ok(socket) = listener.accept() else { loop = false; };
+  while true {
+    let Ok(socket) = listener.accept() else { break; };
     conc { handle_connection(socket); }
   }
   return 0;

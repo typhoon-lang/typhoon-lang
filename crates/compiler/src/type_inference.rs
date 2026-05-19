@@ -652,7 +652,7 @@ impl TypeChecker {
         }
     }
 
-    fn literal_type(&mut self, lit: &Literal, span: Span) -> Result<InferType, TypeError> {
+    fn literal_type(&mut self, lit: &Literal, _span: Span) -> Result<InferType, TypeError> {
         match &lit.kind {
             LiteralKind::Int(_, suffix) => Ok(match suffix.as_deref() {
                 Some("i8") => InferType::Con("Int8".into()),
@@ -867,16 +867,6 @@ impl TypeChecker {
                 InferType::FixedArray(Box::new(Self::substitute_ty(elem, mapping)), *n)
             }
         }
-    }
-
-    fn unwrap_enum_payload(&self, pattern: &Pattern, ty: &InferType) -> InferType {
-        let applied = self.solver.apply(ty);
-        if let PatternKind::EnumVariant { variant_name, .. } = &pattern.node {
-            if let Some(payload) = self.enum_variant_payload(&applied, &variant_name.name) {
-                return payload;
-            }
-        }
-        applied
     }
 
     fn check_statement(
@@ -1316,17 +1306,27 @@ impl TypeChecker {
         arg_tys: Vec<InferType>,
         span: Span,
     ) -> Result<InferType, TypeError> {
-        let method_name = format!("__ty_method__{}__{}", type_name, method);
-        let scheme =
-            self.lookup(&method_name)
-                .cloned()
-                .ok_or_else(|| TypeError::UnknownIdentifier {
-                    name: method_name.clone(),
-                    span: Some(span),
-                })?;
+        let rt_name = format!("__ty_rt__{}__{}", type_name, method);
+        let local_name = format!("__ty_method__{}__{}", type_name, method);
+        let scheme = if let Some(s) = self.lookup(&local_name).cloned() {
+            s
+        } else if let Some(s) = self.lookup(&rt_name).cloned() {
+            s
+        } else {
+            return Err(TypeError::UnknownIdentifier {
+                name: local_name,
+                span: Some(span),
+            });
+        };
         let callee = self.instantiate(&scheme);
-        let mut full_args = vec![base_ty];
-        full_args.extend(arg_tys);
+        let full_args = match self.solver.apply(&callee) {
+            InferType::Fn(params, _) if params.len() == arg_tys.len() => arg_tys,
+            _ => {
+                let mut args = vec![base_ty];
+                args.extend(arg_tys);
+                args
+            }
+        };
         let ret = self.solver.fresh_var();
         self.solver.unify(
             &callee,

@@ -830,12 +830,6 @@ impl LiveAnalyzer {
         self.structured_drops.insert(block_id, drops);
     }
 
-    fn analyze_pattern(&mut self, _pattern: &Pattern) -> Result<(), String> {
-        // Patterns in for-loop bindings introduce new variables into scope;
-        // for now we accept all patterns without tracking their introduced names.
-        Ok(())
-    }
-
     fn run_branch_match_arm(
         &self,
         arm: &MatchArm,

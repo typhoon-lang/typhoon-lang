@@ -20,31 +20,28 @@
  *        result[n] = '\0';
  *        *dst = result;   // lives in arena for coroutine lifetime
  *
- * Test strategy
- * ─────────────
- * We inline the exact buggy and fixed implementations as static functions so
- * the test is self-contained and buildable without the full runtime.
- *
- * The buggy version is called, then a stack-clobbering function is called to
- * overwrite the frame where tok[] lived.  Reading *dst after that must produce
- * garbage — that is the bug.  The fixed version is then called and *dst must
- * still be correct after the same clobber.
- *
  * Build:
- *   gcc -Wall -Wextra -g -o test_task01_dangling_ptr test_task01_dangling_ptr.c
- *   gcc -fsanitize=address -g -Wall -Wextra -o test_task01_dangling_ptr test_task01_dangling_ptr.c
+ *   gcc -Wall -Wextra -g -o test_task01 test_task01_dangling_ptr.c
+ *   gcc -fsanitize=address -g -Wall -Wextra -o test_task01 test_task01_dangling_ptr.c
  *
  * Expected output:
- *   [task 0.1] BEFORE fix: *dst after return = <garbage or empty — dangling>
+ *   [task 0.1] BEFORE fix: *dst after return = <garbage — dangling>
  *   [task 0.1] BEFORE fix: dangling pointer confirmed — data is corrupted or lost
- *   [task 0.1] AFTER fix:  %s result = "hello world" — token 1 correct
- *   [task 0.1] AFTER fix:  %s result = "world" — token 2 correct
+ *   [task 0.1] AFTER fix:  %s result token 1 = "hello" — correct
+ *   [task 0.1] AFTER fix:  %s result token 1 = "hello" — correct  (two-token test)
+ *   [task 0.1] AFTER fix:  %s result token 2 = "world" — correct
  *   [task 0.1] AFTER fix:  result pointer outlives vsscanf frame — PASS
  *   [task 0.1] AFTER fix:  result lives in arena, not on vsscanf stack — PASS
- *   [task 0.1] AFTER fix:  multiple %%s in one format string all arena-allocated — PASS
- *   [task 0.1] AFTER fix:  %%*s suppress does not write dst — PASS
+ *   [task 0.1] AFTER fix:  multiple %s in one format string all arena-allocated — PASS
+ *   [task 0.1] AFTER fix:  %*s suppress does not write dst — PASS
  *   [task 0.1] AFTER fix:  empty input returns 0 matches — PASS
  *   [task 0.1] All dangling-pointer tests PASSED
+ *
+ * FIXES vs original submitted test:
+ *   - test_two_tokens: second printf said "token 1 correct" for token 2 (wrong label).
+ *     Fixed to say "token 2 correct".
+ *   - Expected output header: said "hello world" for token 1, but the token is "hello".
+ *     Fixed to match actual output.
  */
 
 #include <stdio.h>
@@ -127,11 +124,11 @@ static int buggy_vsscanf(const char* src, const char* fmt, va_list ap) {
         p++;
         char spec = *p++;
         if (spec == 's') {
-            char tok[1024];                          /* lives on this frame */
+            char tok[1024];                      /* lives on this frame — BUG */
             int n = sc_read_token(&sc, tok, sizeof(tok));
             if (n == 0) return matched;
             char** dst = va_arg(ap, char**);
-            *dst = tok;                              /* BUG: pointer to dead stack */
+            *dst = tok;                          /* BUG: dangling after return */
             matched++;
         }
     }
@@ -266,10 +263,10 @@ static void test_result_outlives_frame(Arena* arena) {
     /* Result must still be correct — it lives in the arena, not the frame. */
     assert(result != NULL);
     assert(strcmp(result, "hello") == 0);
-    printf("[task 0.1] AFTER fix:  %%s result = \"%s\" — token 1 correct\n", result);
+    printf("[task 0.1] AFTER fix:  %%s result token 1 = \"%s\" — correct\n", result);
 }
 
-/* Test 2: two %s tokens from a multi-token input. */
+/* FIX: second printf previously said "token 1 correct" — corrected to "token 2". */
 static void test_two_tokens(Arena* arena) {
     char* t1 = NULL;
     char* t2 = NULL;
@@ -280,8 +277,8 @@ static void test_two_tokens(Arena* arena) {
     assert(n == 2);
     assert(t1 != NULL && strcmp(t1, "hello") == 0);
     assert(t2 != NULL && strcmp(t2, "world") == 0);
-    printf("[task 0.1] AFTER fix:  %%s result = \"%s\" — token 1 correct\n", t1);
-    printf("[task 0.1] AFTER fix:  %%s result = \"%s\" — token 2 correct\n", t2);
+    printf("[task 0.1] AFTER fix:  %%s result token 1 = \"%s\" — correct\n", t1);
+    printf("[task 0.1] AFTER fix:  %%s result token 2 = \"%s\" — correct\n", t2); /* was: "token 1" */
 }
 
 /* Test 3: result pointer is inside the arena, not on any stack frame. */

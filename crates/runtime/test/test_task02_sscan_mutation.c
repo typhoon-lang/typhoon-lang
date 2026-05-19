@@ -3,53 +3,23 @@
  *
  * Bug: ty_sscan wrote '\0' into the source string to null-terminate a token.
  *      When the source lives in .rodata (string literal), that write is UB:
- *      SIGBUS on some platforms, silent corruption on others.  It also
- *      permanently destroys the rest of the source string for any subsequent
- *      caller.
+ *      SIGBUS on some platforms, silent corruption on others.
  *
- *      Before fix:
- *        if (*src) {
- *            *src = '\0';   // UB: src may point into .rodata
- *            src++;
- *        }
- *
- *      After fix:
- *        size_t len = (size_t)(src - start);
- *        char* tok = slab_alloc(task, len + 1);
- *        memcpy(tok, start, len);
- *        tok[len] = '\0';   // writes only into the arena copy
- *
- * Test strategy
- * ─────────────
- * Both the buggy and fixed implementations are inlined as static functions.
- *
- * Bug demonstration (test 0):
- *   The buggy sscan is called on a heap-duplicated string so we can legally
- *   observe the write, then confirm the source was mutated — proving the bug.
- *   The real crash (SIGBUS) happens on .rodata; we document that as a
- *   signal-handler test under POSIX builds.
- *
- * Fix verification (tests 1-6):
- *   The fixed sscan is called on string literals and heap strings; we verify
- *   the token is correct, the source is not mutated, rest_out is accurate,
- *   multi-token iteration works, and leading/trailing whitespace is handled.
+ * FIXES vs original submitted test:
+ *   - test_rest_out: the range check `rest >= src && rest <= src + strlen(src)`
+ *     is too loose — it passes even if rest_out is off by one. Replaced with
+ *     an exact position check: rest must equal src+5 (past "alpha"), and
+ *     separately rest must not point at the space character (fixed_sscan
+ *     leaves rest at the first non-consumed character, which is the space
+ *     ' ' before "beta"). The key invariant is that `fixed_sscan(rest, &r)`
+ *     yields "beta" — which the original test did verify, but the intermediate
+ *     position was not pinned. Both the exact-offset check and the functional
+ *     check are now present.
  *
  * Build:
- *   gcc -Wall -Wextra -g -o test_task02_sscan_mutation test_task02_sscan_mutation.c
+ *   gcc -Wall -Wextra -g -o test_task02 test_task02_sscan_mutation.c
  *   gcc -fsanitize=address,undefined -g -Wall -Wextra \
- *       -o test_task02_sscan_mutation test_task02_sscan_mutation.c
- *
- * Expected output:
- *   [task 0.2] BEFORE fix: source was mutated — '\0' written at offset 5
- *   [task 0.2] BEFORE fix: in-place mutation confirmed (UB on .rodata) — PASS
- *   [task 0.2] AFTER fix:  token = "hello", source unchanged — PASS
- *   [task 0.2] AFTER fix:  token lives in arena, source untouched — PASS
- *   [task 0.2] AFTER fix:  rest_out points past token in original string — PASS
- *   [task 0.2] AFTER fix:  multi-token iteration via rest_out — PASS
- *   [task 0.2] AFTER fix:  leading whitespace skipped, source intact — PASS
- *   [task 0.2] AFTER fix:  NULL source returns NULL token — PASS
- *   [task 0.2] AFTER fix:  whitespace-only source returns NULL token — PASS
- *   [task 0.2] All sscan-mutation tests PASSED
+ *       -o test_task02 test_task02_sscan_mutation.c
  */
 
 #include <stdio.h>
@@ -102,7 +72,7 @@ static char* buggy_sscan(char* src, char** rest_out) {
     while (*src && *src != ' ' && *src != '\t' && *src != '\n' && *src != '\r') src++;
     /* BUG: write '\0' directly into the source string */
     if (*src) {
-        *src = '\0';   /* UB when src is .rodata */
+        *src = '\0';   /* BUG: UB on .rodata */
         src++;
     }
     if (rest_out) *rest_out = src;
@@ -148,16 +118,11 @@ static void demo_before_fix(void) {
      * After the call, mutable_src[5] should now be '\0' — the bug wrote into
      * the source.  "hello\0world" — the space became a null terminator in-place.
      */
-    int mutation_byte_offset = 5; /* position of the space in "hello world" */
-    int was_mutated = (mutable_src[mutation_byte_offset] == '\0');
-
-    printf("[task 0.2] BEFORE fix: source was mutated — '\\0' written at offset %d\n",
-           mutation_byte_offset);
+    int was_mutated = (mutable_src[5] == '\0');
+    printf("[task 0.2] BEFORE fix: source was mutated — '\\0' written at offset 5\n");
     printf("[task 0.2] BEFORE fix: tok=\"%s\", mutable_src[5]=0x%02x (expected 0x00)\n",
-           tok ? tok : "(null)", (unsigned char)mutable_src[mutation_byte_offset]);
-
-    assert(was_mutated &&
-           "[task 0.2] FAIL: expected buggy_sscan to mutate the source, but it did not");
+           tok ? tok : "(null)", (unsigned char)mutable_src[5]);
+    assert(was_mutated && "[task 0.2] FAIL: expected mutation at offset 5");
     printf("[task 0.2] BEFORE fix: in-place mutation confirmed (UB on .rodata) — PASS\n");
 
     free(mutable_src);
@@ -198,12 +163,14 @@ static void test_token_in_arena(Arena* arena) {
     /* tok must be in the arena, not an alias into src. */
     assert((char*)tok >= arena->mem && (char*)tok < arena->mem + ARENA_SIZE &&
            "[task 0.2] FAIL: token is not in the arena");
-    assert(tok != src && "[task 0.2] FAIL: token is an alias into source (not a copy)");
+    assert(tok != src && "[task 0.2] FAIL: token is an alias into source");
     printf("[task 0.2] AFTER fix:  token lives in arena, source untouched — PASS\n");
 }
 
 /*
- * Test 3: rest_out points to the correct position in the ORIGINAL source.
+ * FIX: original used a loose range check (rest >= src && rest <= src+len).
+ * Now we pin the exact offset AND verify the next token can be read from rest.
+ * "alpha" is 5 bytes; rest must point to src+5 (the space before "beta").
  */
 static void test_rest_out(Arena* arena) {
     const char* src = "alpha beta";
@@ -213,12 +180,24 @@ static void test_rest_out(Arena* arena) {
     assert(tok != NULL && strcmp(tok, "alpha") == 0);
     /* rest should point to the space before "beta", i.e. src + 5. */
     assert(rest != NULL);
-    assert(rest >= src && rest <= src + strlen(src));
-    /* The remaining source starting from rest should give us "beta". */
+
+    /* Exact position: rest must point to the character immediately after
+     * "alpha", which is the space at src[5]. */
+    assert(rest == src + 5 &&
+           "[task 0.2] FAIL: rest_out is not at src+5 (exact position check)");
+    assert(*rest == ' ' &&
+           "[task 0.2] FAIL: rest_out does not point to the space separator");
+
+    /* Functional check: consuming rest must yield "beta". */
     const char* rest2 = NULL;
     char* tok2 = fixed_sscan(arena, rest, &rest2);
-    assert(tok2 != NULL && strcmp(tok2, "beta") == 0);
-    printf("[task 0.2] AFTER fix:  rest_out points past token in original string — PASS\n");
+    assert(tok2 != NULL && strcmp(tok2, "beta") == 0 &&
+           "[task 0.2] FAIL: second token from rest_out is not 'beta'");
+    /* rest2 must point to the null terminator — nothing left. */
+    assert(rest2 != NULL && *rest2 == '\0' &&
+           "[task 0.2] FAIL: rest2 should point to null terminator after last token");
+
+    printf("[task 0.2] AFTER fix:  rest_out exact position and functional check — PASS\n");
 }
 
 /*
@@ -243,7 +222,7 @@ static void test_multi_token_iteration(Arena* arena) {
     assert(i == 4 && "[task 0.2] FAIL: wrong token count");
     /* The original source must still be intact. */
     assert(strcmp(src, "one two three four") == 0 &&
-           "[task 0.2] FAIL: source was mutated during multi-token iteration");
+           "[task 0.2] FAIL: source mutated during iteration");
     printf("[task 0.2] AFTER fix:  multi-token iteration via rest_out — PASS\n");
 }
 
@@ -283,8 +262,6 @@ static void test_whitespace_only(Arena* arena) {
     assert(tok == NULL);
     printf("[task 0.2] AFTER fix:  whitespace-only source returns NULL token — PASS\n");
 }
-
-/* ── main ──────────────────────────────────────────────────────────────── */
 
 int main(void) {
     demo_before_fix();

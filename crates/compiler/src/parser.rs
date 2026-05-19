@@ -155,13 +155,23 @@ impl Parser {
                         if self.peek_token().token_type == TokenType::Spread {
                             let tok = self.advance_token();
                             let span = tok.span;
-                            let p_name = Identifier { name: "...".to_string(), span };
+                            let p_name = Identifier {
+                                name: "...".to_string(),
+                                span,
+                            };
                             let p_type = Spanned::new(
-                                TypeKind { name: "...".to_string(), generic_args: Vec::new() },
+                                TypeKind {
+                                    name: "...".to_string(),
+                                    generic_args: Vec::new(),
+                                },
                                 span,
                                 self.alloc_id(),
                             );
-                            params.push(Parameter { name: p_name, type_annotation: p_type, span });
+                            params.push(Parameter {
+                                name: p_name,
+                                type_annotation: p_type,
+                                span,
+                            });
                             // accept optional trailing comma then break
                             if !self.match_token(TokenType::Comma) {
                                 break;
@@ -1104,7 +1114,7 @@ impl Parser {
             }));
         }
 
-        let mut name = self.identifier_with_span()?.name;
+        let name = self.identifier_with_span()?.name;
         let mut generic_args = Vec::new();
         if self.match_token(TokenType::LessThan) {
             loop {

@@ -1,3 +1,4 @@
+use crate::ast::NodeId;
 use crate::ast::*;
 use crate::desugar::Desugar;
 use crate::lexer::Lexer;
@@ -9,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 struct NamespaceUnit {
-    name: String,
     declarations: Vec<Declaration>,
     uses: Vec<UsePath>,
 }
@@ -58,6 +58,676 @@ fn mangle(ns: &str, name: &str) -> String {
     format!("{}__{}", ns, name)
 }
 
+// ── LLVM IR Namespace Import ─────────────────────────────────────────────────
+
+/// Parses LLVM IR directly into a NamespaceUnit for stdlib integration.
+/// Replaces the round-trip: .ll → .ty source → parse_module()
+fn parse_llvm_to_namespace_unit(
+    ll_source: &str,
+) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
+    let mut units: HashMap<String, NamespaceUnit> = HashMap::new();
+
+    // Track method signatures by receiver type for impl block generation
+    let mut method_sigs: std::collections::HashMap<String, Vec<FunctionSignatureKind>> =
+        std::collections::HashMap::new();
+    // Track pending @ty_sig: annotation
+    let mut pending_ty_sig: Option<String> = None;
+    let mut pending_ty_ns: Option<String> = None;
+
+    let mut push_decl = |ns: &str, decl: Declaration| {
+        let entry = units
+            .entry(ns.to_string())
+            .or_insert_with(|| NamespaceUnit {
+                declarations: vec![],
+                uses: vec![],
+            });
+        entry.declarations.push(decl);
+    };
+
+    for line in ll_source.lines() {
+        let line = line.trim();
+
+        if line.is_empty() {
+            pending_ty_sig = None;
+            pending_ty_ns = None;
+            continue;
+        }
+
+        if let Some(ns) = line.strip_prefix("; @ty_ns:") {
+            pending_ty_ns = Some(ns.trim().to_string());
+            continue;
+        }
+
+        // ; @ty_sig: fn consume(self, ch: ref chan<Int8>)
+        if let Some(sig) = line.strip_prefix("; @ty_sig:") {
+            pending_ty_sig = Some(sig.trim().to_string());
+            continue;
+        }
+        if line.starts_with(';') {
+            continue;
+        }
+
+        // %struct.Foo = type { ... } or %struct.Foo = type opaque
+        if let Some(rest) = line.strip_prefix("%struct.") {
+            if let Some(name) = rest.split('=').next().map(|s| s.trim()) {
+                // Strip pointer suffix for type name
+                let name = name.trim_end_matches('*');
+                if !name.is_empty() {
+                    let ty_name = if name == "TyArray" { "Array" } else { name };
+                    let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
+                    push_decl(&ns, make_struct_decl(ty_name, &ns));
+                }
+            }
+            pending_ty_ns = None;
+            continue;
+        }
+
+        // %enum.Option<T> = type { Some(T), None } or %enum.Result<T, E> = type { Ok(T), Err(E) }
+        if let Some(rest) = line.strip_prefix("%enum.") {
+            if let Some(lhs) = rest.split('=').next().map(|s| s.trim()) {
+                if let Some(body) = rest.split('{').nth(1).and_then(|s| s.split('}').next()) {
+                    let (enum_name, generics) = if let Some(i) = lhs.find('<') {
+                        (&lhs[..i], Some(&lhs[i..]))
+                    } else {
+                        (lhs, None)
+                    };
+                    let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
+                    push_decl(&ns, make_enum_decl(enum_name, generics, body));
+                }
+            }
+            pending_ty_ns = None;
+            continue;
+        }
+
+        // declare or define
+        let method_rest = if let Some(r) = line.strip_prefix("declare ") {
+            Some(("declare", r))
+        } else if let Some(r) = line.strip_prefix("define ") {
+            Some(("define", r))
+        } else {
+            None
+        };
+
+        if let Some((kind, rest)) = method_rest {
+            // Skip type definitions (already handled above)
+            if rest.contains("= type") || rest.contains("= type opaque") {
+                continue;
+            }
+
+            if let Some((_, after_at)) = rest.split_once('@') {
+                let name = after_at
+                    .split('(')
+                    .next()
+                    .map(str::trim)
+                    .unwrap_or(after_at);
+
+                // Method binding: @__ty_method__Type__method
+                if name.starts_with("__ty_method__") {
+                    let name = &name["__ty_method__".len()..]; // strip "__ty_method__"
+                    if let Some((type_name, method_name)) = name.split_once("__") {
+                        let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
+                        // __ty_method__ signatures must come from explicit @ty_sig metadata.
+                        let explicit_sig = pending_ty_sig.take().ok_or_else(|| {
+                            vec![format!(
+                                "Missing @ty_sig annotation for method {}::{} ({})",
+                                type_name, method_name, rest
+                            )]
+                        })?;
+                        let mut sig = parse_ty_signature(&explicit_sig).ok_or_else(|| {
+                            vec![format!(
+                                "Invalid @ty_sig annotation for method {}::{}: {}",
+                                type_name, method_name, explicit_sig
+                            )]
+                        })?;
+                        let parsed_name = sig.name.name.clone();
+                        if !parsed_name.is_empty() && parsed_name != method_name {
+                            return Err(vec![format!(
+                                "@ty_sig method name mismatch for {}::{} (got '{}')",
+                                type_name, method_name, parsed_name
+                            )]);
+                        }
+                        sig.name.name = method_name.to_string();
+                        method_sigs
+                            .entry(format!("{}::{}", ns, type_name))
+                            .or_default()
+                            .push(sig);
+                    }
+                } else {
+                    // Free function - only emit from 'declare', not 'define'
+                    if kind == "declare" {
+                        let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
+                        if let Some(sig) = parse_ll_declare_signature(rest) {
+                            push_decl(&ns, make_extern_fn_decl(name.to_string(), sig, &ns));
+                        }
+                    }
+                }
+            }
+            pending_ty_sig = None;
+            pending_ty_ns = None;
+        }
+    }
+
+    // Generate impl blocks for methods grouped by type
+    for (qualified_type, methods) in &method_sigs {
+        let Some((ns, type_name)) = qualified_type.rsplit_once("::") else {
+            continue;
+        };
+        let impl_methods: Vec<Declaration> = methods
+            .iter()
+            .map(|sig| Declaration {
+                node: DeclarationKind::Function {
+                    name: sig.name.clone(),
+                    generics: sig.generics.clone(),
+                    params: sig.params.clone(),
+                    return_type: sig.return_type.clone(),
+                    body: Block {
+                        statements: vec![],
+                        trailing_expression: None,
+                        span: Span::default(),
+                        block_id: NodeId(0),
+                    },
+                },
+                span: Span::default(),
+                id: NodeId(0),
+            })
+            .collect();
+
+        push_decl(
+            ns,
+            Declaration {
+                node: DeclarationKind::Impl {
+                    trait_name: TypeKind {
+                        name: type_name.to_string(),
+                        generic_args: vec![],
+                    }
+                    .to_spanned(),
+                    type_name: TypeKind {
+                        name: type_name.to_string(),
+                        generic_args: vec![],
+                    }
+                    .to_spanned(),
+                    generics: vec![],
+                    methods: impl_methods,
+                },
+                span: Span::default(),
+                id: NodeId(0),
+            },
+        );
+    }
+
+    Ok(units)
+}
+
+fn make_struct_decl(name: &str, ns: &str) -> Declaration {
+    Declaration {
+        node: DeclarationKind::Struct {
+            name: Identifier {
+                name: name.to_string(),
+                span: Span::default(),
+            },
+            generics: vec![],
+            fields: vec![],
+        },
+        span: Span::default(),
+        id: NodeId(0),
+    }
+}
+
+fn make_enum_decl(name: &str, generics: Option<&str>, body: &str) -> Declaration {
+    let variants: Vec<EnumVariant> = body
+        .split(',')
+        .map(|v| {
+            let v = v.trim();
+            if v.is_empty() {
+                return EnumVariant::new_dummy(
+                    EnumVariantKind {
+                        name: Identifier {
+                            name: String::new(),
+                            span: Span::default(),
+                        },
+                        payload: None,
+                    },
+                    Span::default(),
+                );
+            }
+
+            // Parse "Name" or "Name(Type)" or "Name(Type1, Type2)"
+            let (vname, payload) = if let Some(idx) = v.find('(') {
+                let name = v[..idx].trim();
+                let inner = &v[idx + 1..v.len() - 1].trim();
+                if inner.is_empty() {
+                    (name, None)
+                } else if inner.contains(',') {
+                    let types: Vec<Type> = inner
+                        .split(',')
+                        .map(|t| {
+                            TypeKind {
+                                name: ll_type_to_ty(t.trim()).to_string(),
+                                generic_args: vec![],
+                            }
+                            .to_spanned()
+                        })
+                        .collect();
+                    (
+                        name,
+                        Some(EnumVariantPayloadKind::Tuple(types).to_spanned()),
+                    )
+                } else {
+                    // Single type
+                    let ty = ll_type_to_ty(inner);
+                    if ty == "Str" {
+                        (
+                            name,
+                            Some(
+                                EnumVariantPayloadKind::Unit(
+                                    TypeKind {
+                                        name: "Int8".to_string(),
+                                        generic_args: vec![],
+                                    }
+                                    .to_spanned(),
+                                )
+                                .to_spanned(),
+                            ),
+                        )
+                    } else {
+                        (
+                            name,
+                            Some(
+                                EnumVariantPayloadKind::Unit(
+                                    TypeKind {
+                                        name: ty.to_string(),
+                                        generic_args: vec![],
+                                    }
+                                    .to_spanned(),
+                                )
+                                .to_spanned(),
+                            ),
+                        )
+                    }
+                }
+            } else {
+                (v, None)
+            };
+
+            EnumVariant::new_dummy(
+                EnumVariantKind {
+                    name: Identifier {
+                        name: vname.to_string(),
+                        span: Span::default(),
+                    },
+                    payload,
+                },
+                Span::default(),
+            )
+        })
+        .collect();
+
+    let generics: Vec<GenericParam> = generics
+        .map(|g| {
+            g.trim_matches(|c| c == '<' || c == '>')
+                .split(',')
+                .map(|name| {
+                    GenericParam::new_dummy(
+                        GenericParamKind {
+                            name: Identifier {
+                                name: name.trim().to_string(),
+                                span: Span::default(),
+                            },
+                            bounds: vec![],
+                        },
+                        Span::default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Declaration {
+        node: DeclarationKind::Enum {
+            name: Identifier {
+                name: name.to_string(),
+                span: Span::default(),
+            },
+            generics,
+            variants,
+        },
+        span: Span::default(),
+        id: NodeId(0),
+    }
+}
+
+fn make_extern_fn_decl(name: String, sig: (Vec<Parameter>, Option<Type>), ns: &str) -> Declaration {
+    Declaration {
+        node: DeclarationKind::UnsafeOrExtern(
+            UnsafeOrExternKind::Extern {
+                abi: "C".to_string(),
+                declarations: vec![Spanned::new_dummy(
+                    FunctionSignatureKind {
+                        name: Identifier {
+                            name,
+                            span: Span::default(),
+                        },
+                        generics: vec![],
+                        params: sig.0,
+                        return_type: sig.1,
+                    },
+                    Span::default(),
+                )],
+            }
+            .to_spanned(),
+        ),
+        span: Span::default(),
+        id: NodeId(0),
+    }
+}
+
+fn parse_ll_method_signature(
+    rest: &str,
+    type_name: &str,
+    method_name: &str,
+) -> Option<FunctionSignatureKind> {
+    // rest = "i8* @__ty_rt__Socket__consume(self: %struct.Socket*, i8* %chan)"
+    let (ret_ll, _after_at) = rest.split_once('@')?;
+    let ret_ty = parse_ll_type_node(ret_ll.trim());
+    let ret = if ret_ty == "Unit" {
+        None
+    } else {
+        Some(
+            TypeKind {
+                name: ret_ty,
+                generic_args: vec![],
+            }
+            .to_spanned(),
+        )
+    };
+
+    let args_part = rest.split('(').nth(1)?.trim_end_matches(')').trim();
+
+    if args_part.is_empty() {
+        return Some(FunctionSignatureKind {
+            name: Identifier {
+                name: method_name.to_string(),
+                span: Span::default(),
+            },
+            generics: vec![],
+            params: vec![],
+            return_type: ret,
+        });
+    }
+
+    let mut params = Vec::new();
+    let mut param_idx = 0usize;
+
+    for arg in args_part.split(',') {
+        let arg = arg.trim();
+        if arg == "..." || arg.is_empty() {
+            continue;
+        }
+
+        // Extract type (e.g., "i8* %task" or "%struct.Network*")
+        let ll_ty = arg.split_whitespace().next()?;
+
+        // Skip self pointer (it's implicit in the impl context)
+        let normalized_ty = ll_ty.trim_end_matches('*');
+        let is_self_ptr = normalized_ty == "%struct.Socket"
+            || normalized_ty == "%struct.Listener"
+            || normalized_ty == "%struct.Network"
+            || normalized_ty == format!("%struct.{}", type_name);
+
+        if is_self_ptr {
+            continue;
+        }
+
+        param_idx += 1;
+        let ty = parse_ll_type_node(ll_ty);
+        params.push(Parameter {
+            name: Identifier {
+                name: format!("arg{}", param_idx),
+                span: Span::default(),
+            },
+            type_annotation: TypeKind {
+                name: ty,
+                generic_args: vec![],
+            }
+            .to_spanned(),
+            span: Span::default(),
+        });
+    }
+
+    Some(FunctionSignatureKind {
+        name: Identifier {
+            name: method_name.to_string(),
+            span: Span::default(),
+        },
+        generics: vec![],
+        params,
+        return_type: ret,
+    })
+}
+
+fn parse_ll_declare_signature(rest: &str) -> Option<(Vec<Parameter>, Option<Type>)> {
+    let parts: Vec<&str> = rest.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let ret_ll = parts[0].trim();
+
+    let args_part = parts[1].split('(').nth(1)?.trim_end_matches(')').trim();
+
+    let ret = {
+        let ty = parse_ll_type_node(ret_ll);
+        if ty == "Unit" {
+            None
+        } else {
+            Some(
+                TypeKind {
+                    name: ty,
+                    generic_args: vec![],
+                }
+                .to_spanned(),
+            )
+        }
+    };
+
+    let mut params = Vec::new();
+    let mut param_idx = 0usize;
+    let mut variadic = false;
+
+    if !args_part.is_empty() {
+        for arg in args_part.split(',') {
+            let arg = arg.trim();
+            if arg == "..." {
+                variadic = true;
+                continue;
+            }
+            if arg.is_empty() {
+                continue;
+            }
+
+            // "i8* %task" or "%struct.Buf* %out" or just "i8*"
+            let ll_ty = arg.split_whitespace().next()?;
+            let ty = parse_ll_type_node(ll_ty);
+            param_idx += 1;
+            params.push(Parameter {
+                name: Identifier {
+                    name: format!("arg{}", param_idx),
+                    span: Span::default(),
+                },
+                type_annotation: TypeKind {
+                    name: ty,
+                    generic_args: vec![],
+                }
+                .to_spanned(),
+                span: Span::default(),
+            });
+        }
+    }
+
+    if variadic {
+        params.push(Parameter {
+            name: Identifier {
+                name: "...".to_string(),
+                span: Span::default(),
+            },
+            type_annotation: TypeKind {
+                name: "...".to_string(),
+                generic_args: vec![],
+            }
+            .to_spanned(),
+            span: Span::default(),
+        });
+    }
+
+    Some((params, ret))
+}
+
+fn parse_ty_signature(sig: &str) -> Option<FunctionSignatureKind> {
+    // Parse "fn method(self, arg: Type) -> Ret"
+    let body = sig.trim();
+    let body = body.strip_prefix("fn")?.trim();
+    let (_name, rest) = body.split_once('(')?;
+    let (params_part, tail) = rest.split_once(')')?;
+    let ret_part = if let Some(r) = tail.trim().strip_prefix("->") {
+        Some(r.trim())
+    } else {
+        None
+    };
+
+    let mut params = Vec::new();
+    let mut self_added = false;
+
+    for (i, param) in params_part.split(',').enumerate() {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+
+        if !self_added
+            && i == 0
+            && (param.starts_with("self")
+                || param.starts_with("self:")
+                || param.starts_with("self :"))
+        {
+            self_added = true;
+            continue;
+        }
+
+        // "arg: Type" or just "Type"
+        let (name, ty) = if let Some(idx) = param.rfind(':') {
+            let n = param[..idx].trim().to_string();
+            if n.is_empty() {
+                (format!("arg{}", i), param[idx + 1..].trim().to_string())
+            } else {
+                (n, param[idx + 1..].trim().to_string())
+            }
+        } else {
+            (format!("arg{}", i), param.to_string())
+        };
+
+        params.push(Parameter {
+            name: Identifier {
+                name,
+                span: Span::default(),
+            },
+            type_annotation: parse_ty_type(&ty),
+            span: Span::default(),
+        });
+    }
+
+    let ret = ret_part.and_then(|r| {
+        let r = r.trim();
+        if r.is_empty() {
+            None
+        } else {
+            Some(parse_ty_type(r))
+        }
+    });
+
+    Some(FunctionSignatureKind {
+        name: Identifier {
+            name: String::new(),
+            span: Span::default(),
+        }, // filled by caller
+        generics: vec![],
+        params,
+        return_type: ret,
+    })
+}
+
+fn parse_ty_type(ty: &str) -> Type {
+    let ty = ty.trim();
+    if let Some(inner) = ty.strip_prefix("ref ") {
+        return TypeKind {
+            name: "Ref".to_string(),
+            generic_args: vec![parse_ty_type(inner.trim())],
+        }
+        .to_spanned();
+    }
+    if let Some(i) = ty.find('<') {
+        let name = ty[..i].trim();
+        let args_str = &ty[i + 1..ty.len() - 1];
+        let args: Vec<Type> = args_str
+            .split(',')
+            .map(|a| parse_ty_type(a.trim()))
+            .collect();
+        TypeKind {
+            name: name.to_string(),
+            generic_args: args,
+        }
+        .to_spanned()
+    } else {
+        TypeKind {
+            name: ty.to_string(),
+            generic_args: vec![],
+        }
+        .to_spanned()
+    }
+}
+
+fn make_runtime_method_extern_from_sig(
+    type_name: &str,
+    method_name: &str,
+    sig: &FunctionSignatureKind,
+) -> Declaration {
+    let mut params = Vec::new();
+    params.push(Parameter {
+        name: Identifier {
+            name: "self".to_string(),
+            span: Span::default(),
+        },
+        type_annotation: TypeKind {
+            name: type_name.to_string(),
+            generic_args: vec![],
+        }
+        .to_spanned(),
+        span: Span::default(),
+    });
+    params.extend(sig.params.clone());
+    make_extern_fn_decl(
+        format!("__ty_rt__{}__{}", type_name, method_name),
+        (params, sig.return_type.clone()),
+        "std",
+    )
+}
+
+/// Parse LLVM type node (e.g., "i8*", "%struct.Network*", "i64") to Typhoon type string
+fn parse_ll_type_node(ll: &str) -> String {
+    let ll = ll.trim().trim_end_matches('*');
+    ll_type_to_ty(ll).to_string()
+}
+
+// Extension trait to make constructing Spanned types more ergonomic
+trait ToSpanned {
+    fn to_spanned(self) -> Spanned<Self>
+    where
+        Self: Sized,
+    {
+        Spanned::new_dummy(self, Span::default())
+    }
+}
+
+impl<T> ToSpanned for T {}
+
 fn extract_namespace_units(
     modules: Vec<Module>,
 ) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
@@ -73,8 +743,7 @@ fn extract_namespace_units(
             }
         };
 
-        let mut entry = units.entry(ns.clone()).or_insert_with(|| NamespaceUnit {
-            name: ns.clone(),
+        let entry = units.entry(ns.clone()).or_insert_with(|| NamespaceUnit {
             declarations: Vec::new(),
             uses: Vec::new(),
         });
@@ -85,15 +754,12 @@ fn extract_namespace_units(
             .filter_map(decl_name)
             .map(|i| i.name.clone())
             .collect::<HashSet<_>>();
-        println!("Existing decls in {}: {:?}", ns, existing_decls);
-
         for decl in module.declarations {
             match decl.node {
                 DeclarationKind::Use(path) => entry.uses.push(path),
                 _ => {
                     if let Some(id) = decl_name(&decl) {
                         if existing_decls.contains(&id.name) {
-                            println!("Skipping duplicate: {} in {}", id.name, ns);
                             continue;
                         }
                         existing_decls.insert(id.name.clone());
@@ -139,6 +805,19 @@ fn build_namespace_decl_maps(
                     ));
                 } else {
                     map.insert(id.name.clone(), mangle(ns, &id.name));
+                }
+            }
+            if let DeclarationKind::Enum { variants, .. } = &decl.node {
+                for v in variants {
+                    let vname = v.node.name.name.clone();
+                    if map.contains_key(&vname) {
+                        errors.push(format!(
+                            "Duplicate declaration '{}' in namespace '{}'",
+                            vname, ns
+                        ));
+                    } else {
+                        map.insert(vname.clone(), mangle(ns, &vname));
+                    }
                 }
             }
         }
@@ -272,9 +951,6 @@ fn compute_transitive(
     }
 
     let order = topo_sort(&needed, &edges)?;
-    // topo_sort returns deps first due to postorder push; reverse for deterministic "deps then dependents"
-    let mut order = order;
-    order.reverse();
     Ok(order)
 }
 
@@ -363,10 +1039,27 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
         } => methods
             .into_iter()
             .map(|mut m| {
-                if let DeclarationKind::Function { name, generics, .. } = &mut m.node {
+                if let DeclarationKind::Function {
+                    name,
+                    params,
+                    generics,
+                    ..
+                } = &mut m.node
+                {
                     name.name = method_symbol(&type_name, &name.name);
-                    // Prepend the impl's generics so T, E etc. are in scope
-                    // for resolver and type checker
+                    // Prepend self receiver so func_sigs gets the full param list
+                    // (task is prepended later by register_module_sigs)
+                    params.insert(
+                        0,
+                        Parameter {
+                            name: Identifier {
+                                name: "self".to_string(),
+                                span: Span::default(),
+                            },
+                            type_annotation: type_name.clone(), // the impl's type
+                            span: Span::default(),
+                        },
+                    );
                     let mut merged = ext_generics.clone();
                     merged.extend(generics.drain(..));
                     *generics = merged;
@@ -429,7 +1122,7 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
         return Err(errors);
     }
 
-    // Load stdlib from .ll file and inject as synthetic parsed module
+    // Load stdlib from .ll file and inject directly as NamespaceUnit
     // Look next to the binary, then next to cwd
     let stdlib_ll_path = std::env::current_exe()
         .ok() // Convert Result to Option
@@ -440,30 +1133,52 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
         .map(|d| d.join("typhoon-stdlib.ll"))
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("typhoon-stdlib.ll"));
-    println!("Exe {:?}", std::env::current_exe());
-    println!("Path {:?}", stdlib_ll_path);
+
+    // Parse .ty files into units first, then add stdlib directly from LLVM IR
+    let mut units = extract_namespace_units(modules)?;
+
+    // Load stdlib from .ll file and parse directly into "std" namespace
     if stdlib_ll_path.exists() {
         let ll_source =
             fs::read_to_string(stdlib_ll_path).map_err(|e| vec![format!("read stdlib: {}", e)])?;
-        let ty_source = parse_ll_as_ty_source(&ll_source);
 
-        // Parse the generated .ty source as a module
-        let tokens = crate::lexer::Lexer::new(ty_source).tokenize();
-        match crate::parser::Parser::new(tokens).parse_module() {
-            Ok(m) => modules.push(m),
-            Err(e) => return Err(vec![format!("stdlib parse error: {}", e)]),
+        let stdlib_units = parse_llvm_to_namespace_unit(&ll_source)?;
+        for (ns_name, unit) in stdlib_units {
+            let entry = units.entry(ns_name).or_insert_with(|| NamespaceUnit {
+                declarations: Vec::new(),
+                uses: Vec::new(),
+            });
+            let mut existing_decls = entry
+                .declarations
+                .iter()
+                .filter_map(decl_name)
+                .map(|i| i.name.clone())
+                .collect::<HashSet<_>>();
+            for decl in unit.declarations {
+                if let Some(id) = decl_name(&decl) {
+                    if existing_decls.contains(&id.name) {
+                        continue;
+                    }
+                    existing_decls.insert(id.name.clone());
+                }
+                entry.declarations.push(decl);
+            }
         }
     }
-    println!(
-        "modules count: {}, namespaces: {:?}",
-        modules.len(),
-        modules
-            .iter()
-            .filter_map(|m| m.name.as_deref())
-            .collect::<Vec<_>>()
-    );
 
-    let mut units = extract_namespace_units(modules)?;
+    if let Some(net_unit) = units.get_mut("std::net") {
+        net_unit.uses.push(Spanned::new_dummy(
+            UsePathKind {
+                segments: vec![
+                    "std".to_string(),
+                    "result".to_string(),
+                    "Result".to_string(),
+                ],
+                wildcard: false,
+            },
+            Span::default(),
+        ));
+    }
 
     // Find entry namespace by looking up which unit came from a file named
     // after the entry file's stem — or just read the namespace line only
@@ -485,16 +1200,16 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
     units
         .entry(entry_ns.clone())
         .or_insert_with(|| NamespaceUnit {
-            name: entry_ns.clone(),
             declarations: Vec::new(),
             uses: Vec::new(),
         });
     let decl_maps = build_namespace_decl_maps(&units)?;
     let order = compute_transitive(&units, &entry_ns)?;
 
-    // 1. First, collect all declarations from all namespaces (global index).
+    // 1. Collect declarations from transitive namespaces only.
     let mut global_symbols = HashMap::new();
-    for (ns, unit) in &units {
+    for ns in &order {
+        let unit = units.get(ns).unwrap();
         for decl in &unit.declarations {
             if let Some(id) = decl_name(decl) {
                 let info = match &decl.node {
@@ -526,30 +1241,25 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
             }
         }
     }
-    println!(
-        "global_symbols keys: {:?}",
-        global_symbols.keys().collect::<Vec<_>>()
-    );
-
-    // Step 2: Resolve all namespaces using global context
+    // Step 2: Resolve namespaces using explicit import surface (alias map)
     let mut resolver = crate::resolver::Resolver::new();
     for ns in &order {
         let unit = units.get(ns).unwrap();
-        if ns == "std" {
-            continue;
-        }
-
         let own_decl_names: HashSet<String> = unit
             .declarations
             .iter()
             .filter_map(decl_name)
             .map(|id| id.name.clone())
             .collect();
-
-        let imports_for_ns: HashMap<String, crate::resolver::DeclInfo> = global_symbols
-            .iter()
-            .filter(|(name, _)| !own_decl_names.contains(*name))
-            .map(|(k, v)| (k.clone(), v.clone()))
+        let alias = build_alias_map(ns, &units, &decl_maps)?;
+        let imports_for_ns: HashMap<String, crate::resolver::DeclInfo> = alias
+            .keys()
+            .filter(|name| !own_decl_names.contains(*name))
+            .filter_map(|name| {
+                global_symbols
+                    .get(name)
+                    .map(|info| (name.clone(), info.clone()))
+            })
             .collect();
 
         // Expand impl/extension blocks so the resolver sees individual fn declarations
@@ -571,24 +1281,11 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
             .map_err(|e| e)?;
     }
 
-    // Step 3: Build all_decls — always include std first, then ordered namespaces
+    // Step 3: Build all_decls from transitive namespaces only
     let mut all_decls = Vec::new();
     let mut desugar = Desugar::new();
 
-    // Always expand std into all_decls so type checker can find stdlib methods
-    // (temporary until explicit `use std::...` imports drive inclusion)
-    if let Some(std_unit) = units.get("std") {
-        for decl in std_unit.declarations.clone() {
-            for expanded in expand_impl_and_extension_decls(decl) {
-                all_decls.push(expanded);
-            }
-        }
-    }
-
     for ns in order {
-        if ns == "std" {
-            continue;
-        } // already added above
         let alias = build_alias_map(&ns, &units, &decl_maps)?;
         let unit = units.get(&ns).unwrap();
         for mut decl in unit.declarations.clone() {
@@ -619,242 +1316,12 @@ fn ll_type_to_ty(ll: &str) -> &str {
         "i64" => "Int64",
         "float" => "Float32",
         "double" => "Float64",
+        s if s.starts_with("%struct.Result__") => "Result", // instantiated generic types
+        s if s.starts_with("%struct.Option__") => "Option", // instantiated generic types
         s if s.starts_with("%struct.") => {
             // "%struct.Buf*" -> "Buf", "%struct.TyArray" -> "TyArray"
             s.trim_start_matches("%struct.")
         }
         _ => "Str", // fallback: treat unknown ptrs as opaque
     }
-}
-
-fn parse_ll_as_ty_source(ll_source: &str) -> String {
-    let mut struct_names = Vec::new();
-    let mut enum_decls = Vec::new();
-    let mut free_fns = Vec::new();
-    // (type_name, raw_ty_sig_line) — full Typhoon fn signature string,
-    // either from a `; @ty_sig:` annotation or inferred from LLVM types.
-    let mut methods: Vec<(String, String)> = Vec::new();
-    let mut pending_ty_sig: Option<String> = None;
-
-    for line in ll_source.lines() {
-        let line = line.trim();
-
-        // ; @ty_sig: fn consume(self, ch: ref chan<Int8>)
-        if let Some(sig) = line.strip_prefix("; @ty_sig:") {
-            pending_ty_sig = Some(sig.trim().to_string());
-            continue;
-        }
-
-        // %struct.Foo = type { ... }  OR  %struct.Foo = type opaque
-        if let Some(rest) = line.strip_prefix("%struct.") {
-            if let Some(name) = rest.split('=').next().map(|s| s.trim()) {
-                struct_names.push(name.to_string());
-            }
-            continue;
-        }
-
-        // %enum.Option<T> = type { Some(T), None }
-        // %enum.Result<T, E> = type { Ok(T), Err(E) }
-        if let Some(rest) = line.strip_prefix("%enum.") {
-            // Extract "Name<generics>" from before the '='
-            if let Some(lhs) = rest.split('=').next().map(|s| s.trim()) {
-                // Extract variants from inside "type { ... }"
-                if let Some(body) = rest.split('{').nth(1).and_then(|s| s.split('}').next()) {
-                    // lhs = "Option<T>" or "Result<T, E>"
-                    let (enum_name, generics) = if let Some(i) = lhs.find('<') {
-                        (&lhs[..i], &lhs[i..]) // ("Option", "<T>")
-                    } else {
-                        (lhs, "")
-                    };
-                    // body = " Some(T), None " or " Ok(T), Err(E) "
-                    let variants = body
-                        .split(',')
-                        .map(|v| v.trim().to_string())
-                        .filter(|v| !v.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    enum_decls.push(format!("enum {}{} {{ {} }}", enum_name, generics, variants));
-                }
-            }
-            continue;
-        }
-
-        let method_rest = if let Some(r) = line.strip_prefix("declare ") {
-            Some(("declare", r))
-        } else if let Some(r) = line.strip_prefix("define ") {
-            Some(("define", r))
-        } else {
-            None
-        };
-
-        if let Some((kind, rest)) = method_rest {
-            if rest.contains("@__ty_method__") {
-                // existing method-parsing logic — works for both declare and define
-                let type_name = rest
-                    .split("@__ty_method__")
-                    .nth(1)
-                    .and_then(|s| s.split("__").next())
-                    .map(|s| s.to_string());
-
-                if let Some(type_name) = type_name {
-                    if let Some(sig) = pending_ty_sig.take() {
-                        // Use the explicit Typhoon signature from the annotation
-                        methods.push((type_name, sig));
-                    } else if let Some((_, method_name, params, ret)) = parse_ll_method_decl(rest) {
-                        // Fall back to inferring from LLVM types
-                        let ret_str = if ret == "Unit" {
-                            String::new()
-                        } else {
-                            format!(" -> {}", ret)
-                        };
-                        let params_str = if params.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", params.join(", "))
-                        };
-                        let sig = format!("fn {}(self{}){} {{}}", method_name, params_str, ret_str);
-                        methods.push((type_name, sig));
-                    }
-                }
-            } else {
-                // This block correctly handles all other 'declare' statements,
-                // including @__ty_rt__ functions, by treating them as regular free functions.
-                // only emit free-fn externs from 'declare', not 'define'
-                if let Some(sig) = parse_ll_declare_to_ty(rest) {
-                    free_fns.push(sig);
-                }
-            }
-            pending_ty_sig = None;
-        } else if !line.starts_with(';') {
-            pending_ty_sig = None;
-        }
-    }
-
-    let mut out = String::from("namespace std\nextern \"C\" {\n");
-    for sig in &free_fns {
-        out.push_str(&format!("    {}\n", sig));
-    }
-    out.push_str("}\n");
-
-    // Emit struct declarations
-    let mut emitted = std::collections::HashSet::new();
-    for name in &struct_names {
-        let ty_name = if name == "TyArray" {
-            "Array"
-        } else {
-            name.as_str()
-        };
-        if emitted.insert(ty_name.to_string()) {
-            out.push_str(&format!("struct {} {{}}\n", ty_name));
-        }
-    }
-
-    // Emit enum declarations
-    for decl in &enum_decls {
-        out.push_str(&format!("{}\n", decl));
-    }
-
-    // Emit impl blocks grouped by type
-    let mut by_type: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for (type_name, sig) in methods {
-        by_type.entry(type_name).or_default().push(sig);
-    }
-    for (type_name, sigs) in &by_type {
-        out.push_str(&format!("impl {} {{\n", type_name));
-        for sig in sigs {
-            // Ensure every method has a body — annotation may omit it
-            let line = if sig.contains('{') {
-                sig.clone()
-            } else {
-                format!("{} {{}}", sig)
-            };
-            out.push_str(&format!("    {}\n", line));
-        }
-        out.push_str("}\n");
-    }
-
-    println!("Output: {}", out);
-
-    out
-}
-
-// New helper for __ty_method__Type__method declarations
-fn parse_ll_method_decl(rest: &str) -> Option<(String, String, Vec<String>, String)> {
-    // rest = "i8* @__ty_method__Network__listen(%struct.Network*, i8*)"
-    let (ret_ll, after_at) = rest.split_once('@')?;
-    let ret_ty = ll_type_to_ty(ret_ll.trim()).to_string();
-
-    let (name, args_part) = after_at.split_once('(')?;
-    // name = "__ty_method__Network__listen"
-    let name = name.trim().trim_start_matches("__ty_method__");
-    // Split on first __ to get TypeName and method
-    let (type_name, method_name) = name.split_once("__")?;
-
-    let args_part = args_part.trim_end_matches(')');
-    let mut params = Vec::new();
-    // Skip first arg (self pointer = %struct.TypeName*)
-    let args: Vec<&str> = args_part.split(',').collect();
-    for (i, arg) in args.iter().enumerate().skip(1) {
-        let arg = arg.trim();
-        if arg == "..." || arg.is_empty() {
-            continue;
-        }
-        // Extract LLVM type (e.g., "i8*", "%struct.Network*")
-        let ll_ty = arg.split_whitespace().next()?;
-        let ty = ll_type_to_ty(ll_ty);
-        params.push(format!("arg{}: {}", i, ty));
-    }
-
-    Some((
-        type_name.to_string(),   // Correctly extracted type name (e.g., "Network")
-        method_name.to_string(), // Correctly extracted method name (e.g., "listen")
-        params,
-        ret_ty,
-    ))
-}
-
-fn parse_ll_declare_to_ty(rest: &str) -> Option<String> {
-    // rest = "i32 @ty_net_listen(i8* %addr, i32 %port)"
-    let (ret_ll, after_at) = rest.split_once('@')?;
-    let ret_ty = ll_type_to_ty(ret_ll.trim());
-
-    let (name, args_part) = after_at.split_once('(')?;
-    let name = name.trim();
-    let args_part = args_part.trim_end_matches(')');
-
-    let mut params = Vec::new();
-    let mut variadic = false;
-    if !args_part.trim().is_empty() {
-        for (i, arg) in args_part.split(',').enumerate() {
-            let arg = arg.trim();
-            if arg == "..." {
-                variadic = true;
-                continue;
-            }
-            if arg.is_empty() {
-                continue;
-            }
-            // "i8* %task"  or  "%struct.Buf* %out"  or  just "i8*"
-            let ll_ty = arg.split_whitespace().next()?;
-            let ty = ll_type_to_ty(ll_ty);
-            params.push(format!("arg{}: {}", i, ty));
-        }
-    }
-    if variadic {
-        params.push("...".to_string());
-    }
-
-    let ret_annotation = if ret_ty == "Unit" {
-        String::new()
-    } else {
-        format!(" -> {}", ret_ty)
-    };
-
-    Some(format!(
-        "fn {}({}){}",
-        name,
-        params.join(", "),
-        ret_annotation
-    ))
 }

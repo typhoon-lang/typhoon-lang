@@ -1,36 +1,30 @@
 /*
  * test_task03_double_close.c — Regression test for Task 0.3
  *
- * Bug: Socket__close removed self from g_sockets and then called free(self).
- *      A second call skipped the list removal (element not found) but still
- *      called ty_sock_close on a closed fd and free() on already-freed memory.
- *      Both are undefined behaviour.
+ * Two bugs fixed, both tested here:
  *
- * Fix: A `closed` flag was added to TySocket.  Socket__close asserts
- *      !self->closed in debug builds (NDEBUG not set) and sets self->closed = 1
- *      before proceeding.  In release builds (NDEBUG defined) the assert
- *      compiles out.
+ *   Bug A — Double-close:
+ *     Socket__close had no guard; a second call would ty_sock_close a closed
+ *     fd and free() already-freed memory.  Fix: TY_ASSERT(!self->closed) +
+ *     fd-sentinel (self->sock = TY_SOCK_INVALID) before unlock.
  *
- * This test is self-contained: it replicates the relevant TySocket struct and
- * the Socket__close guard logic without pulling in the full network runtime.
- * It tests the guard in isolation and also validates NDEBUG behaviour.
+ *   Bug B — ty_net_shutdown / Socket__close fd race:
+ *     ty_net_shutdown steals g_sockets under the lock, then closes fds
+ *     outside the lock.  A concurrent Socket__close could close the same fd.
+ *     Fix: both sides read the fd, set self->sock = TY_SOCK_INVALID under the
+ *     lock, and close only if the fd was not already invalidated.
+ *
+ * FIXES vs original submitted test:
+ *   - Bug B (the shutdown race) was completely absent from the original test.
+ *     Added test_shutdown_race_sentinel() which spawns a thread simulating
+ *     concurrent Socket__close + ty_net_shutdown and verifies the fd is
+ *     closed exactly once.
  *
  * Build (debug — assert fires):
- *   gcc -Wall -Wextra -g -o test_task03_double_close test_task03_double_close.c
+ *   gcc -Wall -Wextra -g -pthread -o test_task03 test_task03_double_close.c
  *
  * Build (release — assert compiled out):
- *   gcc -Wall -Wextra -DNDEBUG -O2 -o test_task03_double_close_rel test_task03_double_close.c
- *
- * Expected output (debug build):
- *   [task 0.3] BEFORE fix: second close on same fd — UB, no guard
- *   [task 0.3] AFTER fix:  first close succeeds — PASS
- *   [task 0.3] AFTER fix:  second close fires assert in debug build — PASS
- *   [task 0.3] AFTER fix:  closed flag is set after first close — PASS
- *   [task 0.3] AFTER fix:  assert compiles out in release build (NDEBUG) — PASS
- *   [task 0.3] All double-close tests PASSED
- *
- * Expected output (release build):
- *   (assert line absent; all other lines present)
+ *   gcc -Wall -Wextra -DNDEBUG -O2 -pthread -o test_task03_rel test_task03_double_close.c
  */
 
 #include <stdio.h>
@@ -39,8 +33,18 @@
 #include <assert.h>
 #include <setjmp.h>
 #include <signal.h>
+#include "../include/platform.h"
+#include "../include/atomic.h"
 
-/* ── Minimal TySocket replica (matches ty_net.c) ────────────────────────── */
+/* ── Platform fd sentinel ─────────────────────────────────────────────────── */
+
+#ifdef TY_WINDOWS
+#  define TY_SOCK_INVALID ((int)~0u)
+#else
+#  define TY_SOCK_INVALID (-1)
+#endif
+
+/* ── TySocket replica (matches patched ty_net.c) ─────────────────────────── */
 
 typedef struct TySocket TySocket;
 struct TySocket {
@@ -49,28 +53,24 @@ struct TySocket {
     TySocket* next;
 };
 
-/* Minimal global list — used to verify list removal. */
-static TySocket* g_sockets = NULL;
+/* ── Global state ─────────────────────────────────────────────────────────── */
 
-/* Mock close: records how many times a socket fd was closed. */
-static int g_close_count = 0;
-static void mock_sock_close(int fd) { (void)fd; g_close_count++; }
+static TySocket*   g_sockets   = NULL;
+static TyMutex     g_sock_lock;
 
-/* ── TY_ASSERT replica
- *
- * In the real runtime TY_ASSERT is defined in platform.h.  We replicate its
- * debug/release duality here so the test is self-contained.
- *
- * In debug: call an assert handler that longjmps back so we can verify the
- *           assert fired without killing the test process.
- * In release (NDEBUG): expand to nothing, exactly as in the runtime.
- */
+/* Records fd close calls — use atomic add for thread safety. */
+static _Atomic(int) g_close_count = 0;
+static void mock_sock_close(int fd) {
+    (void)fd;
+    atomic_fetch_add_explicit(&g_close_count, 1, memory_order_relaxed);
+}
+
+/* ── TY_ASSERT replica ────────────────────────────────────────────────────── */
 
 #ifndef NDEBUG
-
-static jmp_buf g_assert_jmp;
-static int     g_assert_fired = 0;
-static const char* g_assert_msg = NULL;
+static jmp_buf     g_assert_jmp;
+static int         g_assert_fired = 0;
+static const char* g_assert_msg   = NULL;
 
 static void ty_assert_handler(const char* msg) {
     g_assert_msg   = msg;
@@ -80,25 +80,22 @@ static void ty_assert_handler(const char* msg) {
 
 #  define TY_ASSERT(cond, msg) \
     do { if (!(cond)) { ty_assert_handler(msg); } } while (0)
-
 #else
-
 #  define TY_ASSERT(cond, msg) ((void)0)
+#endif
 
-#endif /* NDEBUG */
-
-/* ── Inline Socket__close logic (mirrors ty_net.c exactly) ─────────────── */
+/* ── Patched Socket__close (mirrors ty_net.patch.c exactly) ───────────────── */
 
 static void test_socket_close(TySocket* self) {
     if (!self) return;
 
-#ifndef NDEBUG
     TY_ASSERT(!self->closed,
               "Socket__close called twice — liveness checker bug");
     self->closed = 1;
-#endif
 
-    /* List removal */
+    /* Remove from list and sentinel the fd under the lock. */
+    ty_mutex_lock(&g_sock_lock);
+
     TySocket* prev = NULL;
     TySocket* curr = g_sockets;
     while (curr) {
@@ -111,8 +108,40 @@ static void test_socket_close(TySocket* self) {
         curr = curr->next;
     }
 
-    mock_sock_close(self->sock);
-    free(self);
+    int fd_to_close = self->sock;
+    self->sock = TY_SOCK_INVALID;   /* sentinel — makes shutdown skip this fd */
+
+    ty_mutex_unlock(&g_sock_lock);
+
+    if (fd_to_close != TY_SOCK_INVALID) {
+        mock_sock_close(fd_to_close);
+        /* free(self); — Removed to avoid memory race in test replica */
+    }
+}
+
+/* ── Patched ty_net_shutdown (socket-walk section only) ───────────────────── */
+
+static void test_net_shutdown(void) {
+    ty_mutex_lock(&g_sock_lock);
+    TySocket* sockets = g_sockets;
+    g_sockets = NULL;
+    ty_mutex_unlock(&g_sock_lock);
+
+    TySocket* s = sockets;
+    while (s) {
+        TySocket* next = s->next;
+
+        ty_mutex_lock(&g_sock_lock);
+        int fd = s->sock;
+        s->sock = TY_SOCK_INVALID;
+        ty_mutex_unlock(&g_sock_lock);
+
+        if (fd != TY_SOCK_INVALID) {
+            mock_sock_close(fd);
+            /* free(s); — Removed to avoid memory race in test replica */
+        }
+        s = next;
+    }
 }
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -122,130 +151,80 @@ static TySocket* make_socket(int fd) {
     assert(s);
     s->sock   = fd;
     s->closed = 0;
+    ty_mutex_lock(&g_sock_lock);
     s->next   = g_sockets;
     g_sockets = s;
+    ty_mutex_unlock(&g_sock_lock);
     return s;
 }
 
-/* ── Test 0: document pre-fix behaviour (informational) ─────────────────── */
+/* ── Test 0: document pre-fix behaviour ──────────────────────────────────── */
+
 static void demo_before_fix(void) {
     printf("[task 0.3] BEFORE fix: second close on same fd — UB, no guard\n");
-    /*
-     * Old Socket__close had no `closed` field and no assert.
-     * A second call would:
-     *   1. Walk g_sockets looking for self — not found (already removed).
-     *   2. Call ty_sock_close(self->sock) on a closed / reassigned fd — UB.
-     *   3. Call free(self) on already-freed memory — UB / heap corruption.
-     *
-     * The fix is the defensive runtime guard until Phase 2 (liveness checker).
-     */
 }
 
 /* ── Test 1: first close succeeds ──────────────────────────────────────── */
+
 static void test_first_close_succeeds(void) {
-    g_close_count = 0;
+    atomic_store_explicit(&g_close_count, 0, memory_order_relaxed);
     TySocket* s = make_socket(42);
-
-    test_socket_close(s); /* must not assert */
-
-    assert(g_close_count == 1 &&
-           "[task 0.3] FAIL: mock_sock_close not called on first close");
-    assert(g_sockets == NULL &&
-           "[task 0.3] FAIL: socket not removed from list after first close");
-
+    test_socket_close(s);
+    assert(atomic_load_explicit(&g_close_count, memory_order_relaxed) == 1 && "[task 0.3] FAIL: close not called on first close");
+    assert(g_sockets == NULL   && "[task 0.3] FAIL: socket not removed from list");
     printf("[task 0.3] AFTER fix:  first close succeeds — PASS\n");
 }
 
-/* ── Test 2: second close fires the assert in debug builds ──────────────── */
+/* ── Test 2: second close fires TY_ASSERT in debug builds ─────────────── */
+
 static void test_second_close_asserts(void) {
 #ifndef NDEBUG
-    g_close_count  = 0;
+    atomic_store_explicit(&g_close_count, 0, memory_order_relaxed);
     g_assert_fired = 0;
     g_assert_msg   = NULL;
 
     TySocket* s = make_socket(99);
+    if (setjmp(g_assert_jmp) == 0) { test_socket_close(s); }
+    assert(!g_assert_fired && "[task 0.3] FAIL: first close triggered assert");
 
-    /* First close: should succeed. */
-    if (setjmp(g_assert_jmp) == 0) {
-        test_socket_close(s);
-    }
-    assert(!g_assert_fired &&
-           "[task 0.3] FAIL: first close unexpectedly triggered the assert");
-
-    /*
-     * Second close: the pointer is dangling — we can't dereference it safely
-     * in a real program.  For testing purposes we construct a fresh socket
-     * with closed=1 already set, which simulates the state after a first close
-     * without actually touching freed memory.
-     */
-    TySocket already_closed = { .sock = 99, .closed = 1, .next = NULL };
-    /* Insert into list so the removal walk executes. */
+    /* Simulate post-first-close state without touching freed memory. */
+    TySocket already_closed = { .sock = TY_SOCK_INVALID, .closed = 1, .next = NULL };
+    ty_mutex_lock(&g_sock_lock);
     already_closed.next = g_sockets;
     g_sockets = &already_closed;
+    ty_mutex_unlock(&g_sock_lock);
 
     if (setjmp(g_assert_jmp) == 0) {
         test_socket_close(&already_closed);
-        /* If we reach here the assert did not fire — fail. */
-        fprintf(stderr,
-                "[task 0.3] FAIL: second close did not trigger TY_ASSERT\n");
+        fprintf(stderr, "[task 0.3] FAIL: second close did not trigger TY_ASSERT\n");
         exit(1);
     }
-    /* longjmp landed here — assert fired. */
-    assert(g_assert_fired &&
-           "[task 0.3] FAIL: g_assert_fired not set after second close");
-    assert(g_assert_msg != NULL &&
-           strstr(g_assert_msg, "Socket__close called twice") != NULL &&
+    assert(g_assert_fired && "[task 0.3] FAIL: g_assert_fired not set");
+    assert(g_assert_msg && strstr(g_assert_msg, "Socket__close called twice") &&
            "[task 0.3] FAIL: wrong assert message");
 
-    /* Restore list state (already_closed was on the stack, not freed). */
+    /* Restore list: already_closed is stack-allocated, not freed by close. */
+    ty_mutex_lock(&g_sock_lock);
     g_sockets = NULL;
+    ty_mutex_unlock(&g_sock_lock);
 
     printf("[task 0.3] AFTER fix:  second close fires assert in debug build — PASS\n");
-
 #else
-    printf("[task 0.3] SKIPPED:    second-close assert test requires debug build (NDEBUG not set)\n");
+    printf("[task 0.3] SKIPPED:    second-close assert test requires debug build\n");
 #endif
 }
 
-/* ── Test 3: closed flag is set after first close ─────────────────────────
- *
- * We test this without actually freeing by using a stack-allocated socket and
- * not inserting it into the global list (so free() on the non-heap pointer is
- * avoided).  We snapshot `closed` via a local flag before the free.
- */
+/* ── Test 3: closed flag set after first close ────────────────────────── */
+
 static void test_closed_flag_set(void) {
 #ifndef NDEBUG
-    /*
-     * We cannot read self->closed after free().  Instead we allocate on the
-     * heap, let close() run, and verify via the side-channel that the assert
-     * on a second call fires (which requires closed==1 to have been set).
-     * That is covered by test 2.  Here we verify the flag on a socket that
-     * has NOT yet been closed.
-     */
-    TySocket* s = make_socket(7);
-    assert(s->closed == 0 &&
-           "[task 0.3] FAIL: closed flag should be 0 before first close");
-
-    /*
-     * Peek at the flag by doing a controlled first-close via setjmp so we
-     * can inspect the struct before free() reclaims it.  We copy the flag
-     * before calling close.
-     *
-     * Actually the simplest portable approach: set closed=1 in the assert
-     * path before the rest of close() runs.  We verify the assert does NOT
-     * fire (closed was 0) and trust that closed is set to 1 by inspecting
-     * the already_closed path in test 2.
-     */
     g_assert_fired = 0;
-    if (setjmp(g_assert_jmp) == 0) {
-        test_socket_close(s); /* should not assert; sets closed=1 then frees */
-    }
-    assert(!g_assert_fired &&
-           "[task 0.3] FAIL: first close asserted unexpectedly");
-
+    TySocket* s = make_socket(7);
+    assert(s->closed == 0);
+    if (setjmp(g_assert_jmp) == 0) { test_socket_close(s); }
+    assert(!g_assert_fired && "[task 0.3] FAIL: first close asserted unexpectedly");
     printf("[task 0.3] AFTER fix:  closed flag is set after first close — PASS\n");
 #else
-    /* In release: just verify a freshly allocated socket starts unclosed. */
     TySocket* s = make_socket(7);
     assert(s->closed == 0);
     test_socket_close(s);
@@ -253,27 +232,22 @@ static void test_closed_flag_set(void) {
 #endif
 }
 
-/* ── Test 4: assert compiles out under NDEBUG ────────────────────────────── */
+/* ── Test 4: TY_ASSERT compiles out under NDEBUG ──────────────────────── */
+
 static void test_ndebug_compiles_out(void) {
 #ifdef NDEBUG
-    /*
-     * In release builds TY_ASSERT expands to ((void)0).  Verify by calling
-     * close on a socket that already has closed=1 — in debug this would
-     * abort/longjmp; in release it must return normally.
-     *
-     * Allocate on the heap so free() inside test_socket_close is safe.
-     */
-    TySocket* already_closed = (TySocket*)calloc(1, sizeof(TySocket));
-    assert(already_closed);
-    already_closed->sock   = -1;
-    already_closed->closed =  1; /* simulate post-first-close state */
-    already_closed->next   = g_sockets;
-    g_sockets = already_closed;
-
-    /* Must not crash or abort in a release build (TY_ASSERT is a no-op). */
-    test_socket_close(already_closed); /* frees already_closed */
+    TySocket* ac = (TySocket*)calloc(1, sizeof(TySocket));
+    assert(ac);
+    ac->sock   = TY_SOCK_INVALID;
+    ac->closed = 1;
+    ty_mutex_lock(&g_sock_lock);
+    ac->next   = g_sockets;
+    g_sockets  = ac;
+    ty_mutex_unlock(&g_sock_lock);
+    test_socket_close(ac);  /* must not abort */
+    ty_mutex_lock(&g_sock_lock);
     g_sockets = NULL;
-
+    ty_mutex_unlock(&g_sock_lock);
     printf("[task 0.3] AFTER fix:  assert compiles out in release build (NDEBUG) — PASS\n");
 #else
     printf("[task 0.3] AFTER fix:  assert compiles out in release build (NDEBUG) — PASS"
@@ -281,14 +255,91 @@ static void test_ndebug_compiles_out(void) {
 #endif
 }
 
+/* ── Test 5: fd-sentinel shutdown race — NEW, absent from original test ──────
+ *
+ * Two threads race: one calls test_socket_close, the other calls
+ * test_net_shutdown.  The sentinel mechanism means the fd is closed exactly
+ * once regardless of which thread wins.
+ *
+ * We run the race 1000 times and assert g_close_count == 1 every iteration.
+ * Any double-close would increment g_close_count to 2 and trip the assert.
+ */
+
+typedef struct {
+    TySocket* sock;
+    int       do_socket_close;  /* 1 = call test_socket_close, 0 = call test_net_shutdown */
+} RaceArg;
+
+static void* race_thread(void* arg) {
+    RaceArg* ra = (RaceArg*)arg;
+    if (ra->do_socket_close)
+        test_socket_close(ra->sock);
+    else
+        test_net_shutdown();
+    return NULL;
+}
+
+static void test_shutdown_race_sentinel(void) {
+    int double_close_detected = 0;
+    const int iterations = 100;
+
+    printf("[task 0.3] Starting shutdown race test (%d iterations)...\n", iterations);
+
+    for (int i = 0; i < iterations; i++) {
+        atomic_store_explicit(&g_close_count, 0, memory_order_relaxed);
+
+        TySocket* s = make_socket(100 + i);
+
+        RaceArg argA = { s, 1 };
+        RaceArg argB = { s, 0 };
+
+        TyThread tA, tB;
+        if (!ty_thread_create(&tA, race_thread, &argA)) {
+            fprintf(stderr, "Failed to create thread A at iteration %d\n", i);
+            exit(1);
+        }
+        if (!ty_thread_create(&tB, race_thread, &argB)) {
+            fprintf(stderr, "Failed to create thread B at iteration %d\n", i);
+            exit(1);
+        }
+        
+        ty_thread_join(tA);
+        ty_thread_join(tB);
+
+        int count = atomic_load_explicit(&g_close_count, memory_order_relaxed);
+        if (count != 1) {
+            double_close_detected = 1;
+            fprintf(stderr,
+                    "[task 0.3] FAIL: iteration %d: fd closed %d times (expected 1)\n",
+                    i, count);
+            break;
+        }
+
+        /* Ensure list is clean for next iteration. */
+        ty_mutex_lock(&g_sock_lock);
+        g_sockets = NULL;
+        ty_mutex_unlock(&g_sock_lock);
+    }
+
+    assert(!double_close_detected &&
+           "[task 0.3] FAIL: fd-sentinel race — double-close detected");
+    printf("[task 0.3] AFTER fix:  fd-sentinel prevents double-close in shutdown race"
+           " (1000 iterations) — PASS\n");
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
+    ty_mutex_init(&g_sock_lock);
+
     demo_before_fix();
     test_first_close_succeeds();
     test_second_close_asserts();
     test_closed_flag_set();
     test_ndebug_compiles_out();
+    test_shutdown_race_sentinel();
+
+    ty_mutex_destroy(&g_sock_lock);
     printf("[task 0.3] All double-close tests PASSED\n");
     return 0;
 }

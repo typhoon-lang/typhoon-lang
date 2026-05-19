@@ -1,10 +1,18 @@
 %struct.Buf = type { i8*, i64, i64 }
 %struct.TyArray = type { i8*, i64, i64, i64, i64 }
+; @ty_ns: std::net
 %struct.Network  = type { i8* }
+; @ty_ns: std::net
 %struct.Listener = type { i8* }
-%struct.Socket   = type { i8* }
+; @ty_ns: std::net
+%struct.Socket = type { i8* }
+; Result type for listen/accept operations
+%struct.Result__struct_Listenerptr__i32 = type { i8, i8, i8 }
+%struct.Result__struct_Socketptr__i32 = type { i8, i8, i8 }
 %struct.Array = type opaque
+; @ty_ns: std::option
 %enum.Option<T> = type { Some(T), None }
+; @ty_ns: std::result
 %enum.Result<T, E> = type { Ok(T), Err(E) }
 declare void @ty_sched_init     ()
 declare void @ty_sched_run      ()
@@ -33,42 +41,56 @@ declare void @ty_io_subsystem_init     ()
 declare void @ty_io_subsystem_shutdown ()
 declare i32  @ty_io_open               (i8* %driver, i8* %path, i32 %flags, i32 %mode)
 declare void @ty_io_close              (i8* %driver, i32 %fd)
+; @ty_ns: std::net
 declare void @ty_net_init              ()
+; @ty_ns: std::net
 declare void @ty_net_shutdown          ()
+; @ty_ns: std::net
 declare %struct.Network* @ty_net_global()
 
+; @ty_ns: std::net
 declare void @__ty_rt__Socket__consume(%struct.Socket*, i8*)
+; @ty_ns: std::net
 declare void @__ty_rt__Socket__close(%struct.Socket*)
+; @ty_ns: std::net
 declare void @__ty_rt__Network__listen(i8* %task, %struct.Network* %self, i8* %addr, %struct.Result__struct_Listenerptr__i32* %out)
+; @ty_ns: std::net
 declare void @__ty_rt__Listener__accept(i8* %task, %struct.Listener* %self, %struct.Result__struct_Socketptr__i32* %out)
 
+; @ty_ns: std::net
 ; @ty_sig: fn listen(self, addr: Str) -> Result<Listener, Int32>
-define @__ty_method__Network__listen(i8* %task, %struct.Network* %self, i8* %addr) {
+define %struct.Result__struct_Listenerptr__i32 @__ty_method__Network__listen(i8* %task, %struct.Network* %self, i8* %addr) {
 entry:
   %t0 = alloca i8*
   %t1 = alloca %struct.Network*
   %t2 = alloca i8*
+  %result = alloca %struct.Result__struct_Listenerptr__i32
   call void @ty_safepoint()
   store i8* %task, i8** %t0
   store %struct.Network* %self, %struct.Network** %t1
   store i8* %addr, i8** %t2
-  ; span 2356..2358 @ 59:60
-  ret %struct.Result__struct_Listenerptr__i32 zeroinitializer
+  call void @__ty_rt__Network__listen(i8* %task, %struct.Network* %self, i8* %addr, %struct.Result__struct_Listenerptr__i32* %result)
+  %val = load %struct.Result__struct_Listenerptr__i32, %struct.Result__struct_Listenerptr__i32* %result
+  ret %struct.Result__struct_Listenerptr__i32 %val
 }
 
+; @ty_ns: std::net
 ; @ty_sig: fn accept(self) -> Result<Socket, Int32>
 define %struct.Result__struct_Socketptr__i32 @__ty_method__Listener__accept(i8* %task, %struct.Listener* %self) {
 entry:
   %t0 = alloca i8*
   %t1 = alloca %struct.Listener*
+  %result = alloca %struct.Result__struct_Socketptr__i32
   call void @ty_safepoint()
   store i8* %task, i8** %t0
   store %struct.Listener* %self, %struct.Listener** %t1
-  ; span 2422..2424 @ 62:47
-  ret %struct.Result__struct_Socketptr__i32 zeroinitializer
+  call void @__ty_rt__Listener__accept(i8* %task, %struct.Listener* %self, %struct.Result__struct_Socketptr__i32* %result)
+  %val = load %struct.Result__struct_Socketptr__i32, %struct.Result__struct_Socketptr__i32* %result
+  ret %struct.Result__struct_Socketptr__i32 %val
 }
 
-; @ty_sig: fn consume(self, ch: ref chan<Int8>)
+; @ty_ns: std::net
+; @ty_sig: fn consume(self, ch: ref Chan<Int8>)
 define void @__ty_method__Socket__consume(i8* %task, %struct.Socket* %self, i8* %ch) {
 entry:
   %t0 = alloca i8*
@@ -82,6 +104,7 @@ entry:
   ret void
 }
 
+; @ty_ns: std::net
 ; @ty_sig: fn close(self)
 define void @__ty_method__Socket__close(i8* %task, %struct.Socket* %self) {
 entry:

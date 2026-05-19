@@ -190,8 +190,12 @@ impl TypeRegistry {
         base_ty
             .trim_end_matches('*')
             .strip_prefix("%struct.")
-            .map(|name| format!("__ty_method__{}__{}", name, method))
-        // removed: let normalized = name.strip_prefix("struct_").unwrap_or(name);
+            .map(|name| {
+                // Always use __ty_method__ — these are the value-returning wrappers
+                // defined in typhoon-stdlib.ll. __ty_rt__ is the internal out-param
+                // ABI used only by the method wrappers themselves, never by call sites.
+                format!("__ty_method__{}__{}", name, method)
+            })
     }
 
     /// Compute an enum layout from a definition + concrete type args, emit the
@@ -429,6 +433,9 @@ impl<'a> IrBuilder<'a> {
         self.reg = TypeRegistry::new();
         self.adt_structs.clear();
 
+        self.reg
+            .push_type_decl("Buf", "%struct.Buf = type { i8*, i64, i64 }".to_string());
+
         self.reg.push_type_decl(
             "TyArray",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }".to_string(),
@@ -477,15 +484,58 @@ impl<'a> IrBuilder<'a> {
         }
 
         // Pre-generate layouts for networking Result types used by runtime intrinsics.
+        //
+        // We cannot use ensure_enum_layout_for_infer here: Result/Option live in stdlib
+        // modules that are compiled separately, so enum_defs never contains "Result" when
+        // the user module is processed. That causes the lookup to return None and silently
+        // skip registration. Later, the type-checker inference walk may register the same
+        // mangled name with wrong i8 payload types (from an unresolved generic placeholder),
+        // producing extractvalue type mismatches in LLVM.
+        //
+        // Fix: insert the layouts directly, bypassing the enum-def lookup entirely.
+        // The variant ordering (Ok=tag 0, Err=tag 1) matches ensure_enum_layout's
+        // tag_value enumeration over def.variants in declaration order.
         let res_name = self.result_enum_name();
-        for second in ["Listener", "Socket"] {
-            self.ensure_enum_layout_for_infer(&InferType::App(
-                res_name.clone(),
-                vec![
-                    InferType::Con(second.into()),
-                    InferType::Con("Int32".into()),
-                ],
-            ));
+        for ok_payload in ["%struct.Listener*", "%struct.Socket*"] {
+            let llvm_ty = TypeRegistry::mangle_app_struct_name(
+                &res_name,
+                &[mangle_llvm_type_name(ok_payload), "i32".to_string()],
+            );
+            if self.reg.enum_layouts.contains_key(&llvm_ty) {
+                continue;
+            }
+            // Layout: { i8 tag, <ok_payload>, i32 err }
+            // index 0 = tag, index 1 = Ok payload, index 2 = Err payload
+            let body = format!("{{ i8, {}, i32 }}", ok_payload);
+            self.reg
+                .type_decls
+                .push(format!("{} = type {}", llvm_ty, body));
+
+            let mut variants = HashMap::new();
+            variants.insert(
+                "Ok".to_string(),
+                EnumVariantLayout {
+                    tag_value: 0,
+                    payload_index: Some(1),
+                    payload_ty: Some(ok_payload.to_string()),
+                },
+            );
+            variants.insert(
+                "Err".to_string(),
+                EnumVariantLayout {
+                    tag_value: 1,
+                    payload_index: Some(2),
+                    payload_ty: Some("i32".to_string()),
+                },
+            );
+            self.reg.enum_layouts.insert(
+                llvm_ty.clone(),
+                EnumLayout {
+                    llvm_struct_ty: llvm_ty,
+                    tag_ty: "i8".to_string(),
+                    variants,
+                },
+            );
         }
     }
 
@@ -578,6 +628,9 @@ impl<'a> IrBuilder<'a> {
                 ),
             );
         }
+
+        // Networking runtime methods are loaded from typhoon-stdlib.ll (parsed in driver.rs)
+        // Do NOT hardcode here to avoid duplicate declarations
 
         // stdio intrinsics keyed under both source and runtime names
         let stdio: &[(&str, &str, &str, &[&str])] = &[
@@ -701,7 +754,7 @@ impl<'a> IrBuilder<'a> {
                                     )
                                 })
                                 .unwrap_or_else(|| "void".to_string());
-                            let param_types: Vec<String> = params
+                            let mut param_types: Vec<String> = params
                                 .iter()
                                 .map(|p| {
                                     Self::lower_type(
@@ -711,6 +764,23 @@ impl<'a> IrBuilder<'a> {
                                     )
                                 })
                                 .collect();
+                            // LLVM-imported stdlib signatures can lose generic args on
+                            // Result out-params (e.g. become `%struct.Result`).
+                            // Canonicalize known net runtime externs to concrete Result
+                            // layouts so declarations always reference defined types.
+                            if name.name == "__ty_rt__Network__listen" && param_types.len() >= 4 {
+                                param_types[3] = TypeRegistry::mangle_app_struct_name(
+                                    &self.result_enum_name(),
+                                    &["%struct.Listener*".to_string(), "i32".to_string()],
+                                );
+                            } else if name.name == "__ty_rt__Listener__accept"
+                                && param_types.len() >= 3
+                            {
+                                param_types[2] = TypeRegistry::mangle_app_struct_name(
+                                    &self.result_enum_name(),
+                                    &["%struct.Socket*".to_string(), "i32".to_string()],
+                                );
+                            }
                             // Emit the LLVM declare (no task prefix for raw FFI)
                             let decl_line = format!(
                                 "declare {} @{}({})",
@@ -1048,9 +1118,14 @@ impl<'a> IrBuilder<'a> {
                 }
                 // Destructuring let with optional else block
                 let match_val = self.emit_expr(initializer);
+                // Use the concrete emitted LLVM type of the scrutinee SSA value for IR ops
+                // like `extractvalue`; inferred types can be equivalent but differently
+                // mangled names, which LLVM still treats as distinct nominal types.
+                // In LetBinding, prefer inferred type over value_llvm_type scraping:
                 let match_ty = self
                     .actual_inferred_type(initializer)
                     .map(|t| self.lower_infer_type(&t))
+                    .or_else(|| self.value_llvm_type(&match_val))
                     .unwrap_or_else(|| self.expr_llvm_type(initializer));
                 let then_lbl = self.label("letelse_ok");
                 let else_lbl = self.label("letelse_fail");
@@ -1122,14 +1197,18 @@ impl<'a> IrBuilder<'a> {
             .iter()
             .filter(|n| *n != "task" && *n != "arg")
             .filter_map(|name| {
-                let slot = self.locals.get(name)?.clone();
-                let ty = self
-                    .locals_type
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| "i32".to_string());
-                let is_mutable = self.mutable_vars.contains(name);
-                Some((name.clone(), slot, ty, is_mutable))
+                if let Some(slot) = self.locals.get(name) {
+                    let ty = self.locals_type.get(name).cloned().unwrap_or("i32".into());
+                    let is_mutable = self.mutable_vars.contains(name);
+                    Some((name.clone(), slot.clone(), ty, is_mutable))
+                } else {
+                    // Surface this — a missing capture is always a codegen bug upstream
+                    self.emit(format!(
+                        "  ; BUG: capture '{}' not found in locals — missing let binding?",
+                        name
+                    ));
+                    None // still skip, but now it's visible
+                }
             })
             .collect();
 
@@ -1178,6 +1257,7 @@ impl<'a> IrBuilder<'a> {
         // Free variables must be captured via emit_conc_closure, not by
         // referencing parent alloca slots that won't exist in this coroutine.
         self.emit_block_stmts(body, "void");
+        // No closure to free — nothing was heap-allocated for this trampoline.
         self.emit("  ret void".to_string());
         let saved_tmp = self.next_tmp;
         let ir = IrFunction {
@@ -1246,9 +1326,25 @@ impl<'a> IrBuilder<'a> {
             closure_field_tys.join(", ")
         ));
 
-        // Allocate closure staging buffer on the stack (entry alloca)
+        // Heap-allocate the closure via slab_alloc so it survives past the
+        // current stack frame. Using alloca here would place the closure on
+        // the caller's stack; when the accept loop iterates, the next
+        // accept() overwrites the same stack slot before the spawned coro
+        // has read it, corrupting every previously-spawned coro's captured
+        // socket pointer. slab_alloc gives each conc{} its own stable copy.
+        let task_slot = self.emit_task_load();
+        // slab_alloc(arena: i8*, size: i32) -> i8*
+        let raw_ptr = self.tmp();
+        self.emit(format!(
+            "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
+            raw_ptr, task_slot, closure_size
+        ));
+        // Bitcast the raw heap pointer to the typed closure struct pointer
         let closure_slot = self.tmp();
-        self.emit_alloca(&closure_slot, &closure_ty);
+        self.emit(format!(
+            "  {} = bitcast i8* {} to {}*",
+            closure_slot, raw_ptr, closure_ty
+        ));
 
         for (idx, (_, slot, ty, is_mut)) in captured.iter().enumerate() {
             let gep = self.tmp();
@@ -1259,7 +1355,6 @@ impl<'a> IrBuilder<'a> {
             if *is_mut && !ty.ends_with('*') {
                 self.emit(format!("  store {}* {}, {}** {}", ty, slot, ty, gep));
             } else if !ty.ends_with('*') {
-                // If it's a struct (not a pointer), store the value directly.
                 let loaded = self.tmp();
                 self.emit(format!("  {} = load {}, {}* {}", loaded, ty, ty, slot));
                 self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, gep));
@@ -1270,12 +1365,8 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // Bitcast closure slot to i8* for the spawn call
-        let closure_i8 = self.tmp();
-        self.emit(format!(
-            "  {} = bitcast {}* {} to i8*",
-            closure_i8, closure_ty, closure_slot
-        ));
+        // Pass the heap-allocated closure pointer (already i8* from slab_alloc)
+        let closure_i8 = raw_ptr;
 
         // Emit trampoline in saved context
         let ctx = self.save_context();
@@ -1324,6 +1415,21 @@ impl<'a> IrBuilder<'a> {
         }
 
         self.emit_block_stmts(body, "void");
+        // Free the heap-allocated closure after the body completes.
+        // slab_free(arena: i8*, ptr: i8*, size_class: i32)
+        // class_id is in scope here (computed above from closure_size).
+        let task_in_tramp = self.emit_task_load();
+        let arg_for_free = if let Some(slot) = self.locals.get("arg").cloned() {
+            let t = self.tmp();
+            self.emit(format!("  {} = load i8*, i8** {}", t, slot));
+            t
+        } else {
+            "%arg".to_string()
+        };
+        self.emit(format!(
+            "  call void @slab_free(i8* {}, i8* {}, i32 {})",
+            task_in_tramp, arg_for_free, class_id
+        ));
         self.emit("  ret void".to_string());
         let saved_tmp = self.next_tmp;
         let ir = IrFunction {
@@ -1528,8 +1634,13 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or_else(|| init_ty.clone());
         let value = self.emit_widen(&value, &init_ty, &ty);
 
-        if !ty.ends_with('*') && ty != "void" {
-            // Slab allocation for non-pointer (struct) values
+        if !ty.ends_with('*')
+            && ty != "void"
+            && mutable
+            && ty.starts_with("%struct.")
+            && !self.reg.enum_layouts.contains_key(&ty)
+        {
+            // Slab allocation for mutable user struct values only (not enum aggregates)
             let size = self.llvm_const_sizeof(&ty);
             let class_id = get_size_class(size);
             let tv = self.emit_task_load();
@@ -1996,12 +2107,15 @@ impl<'a> IrBuilder<'a> {
 
     fn emit_assign_op(&mut self, op: &Operator, left: &Expression, right: &Expression) -> String {
         let (slot, lval_ty) = self.resolve_lvalue(left);
-        let lhs_val = self.tmp();
+        let lhs_raw = self.tmp();
         self.emit(format!(
             "  {} = load {}, {}* {}",
-            lhs_val, lval_ty, lval_ty, slot
+            lhs_raw, lval_ty, lval_ty, slot
         ));
-        let rhs_val = self.emit_expr(right);
+        let lhs_val = self.emit_widen(&lhs_raw, &lval_ty, &lval_ty);
+        let rhs_raw = self.emit_expr(right);
+        let rhs_ty = self.expr_llvm_type(right);
+        let rhs_val = self.emit_widen(&rhs_raw, &rhs_ty, &lval_ty);
         let res = self.tmp();
         let instr = self.arith_instr(op, &lval_ty, &lhs_val, &rhs_val, &res);
         self.emit(instr);
@@ -2316,8 +2430,16 @@ impl<'a> IrBuilder<'a> {
     }
 
     fn emit_chan_recv(&mut self, call_expr: &Expression, chan_val: &str) -> String {
-        let ty = if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
-            ty
+        // Resolve to the element type T (not Option<T>)
+        let elem_infer = if let Some(inferred) = self.inferred_expr_type(call_expr).cloned() {
+            // inferred is Option<T> — unwrap to T
+            let opt_name = self.option_enum_name();
+            match inferred {
+                InferType::App(ref name, ref args) if name == &opt_name && args.len() == 1 => {
+                    args[0].clone()
+                }
+                other => other,
+            }
         } else if let ExpressionKind::Call { func, .. } = &call_expr.node {
             if let ExpressionKind::FieldAccess { base, .. } = &func.node {
                 if let ExpressionKind::Identifier(id) = &base.node {
@@ -2336,8 +2458,8 @@ impl<'a> IrBuilder<'a> {
             return "0".to_string();
         };
 
-        let elem_ty = self.lower_infer_type(&ty);
-        let opt_infer = InferType::App(self.option_enum_name(), vec![ty]);
+        let elem_ty = self.lower_infer_type(&elem_infer);
+        let opt_infer = InferType::App(self.option_enum_name(), vec![elem_infer]);
         self.ensure_enum_layout_for_infer(&opt_infer);
         let opt_ty =
             TypeRegistry::mangle_app_struct_name(&self.option_enum_name(), &[elem_ty.clone()]);
@@ -2481,17 +2603,26 @@ impl<'a> IrBuilder<'a> {
             .get(method_sym)
             .cloned()
             .unwrap_or_else(|| ("i32".to_string(), vec![]));
-        let self_ty = param_types
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| base_ty.to_string());
-        let tv = self.emit_task_load();
-        let mut arg_pairs = vec![format!("i8* {}", tv), format!("{} {}", self_ty, base_val)];
+        let is_extern = self.reg.extern_fns.contains(method_sym);
+        let self_ty = if is_extern {
+            param_types.get(0)
+        } else {
+            param_types.get(1)
+        }
+        .cloned()
+        .unwrap_or_else(|| base_ty.to_string());
+        let mut arg_pairs = if is_extern {
+            vec![format!("{} {}", self_ty, base_val)]
+        } else {
+            let tv = self.emit_task_load();
+            vec![format!("i8* {}", tv), format!("{} {}", self_ty, base_val)]
+        };
+        let param_offset = if is_extern { 1 } else { 2 };
         for (i, a) in args.iter().enumerate() {
             let v = self.emit_expr(a);
             let actual_ty = self.expr_llvm_type(a);
             let t = param_types
-                .get(i + 2)
+                .get(i + param_offset)
                 .cloned()
                 .unwrap_or_else(|| "i32".to_string());
             let v = self.emit_widen(&v, &actual_ty, &t);
@@ -2775,7 +2906,7 @@ impl<'a> IrBuilder<'a> {
                 let v = self.emit_expr(trail);
                 if let Some((slot, ty)) = &result_slot {
                     let actual_ty = self.expr_llvm_type(trail);
-                    let store_ty = if actual_ty == "i32" {
+                    let store_ty = if actual_ty == "void" {
                         ty.clone()
                     } else {
                         actual_ty
@@ -2797,7 +2928,7 @@ impl<'a> IrBuilder<'a> {
             let v = self.emit_expr(else_expr);
             if let Some((slot, ty)) = &result_slot {
                 let actual_ty = self.expr_llvm_type(else_expr);
-                let store_ty = if actual_ty == "i32" {
+                let store_ty = if actual_ty == "void" {
                     ty.clone()
                 } else {
                     actual_ty
@@ -2909,16 +3040,12 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or_else(|| ty.to_string());
         match &pattern.node {
             PatternKind::Wildcard => "1".to_string(),
-            PatternKind::EnumVariant { variant_name, .. } => {
-                self.actual_inferred_type(scrutinee_expr)
-                    .map(|t| self.ensure_enum_layout_for_infer(&t));
-                self.emit_enum_tag_test(
-                    scrutinee_expr,
-                    &actual_ty,
-                    scrutinee_val,
-                    &variant_name.name,
-                )
-            }
+            PatternKind::EnumVariant { variant_name, .. } => self.emit_enum_tag_test(
+                scrutinee_expr,
+                &actual_ty,
+                scrutinee_val,
+                &variant_name.name,
+            ),
             _ => "1".to_string(),
         }
     }
@@ -3211,6 +3338,15 @@ impl<'a> IrBuilder<'a> {
 
     fn lower_type(ty: &Type, option_name: &str, result_name: &str) -> String {
         // mirrors lower_type but without &self
+        let ty_name = ty.node.name.as_str();
+        let is_option = ty_name == "Option"
+            || ty_name == option_name
+            || ty_name.ends_with("::Option")
+            || ty_name.ends_with("__Option");
+        let is_result = ty_name == "Result"
+            || ty_name == result_name
+            || ty_name.ends_with("::Result")
+            || ty_name.ends_with("__Result");
         match ty.node.name.as_str() {
             "Unit" => "void".to_string(),
             "Int8" | "Char" | "Byte" => "i8".to_string(),
@@ -3230,7 +3366,7 @@ impl<'a> IrBuilder<'a> {
             "Network" => "%struct.Network*".to_string(),
             "Listener" => "%struct.Listener*".to_string(),
             "Socket" => "%struct.Socket*".to_string(),
-            "Option" => {
+            _ if is_option => {
                 let args: Vec<_> = ty
                     .node
                     .generic_args
@@ -3239,7 +3375,7 @@ impl<'a> IrBuilder<'a> {
                     .collect();
                 TypeRegistry::mangle_app_struct_name(option_name, &args)
             }
-            "Result" => {
+            _ if is_result => {
                 let args: Vec<_> = ty
                     .node
                     .generic_args
@@ -3271,12 +3407,24 @@ impl<'a> IrBuilder<'a> {
                 n => format!("%struct.{}", n),
             },
             InferType::App(name, args) if name == "Ref" && args.len() == 1 => "i8*".to_string(),
-            InferType::App(name, args) if name == "Option" && args.len() == 1 => {
+            InferType::App(name, args)
+                if (name == "Option"
+                    || name == &self.option_enum_name()
+                    || name.ends_with("::Option")
+                    || name.ends_with("__Option"))
+                    && args.len() == 1 =>
+            {
                 let inner = self.lower_infer_type(&args[0]);
                 self.ensure_enum_layout_for_infer(ty);
                 TypeRegistry::mangle_app_struct_name(&self.option_enum_name(), &[inner])
             }
-            InferType::App(name, args) if name == "Result" && args.len() == 2 => {
+            InferType::App(name, args)
+                if (name == "Result"
+                    || name == &self.result_enum_name()
+                    || name.ends_with("::Result")
+                    || name.ends_with("__Result"))
+                    && args.len() == 2 =>
+            {
                 let ok = self.lower_infer_type(&args[0]);
                 let err = self.lower_infer_type(&args[1]);
                 self.ensure_enum_layout_for_infer(ty);
@@ -3631,6 +3779,14 @@ impl<'a> IrBuilder<'a> {
         if actual_ty == expected_ty {
             return val.to_string();
         }
+        // LLVM pointer-typed arguments must use `null`, not integer `0`.
+        // Some fallback expression paths produce an integer zero literal;
+        // coerce that case when the callee expects a pointer.
+        if expected_ty.ends_with('*') && matches!(actual_ty, "i1" | "i8" | "i16" | "i32" | "i64") {
+            if val == "0" {
+                return "null".to_string();
+            }
+        }
         let int_rank = |t: &str| -> Option<u8> {
             match t {
                 "i8" => Some(0),
@@ -3681,6 +3837,28 @@ impl<'a> IrBuilder<'a> {
         } else {
             "zeroinitializer".to_string()
         }
+    }
+
+    fn value_llvm_type(&self, value: &str) -> Option<String> {
+        if !value.starts_with('%') {
+            return None;
+        }
+        for line in self.lines.iter().rev() {
+            let t = line.trim_start();
+            if !t.starts_with(&format!("{} = ", value)) {
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = call ", value)) {
+                return rest.split_whitespace().next().map(|s| s.to_string());
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = load ", value)) {
+                return rest.split(',').next().map(|s| s.trim().to_string());
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = extractvalue ", value)) {
+                return rest.split_whitespace().next().map(|s| s.to_string());
+            }
+        }
+        None
     }
 
     fn fixed_array_len(&self, array_ty: &str) -> Option<usize> {
@@ -3774,6 +3952,16 @@ impl<'a> IrBuilder<'a> {
                 }
             });
         }
+
+        // Remove global function names — they are called directly by symbol, not captured.
+        // This covers both stdlib functions (printf, println, …) registered in func_sigs
+        // and user-defined functions from the same module. Without this filter, any bare
+        // function call inside a conc{} block would appear as a missing capture and emit
+        // a BUG comment even though the generated IR is correct.
+        captured.retain(|name| {
+            !self.reg.func_sigs.contains_key(name.as_str())
+                && !self.reg.extern_fns.contains(name.as_str())
+        });
 
         captured
     }

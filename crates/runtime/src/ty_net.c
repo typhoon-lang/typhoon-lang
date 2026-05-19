@@ -1,12 +1,12 @@
 /*
-    * ty_net.c — minimal capability-gated networking for Typhoon
-    *
-    * Notes:
-    * - Uses OS sockets directly (blocking for now).
-    * - `task` is accepted for future slab allocation; currently unused.
-    * - Address parsing supports \"host:port\" (IPv4 / hostname). IPv6 literals
-    *   are not supported yet.
-    */
+ * ty_net.c — minimal capability-gated networking for Typhoon
+ *
+ * Notes:
+ * - Uses OS sockets directly (blocking for now).
+ * - `task` is accepted for future slab allocation; currently unused.
+ * - Address parsing supports \"host:port\" (IPv4 / hostname). IPv6 literals
+ *   are not supported yet.
+ */
 
 #include "ty_net.h"
 #include "scheduler.h"
@@ -62,6 +62,12 @@ static const char* ty_net_errstr_errno(int32_t code, char* buf, size_t buf_len) 
 }
 #endif
 
+#if defined(_WIN32)
+#  define TY_SOCK_INVALID  INVALID_SOCKET
+#else
+#  define TY_SOCK_INVALID  ((ty_sock_t)(-1))
+#endif
+
 typedef struct TyResult_i32_i32 {
     uint8_t ok;
     int32_t value;
@@ -94,33 +100,62 @@ void ty_net_shutdown(void) {
     ty_mutex_lock(&g_sock_lock);
     struct TyListener* listeners = g_listeners;
     g_listeners = NULL;
-    struct TySocket* sockets = g_sockets;
+    struct TySocket*  sockets   = g_sockets;
     g_sockets = NULL;
     ty_mutex_unlock(&g_sock_lock);
 
-    /* Shut down and free every listener. */
+    /*
+     * Shut down and free every listener.
+     *
+     * A concurrent Listener__close (once it exists — see §12 Review note
+     * about missing Listener__close) could race here.  Apply the same
+     * sentinel pattern: read l->sock, set sentinel, then close outside
+     * any lock.
+     */
     struct TyListener* l = listeners;
     while (l) {
         struct TyListener* next = l->next;
-        ty_sock_force_shutdown(l->sock);
-        ty_sock_close(l->sock);
+
+        ty_mutex_lock(&g_sock_lock);
+        ty_sock_t lfd = l->sock;
+        l->sock = TY_SOCK_INVALID;
+        ty_mutex_unlock(&g_sock_lock);
+
+        if (lfd != TY_SOCK_INVALID) {
+            ty_sock_force_shutdown(lfd);
+            ty_sock_close(lfd);
+        }
         free(l);
         l = next;
     }
 
-    /* Shut down and free every socket. */
+    /*
+     * Shut down and free every socket.
+     *
+     * A concurrent Socket__close may have already closed the fd and set
+     * self->sock = TY_SOCK_INVALID before we reach this node (case B in
+     * the comment in __ty_rt__Socket__close above).  Check before closing.
+     */
     struct TySocket* s = sockets;
     while (s) {
         struct TySocket* next = s->next;
-        ty_sock_force_shutdown(s->sock);
-        ty_sock_close(s->sock);
+
+        ty_mutex_lock(&g_sock_lock);
+        ty_sock_t sfd = s->sock;
+        s->sock = TY_SOCK_INVALID;
+        ty_mutex_unlock(&g_sock_lock);
+
+        if (sfd != TY_SOCK_INVALID) {
+            ty_sock_force_shutdown(sfd);
+            ty_sock_close(sfd);
+        }
         free(s);
         s = next;
     }
 
-    #if defined(_WIN32)
+#if defined(_WIN32)
     (void)WSACleanup();
-    #endif
+#endif
 }
 
 
@@ -464,25 +499,58 @@ void __ty_rt__Socket__close(void* task, TySocket* self) {
     (void)task;
     if (!self) return;
 
-#ifndef NDEBUG
+    /* ── Debug guard: catch double-close from liveness checker bugs ── */
     TY_ASSERT(!self->closed, "Socket__close called twice — liveness checker bug");
+    /* Mark closed immediately.  This is visible to any concurrent caller
+     * before we acquire the lock, giving an early signal in debug builds. */
     self->closed = 1;
-#endif
 
+    /* ── Remove from global list and invalidate the fd atomically ──── */
     ty_mutex_lock(&g_sock_lock);
+
     struct TySocket* prev = NULL;
     struct TySocket* curr = g_sockets;
     while (curr) {
         if (curr == self) {
             if (prev) prev->next = curr->next;
-            else g_sockets = curr->next;
+            else       g_sockets = curr->next;
             break;
         }
         prev = curr;
         curr = curr->next;
     }
+
+    /* Sentinel the fd before releasing the lock.
+     *
+     * ty_net_shutdown steals the list under the lock and then walks it
+     * outside the lock.  By the time shutdown reaches this node (if it
+     * already stole the list before we locked above, `curr` will be NULL
+     * and we won't find self in g_sockets — but self->sock must still be
+     * invalidated so shutdown's walk sees TY_SOCK_INVALID and skips it).
+     *
+     * Two cases:
+     *   A. We removed self from g_sockets (curr != NULL above):
+     *      shutdown will never see this node.  Sentinel is defensive only.
+     *   B. Shutdown already stole the list (curr == NULL above):
+     *      shutdown holds a pointer to self in its local `sockets` variable.
+     *      We must set self->sock = TY_SOCK_INVALID before shutdown's walk
+     *      reaches this node.  The mutex ensures we finish before shutdown
+     *      proceeds past ty_mutex_unlock in its own list-steal section.
+     *      (Shutdown holds g_sock_lock while stealing; we held it here too,
+     *      so one of us went first.  If we go first: we close the fd, set
+     *      sentinel, unlock — shutdown then sees sentinel and skips.
+     *      If shutdown goes first: it steals the list, we get the lock, find
+     *      curr==NULL, set sentinel on the now-shutdown-owned node, unlock —
+     *      shutdown's walk will check for TY_SOCK_INVALID and skip.)
+     */
+    ty_sock_t fd_to_close = self->sock;
+    self->sock = TY_SOCK_INVALID;
+
     ty_mutex_unlock(&g_sock_lock);
 
-    ty_sock_close(self->sock);
+    /* ── Close outside the lock ── */
+    if (fd_to_close != TY_SOCK_INVALID) {
+        ty_sock_close(fd_to_close);
+    }
     free(self);
 }

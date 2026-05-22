@@ -8,9 +8,8 @@
  * the calling coroutine's arena.  Pass NULL only in unit tests that do not
  * need arena-backed allocation (ty_sscan falls back to malloc in that case).
  *
- * StackBuf (4 096 B cap) is a temporary measure; replaced by slab TyBuf in
- * Phase 3.  Functions that use StackBuf internally return int so callers can
- * detect truncation via a negative return value.
+ * Formatted output uses a slab-backed growable buffer. Functions that return
+ * int use negative values for write/format failures (e.g. arena OOM).
  */
 
 #ifndef TY_IO_H
@@ -41,32 +40,29 @@ typedef struct Buf       Buf;
 
 /*
  * ty_print / ty_println — write a raw string to stdout.
- * Return void: plain strings cannot overflow StackBuf (no formatting).
+ * Return void: plain strings perform direct writes (no formatting buffer).
  */
 void ty_print  (SlabArena* arena, char* s);
 void ty_println(SlabArena* arena, char* s);
 
 /*
  * ty_printf — fixed-arity formatted print to stdout.
- * Returns number of bytes written, or -1 if output was truncated (overflow).
+ * Returns number of bytes written, or -1 on formatting/write failure.
  * Accepts exactly 4 uint64_t args; unused slots should be 0.
- * StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3.
  */
 int ty_printf(SlabArena* arena, char* fmt,
               uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 
 /*
  * ty_fprint / ty_fprintln — write a raw string to an arbitrary fd.
- * Returns number of bytes written, or -1 if the string length alone would
- * exceed STACK_BUF_CAP (4 096 bytes).
+ * Returns number of bytes written, or -1 on write failure.
  */
 int ty_fprint  (SlabArena* arena, int fd, char* s);
 int ty_fprintln(SlabArena* arena, int fd, char* s);
 
 /*
  * ty_fprintf — formatted print to an arbitrary fd.
- * Returns number of bytes written, or -1 if output was truncated (overflow).
- * StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3.
+ * Returns number of bytes written, or -1 on formatting/write failure.
  */
 int ty_fprintf(SlabArena* arena, int fd, char* fmt, ...);
 
@@ -76,7 +72,7 @@ int ty_fprintf(SlabArena* arena, int fd, char* fmt, ...);
  */
 void ty_sprint  (SlabArena* arena, Buf* out, char* s);
 void ty_sprintln(SlabArena* arena, Buf* out, char* s);
-void ty_sprintf (SlabArena* arena, Buf* out, char* fmt, ...);
+int  ty_sprintf (SlabArena* arena, Buf* out, char* fmt, ...);
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  SCAN family — read tokens / formatted data

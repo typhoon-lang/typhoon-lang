@@ -36,6 +36,7 @@ TyNetwork* ty_net_global(void);
 /* LLVM-emitted method symbols */
 void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* out);
 void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* out);
+void __ty_rt__Listener__close(void* task, TyListener* self);
 void __ty_rt__Socket__close(void* task, TySocket* self);
 
 #ifdef __cplusplus

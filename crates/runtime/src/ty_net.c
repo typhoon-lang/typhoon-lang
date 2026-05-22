@@ -107,10 +107,8 @@ void ty_net_shutdown(void) {
     /*
      * Shut down and free every listener.
      *
-     * A concurrent Listener__close (once it exists — see §12 Review note
-     * about missing Listener__close) could race here.  Apply the same
-     * sentinel pattern: read l->sock, set sentinel, then close outside
-     * any lock.
+     * A concurrent __ty_rt__Listener__close could race here.  Apply the same
+     * sentinel pattern: read l->sock, set sentinel, then close outside any lock.
      */
     struct TyListener* l = listeners;
     while (l) {
@@ -245,12 +243,14 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
 
         if (bind(s, it->ai_addr, (socklen_t)it->ai_addrlen) != 0) {
             last_err = ty_net_last_error();
+            TY_DEBUG("[net] Listen failed: bind: %s\n", strerror(last_err));
             ty_sock_close(s);
             s = (ty_sock_t)(-1);
             continue;
         }
         if (listen(s, 128) != 0) {
             last_err = ty_net_last_error();
+            TY_DEBUG("[net] Listen failed: listen: %s\n", strerror(last_err));
             ty_sock_close(s);
             s = (ty_sock_t)(-1);
             continue;
@@ -340,6 +340,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
         return;
     }
     sock->sock = c;
+    sock->closed = 0;
     ty_mutex_lock(&g_sock_lock);
     sock->next = g_sockets;
     g_sockets = sock;
@@ -352,54 +353,76 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     return;
 }
 
-static void socket_consumer_coro(void* task, void* arg) {
-    /* arg: [TySocket*, TyChan*] */
-    void** pair = (void**)arg;
-    TySocket* sock = (TySocket*)pair[0];
-    struct TyChan* chan = (struct TyChan*)pair[1];
-    char buf[1024];
+/* ── Socket__consume ─────────────────────────────────────────────────────────
+ *
+ * Spawns a background coroutine that reads bytes from self->sock and sends
+ * each one into `ch`, then closes `ch` on EOF or error.
+ *
+ * The spawned coroutine runs on the scheduler and owns the read loop; the
+ * caller returns immediately and drives from ch.recv() / ch.try_recv().
+ *
+ * Closure layout (heap-allocated, freed by the reader coro on exit):
+ *   struct TyConsumeCtx { TySocket* socket; struct TyChan* chan; }
+ *
+ * The reader uses blocking recv(2) on the OS socket.  This is consistent with
+ * the rest of the runtime ("blocking for now" per the file-level comment).
+ * A single scheduler worker thread will be occupied per active connection until
+ * async I/O is wired up in a later phase.
+ */
 
-    while (1) {
-        int r = recv(sock->sock, buf, sizeof(buf), 0);
-        if (r < 0) {
-            /* A real error (not EAGAIN/EWOULDBLOCK — socket is blocking).
-             * Treat as EOF so the reader's recv()/try_recv() loop terminates
-             * cleanly rather than spinning forever on a broken socket. */
+typedef struct {
+    TySocket*       socket;
+    struct TyChan*  chan;
+} TyConsumeCtx;
+
+static void ty_socket_reader_coro(void* task, void* arg) {
+    TyConsumeCtx*  ctx  = (TyConsumeCtx*)arg;
+    TySocket*      self = ctx->socket;
+    struct TyChan* ch   = ctx->chan;
+    free(ctx);          /* closure is no longer needed once unpacked */
+
+    char byte_buf;
+    for (;;) {
+        /* Check whether Socket__close has already invalidated the fd. */
+        ty_mutex_lock(&g_sock_lock);
+        ty_sock_t fd = self ? self->sock : TY_SOCK_INVALID;
+        ty_mutex_unlock(&g_sock_lock);
+
+        if (fd == TY_SOCK_INVALID)
+            break;      /* socket was closed externally */
+
 #if defined(_WIN32)
-            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
-                ty_net_last_error(), "winsock");
+        int n = recv((SOCKET)fd, &byte_buf, 1, 0);
+        if (n == SOCKET_ERROR || n == 0) break;
 #else
-            TY_DEBUG("[net] socket_consumer_coro recv error errno=%d (%s)\n",
-                ty_net_last_error(), strerror(ty_net_last_error()));
+        ssize_t n;
+        do { n = recv(fd, &byte_buf, 1, 0); } while (n < 0 && errno == EINTR);
+        if (n <= 0) break;  /* 0 = EOF, <0 = error */
 #endif
-            break;
-        }
-        if (r == 0) {
-            /* Orderly remote close (EOF). */
-            break;
-        }
-        /* Send each byte individually — channel slot is 1 byte (Int8/Char).
-         * Passing a pointer into a 1-byte slot would corrupt channel memory. */
-        for (int i = 0; i < r; i++) {
-            ty_chan_send(task, chan, &buf[i]);
-        }
+        ty_chan_send((SlabArena*)task, ch, &byte_buf);
     }
-    /* Closing the channel is the EOF signal to both recv() and try_recv():
-     *   recv()     — blocking wait returns None
-     *   try_recv() — non-blocking poll returns None */
-    ty_chan_close(chan);
-    free(pair);
+    ty_chan_close(ch);
 }
 
-void __ty_rt__Socket__consume(void* task, TySocket* self, struct TyChan* chan) {
-    void** pair = (void**)malloc(sizeof(void*) * 2);
-    if (!pair) {
-        TY_DEBUG("[net] Socket__consume OOM allocating coroutine arg\n");
+void __ty_rt__Socket__consume(void* task, TySocket* self, void* ch) {
+    if (!self || !ch) {
+        if (ch) ty_chan_close((struct TyChan*)ch);
         return;
     }
-    pair[0] = self;
-    pair[1] = chan;
-    ty_spawn(task, socket_consumer_coro, pair);
+
+    TyConsumeCtx* ctx = (TyConsumeCtx*)malloc(sizeof(TyConsumeCtx));
+    if (!ctx) {
+        /* OOM: close the channel immediately so the receiver sees EOF. */
+        ty_chan_close((struct TyChan*)ch);
+        return;
+    }
+    ctx->socket = self;
+    ctx->chan   = (struct TyChan*)ch;
+
+    /* ty_spawn(arena, fn_ptr, arg_ptr) → new coroutine.
+     * Passing the caller's task as the arena shares the same slab pool,
+     * matching how connection handler coros are spawned elsewhere. */
+    ty_spawn((SlabArena*)task, ty_socket_reader_coro, (void*)ctx);
 }
 
 /*
@@ -493,6 +516,33 @@ TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, i
     out.value = r;
     out.err = 0;
     return out;
+}
+
+void __ty_rt__Listener__close(void* task, TyListener* self) {
+    (void)task;
+    if (!self) return;
+
+    ty_mutex_lock(&g_sock_lock);
+    struct TyListener* prev = NULL;
+    struct TyListener* curr = g_listeners;
+    while (curr) {
+        if (curr == self) {
+            if (prev) prev->next = curr->next;
+            else      g_listeners = curr->next;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    ty_sock_t fd_to_close = self->sock;
+    self->sock = TY_SOCK_INVALID;
+    ty_mutex_unlock(&g_sock_lock);
+
+    if (fd_to_close != TY_SOCK_INVALID) {
+        ty_sock_force_shutdown(fd_to_close);
+        ty_sock_close(fd_to_close);
+    }
+    free(self);
 }
 
 void __ty_rt__Socket__close(void* task, TySocket* self) {

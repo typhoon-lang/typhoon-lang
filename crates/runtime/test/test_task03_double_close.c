@@ -33,8 +33,8 @@
 #include <assert.h>
 #include <setjmp.h>
 #include <signal.h>
-#include "../include/platform.h"
-#include "../include/atomic.h"
+#include "platform.h"
+#include "atomic.h"
 
 /* ── Platform fd sentinel ─────────────────────────────────────────────────── */
 
@@ -302,7 +302,7 @@ static void test_shutdown_race_sentinel(void) {
             fprintf(stderr, "Failed to create thread B at iteration %d\n", i);
             exit(1);
         }
-        
+
         ty_thread_join(tA);
         ty_thread_join(tB);
 

@@ -129,6 +129,11 @@ impl TypeRegistry {
     /// Push a type-definition line into `type_decls` only if `sym` has not
     /// been declared before.  Returns `true` when the line was actually added.
     fn push_type_decl(&mut self, sym: &str, line: String) -> bool {
+        let sym = sym
+            .strip_prefix("%struct.")
+            .or_else(|| sym.strip_prefix("%enum."))
+            .or_else(|| sym.strip_prefix("%newtype."))
+            .unwrap_or(sym);
         if self.declared_syms.insert(sym.to_string()) {
             self.type_decls.push(line);
             true
@@ -493,8 +498,9 @@ impl<'a> IrBuilder<'a> {
         // producing extractvalue type mismatches in LLVM.
         //
         // Fix: insert the layouts directly, bypassing the enum-def lookup entirely.
-        // The variant ordering (Ok=tag 0, Err=tag 1) matches ensure_enum_layout's
-        // tag_value enumeration over def.variants in declaration order.
+        // The runtime C ABI uses an `ok` byte, not source enum ordinal tags:
+        // ok=1 means Ok(payload), ok=0 means Err(err).
+        // ── Result<Listener, Int32> and Result<Socket, Int32> ────────────────
         let res_name = self.result_enum_name();
         for ok_payload in ["%struct.Listener*", "%struct.Socket*"] {
             let llvm_ty = TypeRegistry::mangle_app_struct_name(
@@ -504,18 +510,15 @@ impl<'a> IrBuilder<'a> {
             if self.reg.enum_layouts.contains_key(&llvm_ty) {
                 continue;
             }
-            // Layout: { i8 tag, <ok_payload>, i32 err }
-            // index 0 = tag, index 1 = Ok payload, index 2 = Err payload
             let body = format!("{{ i8, {}, i32 }}", ok_payload);
             self.reg
-                .type_decls
-                .push(format!("{} = type {}", llvm_ty, body));
+                .push_type_decl(&llvm_ty, format!("{} = type {}", llvm_ty, body));
 
             let mut variants = HashMap::new();
             variants.insert(
                 "Ok".to_string(),
                 EnumVariantLayout {
-                    tag_value: 0,
+                    tag_value: 1,
                     payload_index: Some(1),
                     payload_ty: Some(ok_payload.to_string()),
                 },
@@ -523,9 +526,81 @@ impl<'a> IrBuilder<'a> {
             variants.insert(
                 "Err".to_string(),
                 EnumVariantLayout {
-                    tag_value: 1,
+                    tag_value: 0,
                     payload_index: Some(2),
                     payload_ty: Some("i32".to_string()),
+                },
+            );
+            self.reg.enum_layouts.insert(
+                llvm_ty.clone(),
+                EnumLayout {
+                    llvm_struct_ty: llvm_ty,
+                    tag_ty: "i8".to_string(),
+                    variants,
+                },
+            );
+        }
+
+        // ── Option<Int8> and Option<Int32> ───────────────────────────────────
+        //
+        // Option lives in the stdlib module and is never in enum_defs when the
+        // user module is compiled, so ensure_enum_layout_for_infer silently
+        // returns without registering anything.  The mangled type name is still
+        // emitted at use sites (alloca, load, extractvalue), so LLVM would see
+        // an undefined type.
+        //
+        // Worse: if the first use of any Option<T> triggers ensure_enum_layout
+        // via a path where lower_infer_type returns "i8" as a fallback (e.g.
+        // because the channel element type wasn't resolved yet), the layout is
+        // registered with an i8 payload and cached under the mangled name.
+        // A later correct resolution of the same name is a no-op (the cache hit
+        // guard at the top of ensure_enum_layout returns early), so the wrong
+        // layout persists for the entire compilation and every Option<Int32>
+        // alloca is only 2 bytes wide — causing a 4-byte ty_chan_recv to
+        // overflow it on every popcount drain.
+        //
+        // Fix: pre-register the correct layouts here, before any use site can
+        // race to register the wrong ones.  Extend this list as new element
+        // types become common (Int64, Bool, Str, …).
+        let opt_name = self.option_enum_name();
+        // (llvm_elem_ty, payload_index_in_struct)
+        let option_elem_tys: &[(&str, &str)] = &[
+            ("i8", "i8"),
+            ("i16", "i16"),
+            ("i32", "i32"),
+            ("i64", "i64"),
+            ("i1", "i1"),
+            ("i8*", "i8*"),
+        ];
+        for (elem_ty, _) in option_elem_tys {
+            let llvm_ty =
+                TypeRegistry::mangle_app_struct_name(&opt_name, &[mangle_llvm_type_name(elem_ty)]);
+            if self.reg.enum_layouts.contains_key(&llvm_ty) {
+                continue;
+            }
+            // Layout: { i8 tag, <elem_ty> value }
+            // tag=0 → Some (payload at index 1), tag=1 → None (no payload)
+            let body = format!("{{ i8, {} }}", elem_ty);
+            // push_type_decl so declared_syms is updated and register_module_sigs
+            // cannot later overwrite this with an opaque stub.
+            self.reg
+                .push_type_decl(&llvm_ty, format!("{} = type {}", llvm_ty, body));
+
+            let mut variants = HashMap::new();
+            variants.insert(
+                "Some".to_string(),
+                EnumVariantLayout {
+                    tag_value: 0,
+                    payload_index: Some(1),
+                    payload_ty: Some(elem_ty.to_string()),
+                },
+            );
+            variants.insert(
+                "None".to_string(),
+                EnumVariantLayout {
+                    tag_value: 1,
+                    payload_index: None,
+                    payload_ty: None,
                 },
             );
             self.reg.enum_layouts.insert(
@@ -572,6 +647,14 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_net_init              ()",
             "declare void @ty_net_shutdown          ()",
             "declare %struct.Network* @ty_net_global()",
+            // Stdlib networking method stubs — implementations are in typhoon-stdlib.ll.
+            // Declared here so the symbol is always visible in the user module IR
+            // without relying on the all_decls → register_module_sigs pipeline, which
+            // can be disrupted by desugar transforming the UnsafeOrExtern nodes.
+            // Void methods (no return value):
+            "declare void @__ty_method__Listener__close  (i8*, %struct.Listener*)",
+            "declare void @__ty_method__Socket__consume  (i8*, %struct.Socket*, i8*)",
+            "declare void @__ty_method__Socket__close    (i8*, %struct.Socket*)",
             // ── print family ──────────────────────────────────────────────────────────
             "declare void @ty_print    (i8* %task, i8* %s)",
             "declare void @ty_println  (i8* %task, i8* %s)",
@@ -629,8 +712,78 @@ impl<'a> IrBuilder<'a> {
             );
         }
 
-        // Networking runtime methods are loaded from typhoon-stdlib.ll (parsed in driver.rs)
-        // Do NOT hardcode here to avoid duplicate declarations
+        // Networking method stubs — value-returning wrappers defined in typhoon-stdlib.ll.
+        // These use result_enum_name() so they can't go in the static array above.
+        // Void stubs are already declared in the static array; only add func_sigs for them.
+        {
+            let res_listener = TypeRegistry::mangle_app_struct_name(
+                &self.result_enum_name(),
+                &["%struct.Listener*".to_string(), "i32".to_string()],
+            );
+            let res_socket = TypeRegistry::mangle_app_struct_name(
+                &self.result_enum_name(),
+                &["%struct.Socket*".to_string(), "i32".to_string()],
+            );
+
+            // Network::listen(self, addr: Str) -> Result<Listener, Int32>
+            let listen_params = vec![
+                "i8*".to_string(),
+                "%struct.Network*".to_string(),
+                "i8*".to_string(),
+            ];
+            let listen_decl = format!(
+                "declare {} @__ty_method__Network__listen({})",
+                res_listener,
+                listen_params.join(", ")
+            );
+            self.reg
+                .push_declare("__ty_method__Network__listen", listen_decl);
+            self.reg.func_sigs.insert(
+                "__ty_method__Network__listen".to_string(),
+                (res_listener, listen_params),
+            );
+
+            // Listener::accept(self) -> Result<Socket, Int32>
+            let accept_params = vec!["i8*".to_string(), "%struct.Listener*".to_string()];
+            let accept_decl = format!(
+                "declare {} @__ty_method__Listener__accept({})",
+                res_socket,
+                accept_params.join(", ")
+            );
+            self.reg
+                .push_declare("__ty_method__Listener__accept", accept_decl);
+            self.reg.func_sigs.insert(
+                "__ty_method__Listener__accept".to_string(),
+                (res_socket, accept_params),
+            );
+
+            // Void method func_sigs (declares already emitted in the static array)
+            self.reg.func_sigs.insert(
+                "__ty_method__Listener__close".to_string(),
+                (
+                    "void".to_string(),
+                    vec!["i8*".to_string(), "%struct.Listener*".to_string()],
+                ),
+            );
+            self.reg.func_sigs.insert(
+                "__ty_method__Socket__consume".to_string(),
+                (
+                    "void".to_string(),
+                    vec![
+                        "i8*".to_string(),
+                        "%struct.Socket*".to_string(),
+                        "i8*".to_string(),
+                    ],
+                ),
+            );
+            self.reg.func_sigs.insert(
+                "__ty_method__Socket__close".to_string(),
+                (
+                    "void".to_string(),
+                    vec!["i8*".to_string(), "%struct.Socket*".to_string()],
+                ),
+            );
+        }
 
         // stdio intrinsics keyed under both source and runtime names
         let stdio: &[(&str, &str, &str, &[&str])] = &[
@@ -768,20 +921,49 @@ impl<'a> IrBuilder<'a> {
                             // Result out-params (e.g. become `%struct.Result`).
                             // Canonicalize known net runtime externs to concrete Result
                             // layouts so declarations always reference defined types.
+                            //
+                            // Two corrections per function:
+                            //   1. The Result type name is concretised to the mangled form.
+                            //   2. A trailing `*` is appended — these are out-param pointers,
+                            //      not by-value structs.  Without the `*` LLVM rejects the
+                            //      call inside the stdlib.ll wrapper which does pass a pointer.
                             if name.name == "__ty_rt__Network__listen" && param_types.len() >= 4 {
-                                param_types[3] = TypeRegistry::mangle_app_struct_name(
-                                    &self.result_enum_name(),
-                                    &["%struct.Listener*".to_string(), "i32".to_string()],
+                                param_types[3] = format!(
+                                    "{}*",
+                                    TypeRegistry::mangle_app_struct_name(
+                                        &self.result_enum_name(),
+                                        &["%struct.Listener*".to_string(), "i32".to_string()],
+                                    )
                                 );
                             } else if name.name == "__ty_rt__Listener__accept"
                                 && param_types.len() >= 3
                             {
-                                param_types[2] = TypeRegistry::mangle_app_struct_name(
-                                    &self.result_enum_name(),
-                                    &["%struct.Socket*".to_string(), "i32".to_string()],
+                                param_types[2] = format!(
+                                    "{}*",
+                                    TypeRegistry::mangle_app_struct_name(
+                                        &self.result_enum_name(),
+                                        &["%struct.Socket*".to_string(), "i32".to_string()],
+                                    )
                                 );
+                            } else if name.name == "__ty_rt__Socket__consume" {
+                                // consume gained a leading `task` parameter (i8*) in the
+                                // runtime so it can call ty_spawn.  If the stdlib.ll being
+                                // parsed pre-dates that change and only has (Socket*, chan),
+                                // patch the signature here so the codegen-emitted declare
+                                // and the actual call site both include task.
+                                if param_types.first().map(|t| t.as_str()) != Some("i8*") {
+                                    param_types.insert(0, "i8*".to_string());
+                                }
                             }
-                            // Emit the LLVM declare (no task prefix for raw FFI)
+                            // __ty_method__ stubs are Typhoon-ABI functions (take task as i8*)
+                            // and must NOT be in extern_fns (which shifts param_offset).
+                            // __ty_rt__ and other C externs use raw C ABI (no task prepend).
+                            let is_method_stub = name.name.starts_with("__ty_method__");
+                            if is_method_stub {
+                                // Prepend task pointer — mirrors what the Function arm does.
+                                param_types.insert(0, "i8*".to_string());
+                            }
+                            // Emit the LLVM declare
                             let decl_line = format!(
                                 "declare {} @{}({})",
                                 ret_ty,
@@ -789,12 +971,12 @@ impl<'a> IrBuilder<'a> {
                                 param_types.join(", ")
                             );
                             self.reg.push_declare(&name.name, decl_line);
-                            // Register so call-sites resolve correctly
-                            // Mark as no-task by NOT prepending i8* here
                             self.reg
                                 .func_sigs
                                 .insert(name.name.clone(), (ret_ty, param_types));
-                            self.reg.extern_fns.insert(name.name.clone());
+                            if !is_method_stub {
+                                self.reg.extern_fns.insert(name.name.clone());
+                            }
                         }
                     }
                 }
@@ -2377,7 +2559,7 @@ impl<'a> IrBuilder<'a> {
 
         // User-defined method
         if let Some(method_sym) = self.method_symbol_for_call(&base_ty, &field.name) {
-            return self.emit_user_method_call(&method_sym, &base_val, &base_ty, args);
+            return self.emit_user_method_call(call_expr, &method_sym, &base_val, &base_ty, args);
         }
 
         "0".to_string()
@@ -2591,18 +2773,23 @@ impl<'a> IrBuilder<'a> {
 
     fn emit_user_method_call(
         &mut self,
+        call_expr: &Expression,
         method_sym: &str,
         base_val: &str,
         base_ty: &str,
         args: &[Expression],
     ) -> String {
         let runtime_name = link_symbol_name(method_sym);
+        // Look up the func_sig registered by register_module_sigs.
+        // For stdlib methods (@__ty_method__) this is populated from the @ty_sig annotation.
+        // Fall back to empty rather than ("i32", []) so missing entries don't silently
+        // produce wrong types — callers use actual_ty / inferred type instead.
         let (ret_ty, param_types) = self
             .reg
             .func_sigs
             .get(method_sym)
             .cloned()
-            .unwrap_or_else(|| ("i32".to_string(), vec![]));
+            .unwrap_or_else(|| ("".to_string(), vec![]));
         let is_extern = self.reg.extern_fns.contains(method_sym);
         let self_ty = if is_extern {
             param_types.get(0)
@@ -2621,10 +2808,13 @@ impl<'a> IrBuilder<'a> {
         for (i, a) in args.iter().enumerate() {
             let v = self.emit_expr(a);
             let actual_ty = self.expr_llvm_type(a);
+            // Use the declared param type when available; fall back to the actual
+            // emitted type rather than a hardcoded "i32" so missing func_sig entries
+            // don't corrupt arg types (e.g. passing a string literal as i32).
             let t = param_types
                 .get(i + param_offset)
                 .cloned()
-                .unwrap_or_else(|| "i32".to_string());
+                .unwrap_or_else(|| actual_ty.clone());
             let v = self.emit_widen(&v, &actual_ty, &t);
             arg_pairs.push(format!("{} {}", t, v));
         }
@@ -2663,10 +2853,21 @@ impl<'a> IrBuilder<'a> {
             ));
             return "0".to_string();
         }
+        // Determine the effective return type: prefer the func_sig declaration, but if
+        // it was absent (empty string fallback) use the call-expression's inferred type.
+        let effective_ret = if ret_ty.is_empty() {
+            self.inferred_expr_type(call_expr)
+                .cloned()
+                .map(|t| self.lower_infer_type(&t))
+                .filter(|t| !t.is_empty() && t != "void")
+                .unwrap_or_else(|| "i32".to_string())
+        } else {
+            ret_ty.clone()
+        };
         self.emit(format!(
             "  {} = call {} @{}({})",
             tmp,
-            ret_ty,
+            effective_ret,
             runtime_name,
             arg_pairs.join(", ")
         ));
@@ -3542,18 +3743,31 @@ impl<'a> IrBuilder<'a> {
                             // The return type is a known enum layout. Reconstruct InferType args
                             // from the layout's variants, converting LLVM types back to source names.
                             let layout = self.reg.enum_layouts.get(&ret_ty_str).cloned().unwrap();
-                            // Find Ok (tag 0) and Err (tag 1) payload types from the layout.
-                            let mut sorted: Vec<_> = layout.variants.values().collect();
-                            sorted.sort_by_key(|v| v.tag_value);
-                            let args: Vec<InferType> = sorted
-                                .iter()
-                                .filter_map(|v| v.payload_ty.as_ref())
-                                .map(|llvm_ty| InferType::Con(Self::llvm_ty_to_infer_name(llvm_ty)))
-                                .collect();
-                            if !args.is_empty() {
+                            // Reconstruct Result<T,E> args in canonical (Ok, Err) order.
+                            let ok_payload = layout.variants.get("Ok").and_then(|v| v.payload_ty.clone());
+                            let err_payload = layout.variants.get("Err").and_then(|v| v.payload_ty.clone());
+                            if let (Some(ok_ty), Some(err_ty)) = (ok_payload, err_payload) {
+                                let args: Vec<InferType> = vec![
+                                    InferType::Con(Self::llvm_ty_to_infer_name(&ok_ty)),
+                                    InferType::Con(Self::llvm_ty_to_infer_name(&err_ty)),
+                                ];
                                 let res = InferType::App(self.reg.result_enum_name(), args);
                                 self.ensure_enum_layout_for_infer(&res);
                                 return Some(res);
+                            } else {
+                                // Fallback: preserve old behaviour (tag-ordered) if Ok/Err names not present.
+                                let mut sorted: Vec<_> = layout.variants.values().collect();
+                                sorted.sort_by_key(|v| v.tag_value);
+                                let args: Vec<InferType> = sorted
+                                    .iter()
+                                    .filter_map(|v| v.payload_ty.as_ref())
+                                    .map(|llvm_ty| InferType::Con(Self::llvm_ty_to_infer_name(llvm_ty)))
+                                    .collect();
+                                if !args.is_empty() {
+                                    let res = InferType::App(self.reg.result_enum_name(), args);
+                                    self.ensure_enum_layout_for_infer(&res);
+                                    return Some(res);
+                                }
                             }
                         }
                     }
@@ -4278,7 +4492,9 @@ mod tests {
             .parse_module()
             .unwrap();
         let mut checker = crate::type_inference::TypeChecker::new();
-        checker.check_module(&module).unwrap();
+        checker
+            .check_module(&module, &std::collections::HashMap::new())
+            .unwrap();
         let mut liveness = crate::liveness::LiveAnalyzer::new();
         let drop_map = liveness
             .analyze_module(&module)
@@ -4309,7 +4525,10 @@ mod tests {
     #[test]
     fn lowers_let_bindings() {
         let text = compile("fn main() -> Int32 { let x: Int32 = 3; return x; }");
-        assert!(text.contains("call i8* @slab_alloc"));
+        assert!(
+            text.contains("alloca i32"),
+            "expected alloca for immutable scalar let"
+        );
         assert!(text.contains("store i32 3"));
         assert!(text.contains("load i32"));
     }

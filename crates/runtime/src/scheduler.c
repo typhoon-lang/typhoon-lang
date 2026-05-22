@@ -19,6 +19,7 @@
 #include "platform.h"
 #include "atomic.h"
 #include "ty_mem.h"
+#include "ty_io_backend.h"
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -721,6 +722,7 @@ static void worker_sched_loop(uint32_t hi, uint32_t lo) {
 
         co = sched_next_coro(w);
         if (!co) {
+            (void)ty_io_poll();
             ty_sleep_ns(1000000);
             continue;
         }

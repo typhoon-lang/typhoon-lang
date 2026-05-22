@@ -18,6 +18,7 @@ endif()
 add_library(runtime STATIC
     src/ty_ctx.S
     src/io_driver.c
+    src/ty_io_backend.c
     src/scheduler.c
     src/ty_mem.c
     src/ty_net.c
@@ -43,6 +44,9 @@ if(BUILD_TESTS)
         test/test_task02_sscan_mutation.c
         test/test_task03_double_close.c
         test/test_task04_overflow.c
+        test/test_phase2_listener_close.c
+        test/test_phase2_accept_write_close.c
+        test/test_phase3_large_sprintf.c
     )
 
     foreach(test_src ${C_TEST_SOURCES})

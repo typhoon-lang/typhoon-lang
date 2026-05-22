@@ -108,14 +108,31 @@ fn parse_llvm_to_namespace_unit(
         }
 
         // %struct.Foo = type { ... } or %struct.Foo = type opaque
-        if let Some(rest) = line.strip_prefix("%struct.") {
-            if let Some(name) = rest.split('=').next().map(|s| s.trim()) {
-                // Strip pointer suffix for type name
-                let name = name.trim_end_matches('*');
-                if !name.is_empty() {
-                    let ty_name = if name == "TyArray" { "Array" } else { name };
-                    let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
-                    push_decl(&ns, make_struct_decl(ty_name, &ns));
+        // Guard: must contain " = type " to distinguish type definitions from
+        // %struct.Foo* appearing inside declare/define parameter lists.
+        if line.starts_with("%struct.") && line.contains(" = type ") {
+            if let Some(rest) = line.strip_prefix("%struct.") {
+                if let Some(name) = rest.split('=').next().map(|s| s.trim()) {
+                    // Strip pointer suffix for type name
+                    let name = name.trim_end_matches('*');
+                    if !name.is_empty() {
+                        let ty_name = if name == "TyArray" { "Array" } else { name };
+                        // If no explicit @ty_ns annotation, infer namespace from name prefix
+                        // for codegen-emitted monomorphisations of stdlib generic types.
+                        // These are defined in the user module IR (not stdlib.ll) so they
+                        // never carry a @ty_ns comment, but must still land in the right
+                        // namespace unit so use-decls like `use std::result::Result` resolve.
+                        let ns = pending_ty_ns.clone().unwrap_or_else(|| {
+                            if ty_name.starts_with("Result__") {
+                                "std::result".to_string()
+                            } else if ty_name.starts_with("Option__") {
+                                "std::option".to_string()
+                            } else {
+                                "std".to_string()
+                            }
+                        });
+                        push_decl(&ns, make_struct_decl(ty_name, &ns));
+                    }
                 }
             }
             pending_ty_ns = None;
@@ -123,15 +140,40 @@ fn parse_llvm_to_namespace_unit(
         }
 
         // %enum.Option<T> = type { Some(T), None } or %enum.Result<T, E> = type { Ok(T), Err(E) }
-        if let Some(rest) = line.strip_prefix("%enum.") {
-            if let Some(lhs) = rest.split('=').next().map(|s| s.trim()) {
-                if let Some(body) = rest.split('{').nth(1).and_then(|s| s.split('}').next()) {
+        // Also handles opaque sentinels: %enum.Option = type opaque
+        if line.starts_with("%enum.") && line.contains(" = type ") {
+            if let Some(rest) = line.strip_prefix("%enum.") {
+                if let Some(lhs) = rest.split('=').next().map(|s| s.trim()) {
                     let (enum_name, generics) = if let Some(i) = lhs.find('<') {
                         (&lhs[..i], Some(&lhs[i..]))
                     } else {
                         (lhs, None)
                     };
                     let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
+                    // Use the body if present.  For opaque types the LLVM line has no { },
+                    // so we fall back to the canonical variant list for known stdlib enums.
+                    // This ensures Ok/Err/Some/None are registered in the decl map even
+                    // though %enum.Result / %enum.Option can only be defined once in IR
+                    // (as opaque) and cannot carry a body there.
+                    let body_from_line = rest.split('{').nth(1).and_then(|s| s.split('}').next());
+                    let canonical_body: &str = match enum_name {
+                        "Option" => "Some(T), None",
+                        "Result" => "Ok(T), Err(E)",
+                        _ => "",
+                    };
+                    let body = body_from_line.unwrap_or(canonical_body);
+                    let canonical_generics: &str = match enum_name {
+                        "Option" => "<T>",
+                        "Result" => "<T, E>",
+                        _ => "",
+                    };
+                    let generics = generics.or_else(|| {
+                        if canonical_generics.is_empty() {
+                            None
+                        } else {
+                            Some(canonical_generics)
+                        }
+                    });
                     push_decl(&ns, make_enum_decl(enum_name, generics, body));
                 }
             }
@@ -207,52 +249,45 @@ fn parse_llvm_to_namespace_unit(
         }
     }
 
-    // Generate impl blocks for methods grouped by type
+    // Generate extern declarations for stdlib methods grouped by type.
+    // Using UnsafeOrExtern (not Function + Impl) means:
+    //   - desugar never injects a synthetic return statement into the body
+    //   - register_module_sigs routes them through the push_declare path, so
+    //     a `declare` line is always emitted into the preamble regardless of
+    //     return type
+    //   - lower_module's filter_map skips them (UnsafeOrExtern, not Function)
+    //     so no empty define block shadows the stdlib.ll implementation
     for (qualified_type, methods) in &method_sigs {
         let Some((ns, type_name)) = qualified_type.rsplit_once("::") else {
             continue;
         };
-        let impl_methods: Vec<Declaration> = methods
-            .iter()
-            .map(|sig| Declaration {
-                node: DeclarationKind::Function {
-                    name: sig.name.clone(),
-                    generics: sig.generics.clone(),
-                    params: sig.params.clone(),
-                    return_type: sig.return_type.clone(),
-                    body: Block {
-                        statements: vec![],
-                        trailing_expression: None,
-                        span: Span::default(),
-                        block_id: NodeId(0),
+        for sig in methods {
+            // Build the mangled __ty_method__ name that codegen will call.
+            // self is prepended as the first explicit param; task (i8*) is
+            // prepended by register_module_sigs when it builds the LLVM declare.
+            let mangled = format!("__ty_method__{}__{}", type_name, sig.name.name);
+            let self_param = Parameter {
+                name: Identifier {
+                    name: "self".to_string(),
+                    span: Span::default(),
+                },
+                type_annotation: Type {
+                    node: TypeKind {
+                        name: type_name.to_string(),
+                        generic_args: vec![],
                     },
+                    span: Span::default(),
+                    id: NodeId(0),
                 },
                 span: Span::default(),
-                id: NodeId(0),
-            })
-            .collect();
-
-        push_decl(
-            ns,
-            Declaration {
-                node: DeclarationKind::Impl {
-                    trait_name: TypeKind {
-                        name: type_name.to_string(),
-                        generic_args: vec![],
-                    }
-                    .to_spanned(),
-                    type_name: TypeKind {
-                        name: type_name.to_string(),
-                        generic_args: vec![],
-                    }
-                    .to_spanned(),
-                    generics: vec![],
-                    methods: impl_methods,
-                },
-                span: Span::default(),
-                id: NodeId(0),
-            },
-        );
+            };
+            let mut params = vec![self_param];
+            params.extend(sig.params.clone());
+            push_decl(
+                ns,
+                make_extern_fn_decl(mangled, (params, sig.return_type.clone()), ns),
+            );
+        }
     }
 
     Ok(units)
@@ -1090,7 +1125,9 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
     }
 }
 
-pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
+pub fn compile_project(
+    path: &Path,
+) -> Result<(Module, HashMap<String, crate::resolver::DeclInfo>), Vec<String>> {
     let mut files = collect_ty_files(path).map_err(|e| vec![e])?;
     files.sort();
     files.dedup();
@@ -1299,11 +1336,14 @@ pub fn compile_project(path: &Path) -> Result<Module, Vec<String>> {
         }
     }
 
-    Ok(Module {
-        name: Some(entry_ns),
-        declarations: all_decls,
-        span: Span::default(),
-    })
+    Ok((
+        Module {
+            name: Some(entry_ns),
+            declarations: all_decls,
+            span: Span::default(),
+        },
+        global_symbols,
+    ))
 }
 
 fn ll_type_to_ty(ll: &str) -> &str {

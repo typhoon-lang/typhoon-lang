@@ -12,7 +12,7 @@ pub fn compile(input: &str, output: &str) {
 }
 
 pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
-    let module = match compile_project(Path::new(input)) {
+    let (module, imports) = match compile_project(Path::new(input)) {
         Ok(m) => m,
         Err(errs) => {
             for e in errs {
@@ -23,7 +23,7 @@ pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
     };
 
     let mut checker = TypeChecker::new();
-    if let Err(err) = checker.check_module(&module) {
+    if let Err(err) = checker.check_module(&module, &imports) {
         eprintln!("Type error: {:?}", err);
         std::process::exit(1);
     }

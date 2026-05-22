@@ -15,7 +15,7 @@
  *                 %f %lf %g %e %x %X %o %b %%
  *                 Width/precision: %5d %.3f %-10s %05d
  *
- * No malloc — all heap via SlabArena. Stack buffers for formatting.
+ * No malloc — all heap via SlabArena.
  */
 
 #include <stdint.h>
@@ -210,36 +210,62 @@ static int64_t io_do_read(int fd, char* buf, size_t len) {
  * ════════════════════════════════════════════════════════════════════════════
  */
 
-/* ── stack Buf (no arena needed for ephemeral output)
- * ─────────────────────────
- */
-
-#define STACK_BUF_CAP 4096
-
 typedef struct {
-    char   data[STACK_BUF_CAP];
+    SlabArena* arena;
+    char*  data;
     size_t len;
-    int    overflow;   /* if 1, data was truncated */
-} StackBuf;
+    size_t cap;
+    int    overflow;   /* if 1, growth failed (arena OOM) */
+} SlabBuf;
 
-static void sbuf_init(StackBuf* b) { b->len = 0; b->overflow = 0; }
-
-static void sbuf_push(StackBuf* b, const char* s, size_t n) {
-    if (b->overflow) return;
-    if (b->len + n >= STACK_BUF_CAP) {
-        n = STACK_BUF_CAP - b->len - 1;
-        b->overflow = 1;
+static void sbuf_init(SlabBuf* b, SlabArena* arena) {
+    b->arena = arena;
+    b->len = 0;
+    b->cap = 256;
+    b->overflow = 0;
+    b->data = NULL;
+    if (arena) {
+        int32_t cls = size_to_class(b->cap);
+        b->data = (char*)slab_alloc(arena, cls);
     }
+    if (!b->data) {
+        b->overflow = 1;
+        return;
+    }
+    b->data[0] = '\0';
+}
+
+static int sbuf_ensure(SlabBuf* b, size_t needed) {
+    if (b->overflow) return 0;
+    if (needed <= b->cap) return 1;
+    size_t next = b->cap;
+    while (next < needed) next *= 2;
+    int32_t cls = size_to_class(next);
+    char* n = (char*)slab_alloc(b->arena, cls);
+    if (!n) {
+        b->overflow = 1;
+        return 0;
+    }
+    if (b->data && b->len) memcpy(n, b->data, b->len);
+    n[b->len] = '\0';
+    b->data = n;
+    b->cap = next;
+    return 1;
+}
+
+static void sbuf_push(SlabBuf* b, const char* s, size_t n) {
+    if (b->overflow) return;
+    if (!sbuf_ensure(b, b->len + n + 1)) return;
     memcpy(b->data + b->len, s, n);
     b->len += n;
     b->data[b->len] = '\0';
 }
 
-static void sbuf_push_char(StackBuf* b, char c) {
+static void sbuf_push_char(SlabBuf* b, char c) {
     sbuf_push(b, &c, 1);
 }
 
-static void sbuf_push_str(StackBuf* b, const char* s) {
+static void sbuf_push_str(SlabBuf* b, const char* s) {
     if (!s) s = "(null)";
     sbuf_push(b, s, strlen(s));
 }
@@ -305,7 +331,7 @@ static size_t fmt_double(char* out, double v, int prec, char spec) {
  * ───────────────────────────────────────────────────────────
  */
 
-static void sbuf_pad(StackBuf* b, int width, size_t used, int left, char padch) {
+static void sbuf_pad(SlabBuf* b, int width, size_t used, int left, char padch) {
     if (width <= 0 || (int)used >= width) return;
     int pad = width - (int)used;
     if (left) {
@@ -316,11 +342,11 @@ static void sbuf_pad(StackBuf* b, int width, size_t used, int left, char padch) 
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  Core vprintf — writes formatted output into a StackBuf
+ *  Core vprintf — writes formatted output into a SlabBuf
  * ════════════════════════════════════════════════════════════════════════════
  */
 
-static void ty_vformat(StackBuf* out, const char* fmt, va_list ap) {
+static void ty_vformat(SlabBuf* out, const char* fmt, va_list ap) {
     const char* p = fmt;
     while (*p) {
         if (*p != '%') { sbuf_push_char(out, *p++); continue; }
@@ -555,7 +581,7 @@ void ty_println(SlabArena* arena, char* s) {
 /* ── ty_printf
  * ───────────────────────────────────────────────────────────────── */
 
-static void ty_format_fixed(StackBuf* out, const char* fmt, uint64_t* args, int n_args) {
+static void ty_format_fixed(SlabBuf* out, const char* fmt, uint64_t* args, int n_args) {
     const char* p = fmt;
     int arg_idx = 0;
     while (*p) {
@@ -609,13 +635,11 @@ static void ty_format_fixed(StackBuf* out, const char* fmt, uint64_t* args, int 
 }
 
 int ty_printf(SlabArena* arena, char* fmt, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
-    (void)arena;
-    StackBuf buf;
-    sbuf_init(&buf);
+    SlabBuf buf;
+    sbuf_init(&buf, arena);
     uint64_t args[4] = { a1, a2, a3, a4 };
     ty_format_fixed(&buf, fmt, args, 4);
-    /* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
-    if (buf.overflow) return -1; /* signal truncation to caller */
+    if (buf.overflow) return -1;
     io_do_write(TY_STDOUT_FD, buf.data, buf.len);
     return (int)buf.len;
 }
@@ -623,12 +647,10 @@ int ty_printf(SlabArena* arena, char* fmt, uint64_t a1, uint64_t a2, uint64_t a3
 /* ── ty_fprint / ty_fprintln / ty_fprintf
  * ────────────────────────────────────── */
 
-/* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
 int ty_fprint(SlabArena* arena, int fd, char* s) {
     (void)arena;
     if (!s) s = "";
     size_t len = strlen(s);
-    if (len >= STACK_BUF_CAP) return -1; /* output would be truncated */
     io_do_write(fd, s, len);
     return (int)len;
 }
@@ -641,15 +663,13 @@ int ty_fprintln(SlabArena* arena, int fd, char* s) {
 }
 
 int ty_fprintf(SlabArena* arena, int fd, char* fmt, ...) {
-    (void)arena;
-    StackBuf buf;
-    sbuf_init(&buf);
+    SlabBuf buf;
+    sbuf_init(&buf, arena);
     va_list ap;
     va_start(ap, fmt);
     ty_vformat(&buf, fmt, ap);
     va_end(ap);
-    /* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
-    if (buf.overflow) return -1; /* signal truncation to caller */
+    if (buf.overflow) return -1;
     io_do_write(fd, buf.data, buf.len);
     return (int)buf.len;
 }
@@ -676,12 +696,11 @@ void ty_sprintln(SlabArena* arena, Buf* out, char* s) {
 /* ════════════════════════════════════════════════════════════════════════════
  * TASK 0.4 — ty_sprintf overflow
  *
- * ty_sprintf currently formats into a StackBuf and then pushes the result
- * into the caller's Buf with ty_buf_push_str.  If the formatted string
- * exceeds STACK_BUF_CAP (4096 bytes), it is silently truncated.
+ * ty_sprintf currently formats into a SlabBuf and then pushes the result
+ * into the caller's Buf with ty_buf_push_str.
  *
- * Fix: check buf.overflow after ty_vformat and return without pushing
- * the truncated data.  The return type changes from void to int so the
+ * Fix: check buf.overflow after ty_vformat and return without pushing.
+ * The return type changes from void to int so the
  * caller can detect truncation via the `?` operator.
  *
  * The LLVM IR declaration must be updated to match:
@@ -695,16 +714,15 @@ void ty_sprintln(SlabArena* arena, Buf* out, char* s) {
  * (it just appends "\n").  It is left as void.
  * ════════════════════════════════════════════════════════════════════════════ */
 
-/* StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3. */
 int ty_sprintf(SlabArena* arena, Buf* out, char* fmt, ...) {
     if (!out) return -1;
-    StackBuf tmp;
-    sbuf_init(&tmp);
+    SlabBuf tmp;
+    sbuf_init(&tmp, arena);
     va_list ap;
     va_start(ap, fmt);
     ty_vformat(&tmp, fmt, ap);
     va_end(ap);
-    if (tmp.overflow) return -1;  /* signal truncation — do NOT push partial data */
+    if (tmp.overflow) return -1;
     ty_buf_push_str(arena, out, tmp.data);
     return (int)tmp.len;
 }

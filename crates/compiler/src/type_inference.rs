@@ -288,8 +288,13 @@ impl TypeChecker {
         );
     }
 
-    pub fn check_module(&mut self, module: &Module) -> Result<(), TypeError> {
+    pub fn check_module(
+        &mut self,
+        module: &Module,
+        imports: &std::collections::HashMap<String, crate::resolver::DeclInfo>,
+    ) -> Result<(), TypeError> {
         self.reset();
+        self.seed_from_imports(imports);
         self.collect_type_info(module)?;
         self.predeclare_functions(module)?;
         for decl in &module.declarations {
@@ -542,6 +547,93 @@ impl TypeChecker {
             }
         }
         Ok(())
+    }
+
+    pub fn seed_from_imports(
+        &mut self,
+        imports: &std::collections::HashMap<String, crate::resolver::DeclInfo>,
+    ) {
+        use crate::resolver::DeclInfo;
+        for (name, info) in imports {
+            if let DeclInfo::Enum { variants } = info {
+                let variant_names: Vec<&str> = variants.keys().map(|s| s.as_str()).collect();
+                let is_option = variant_names.contains(&"Some") && variant_names.contains(&"None");
+                let is_result = variant_names.contains(&"Ok") && variant_names.contains(&"Err");
+                if is_option && self.registry.option_type_name.is_none() {
+                    self.registry.option_type_name = Some(name.clone());
+                }
+                if is_result && self.registry.result_type_name.is_none() {
+                    self.registry.result_type_name = Some(name.clone());
+                }
+                // Register variant constructors so Ok(x), Err(e), Some(x), None work in user code.
+                let enum_ty = InferType::App(
+                    name.clone(),
+                    vec![self.solver.fresh_var(), self.solver.fresh_var()],
+                );
+                let enum_ty_1 = InferType::App(name.clone(), vec![self.solver.fresh_var()]);
+                for (vname, vinfo) in variants {
+                    if self.lookup(vname).is_some() {
+                        continue; // already seeded (e.g. from a previous module)
+                    }
+                    let (the_enum_ty, payload_ty) = match vname.as_str() {
+                        // Result variants carry two generic params
+                        "Ok" | "Err" => {
+                            let inner = self.solver.fresh_var();
+                            (enum_ty.clone(), Some(inner))
+                        }
+                        // Option variants carry one generic param
+                        "Some" => {
+                            let inner = self.solver.fresh_var();
+                            (enum_ty_1.clone(), Some(inner))
+                        }
+                        "None" => (enum_ty_1.clone(), None),
+                        _ => {
+                            // Generic fallback: use payload presence from DeclInfo
+                            let has_payload = vinfo.payload.is_some();
+                            let inner = if has_payload {
+                                Some(self.solver.fresh_var())
+                            } else {
+                                None
+                            };
+                            (InferType::Con(name.clone()), inner)
+                        }
+                    };
+                    let ordered_vars: Vec<TypeVarId> = match &the_enum_ty {
+                        InferType::App(_, args) => args
+                            .iter()
+                            .filter_map(|a| {
+                                if let InferType::Var(id) = a {
+                                    Some(*id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => vec![],
+                    };
+                    self.registry.enum_variants.insert(
+                        vname.clone(),
+                        (name.clone(), ordered_vars.clone(), payload_ty.clone()),
+                    );
+                    match payload_ty {
+                        Some(inner) => self.set_global(
+                            vname.clone(),
+                            Scheme {
+                                vars: ordered_vars,
+                                ty: InferType::Fn(vec![inner], Box::new(the_enum_ty)),
+                            },
+                        ),
+                        None => self.set_global(
+                            vname.clone(),
+                            Scheme {
+                                vars: ordered_vars,
+                                ty: the_enum_ty,
+                            },
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_global(&mut self, name: String, scheme: Scheme) {
@@ -1321,6 +1413,42 @@ impl TypeChecker {
         let callee = self.instantiate(&scheme);
         let full_args = match self.solver.apply(&callee) {
             InferType::Fn(params, _) if params.len() == arg_tys.len() => arg_tys,
+            InferType::Fn(params, _) if params.len() == arg_tys.len() + 1 => {
+                let mut args = vec![base_ty];
+                args.extend(arg_tys);
+                args
+            }
+            InferType::Fn(params, _) if params.len() == arg_tys.len() + 2 => {
+                if matches!(params.first(), Some(InferType::Con(name)) if name == "Str") {
+                    let mut args = vec![InferType::Con("Str".into()), base_ty];
+                    args.extend(arg_tys);
+                    args
+                } else {
+                    let mut args = vec![base_ty];
+                    args.extend(arg_tys);
+                    args
+                }
+            }
+            InferType::Fn(params, _) if params.len() > arg_tys.len() + 2 => {
+                // More params than user-supplied args + self + task.
+                // This happens for value-returning stdlib wrappers that carry an
+                // internal out-param in their LLVM func_sig (e.g. Network::listen
+                // has task, self, addr, out* — but the call site only supplies addr).
+                // Prepend task (Str) and self, then pad the remainder with fresh vars
+                // so unification can still check the user-visible arguments.
+                let mut args = if matches!(params.first(), Some(InferType::Con(name)) if name == "Str")
+                {
+                    vec![InferType::Con("Str".into()), base_ty]
+                } else {
+                    vec![base_ty]
+                };
+                args.extend(arg_tys);
+                // Pad to the expected arity with fresh vars for the hidden out-params.
+                while args.len() < params.len() {
+                    args.push(self.solver.fresh_var());
+                }
+                args
+            }
             _ => {
                 let mut args = vec![base_ty];
                 args.extend(arg_tys);

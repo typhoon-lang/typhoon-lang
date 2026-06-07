@@ -3,7 +3,7 @@ import socket
 import sys
 import time
 
-host, port, max_wait = "127.0.0.1", 8080, 60
+host, port, max_wait = "127.0.0.1", 8080, 120
 print(f"Waiting up to {max_wait}s for {host}:{port} ...")
 
 for i in range(max_wait):

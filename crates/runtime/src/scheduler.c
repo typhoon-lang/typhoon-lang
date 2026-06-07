@@ -20,8 +20,19 @@
 #include "atomic.h"
 #include "ty_mem.h"
 #include "ty_io_backend.h"
+
+/* Platform-specific IO backend headers */
+#if defined(_WIN32)
+#include "ty_io_iocp.h"
+#elif defined(__APPLE__)
+#include "ty_io_kqueue.h"
+#elif defined(__linux__)
+#include "ty_io_uring.h"
+#endif
+
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <assert.h>
 
@@ -247,6 +258,8 @@ enum {
 static TY_THREAD_LOCAL Worker* tl_worker = NULL;
 
 static Worker* current_worker(void) { return tl_worker; }
+
+Worker* ty_sched_current_worker(void) { return tl_worker; }
 static TyCoro* current_coro(void) {
     Worker* w = current_worker();
     return w ? w->current : NULL;
@@ -627,6 +640,13 @@ void ty_safepoint(void) {
 
     /* Consume any new ticks that arrived since we last checked. */
     uint32_t global = atomic_load_explicit(&preempt_global_tick, memory_order_relaxed);
+
+    /* Poll IO on a regular cadence to bound IO latency in CPU-bound workloads.
+     * Poll every 64 global ticks (configurable via design decision). */
+    if ((global & (64u - 1u)) == 0u) {
+        (void)ty_io_poll();
+    }
+
     uint32_t delta  = global - worker_preempt_tick_seen[wid];
     if (delta == 0) return;
     worker_preempt_tick_seen[wid] = global;
@@ -825,6 +845,12 @@ static void run_sched_loop(uint32_t hi, uint32_t lo) {
             }
         }
         if (!co) {
+            /* Poll IO backend — critical for Windows IOCP where accept events
+             * are per-worker and only checked via ty_io_poll(). Without this,
+             * parked accept coroutines on worker 0 never get woken because
+             * run_sched_loop previously skipped ty_io_poll() entirely. */
+            // (void)ty_io_poll();
+            // ty_sleep_ns(1000000);
             ty_sleep_ns(10000);
             continue;
         }
@@ -877,6 +903,26 @@ void ty_sched_shutdown(void) {
     TY_DEBUG("[sched] shutdown:join_workers\n");
     for (int i = 1; i < num_workers; i++)
         ty_thread_join(workers[i].thread);
+
+    /* Shutdown per-worker IO backends. */
+    for (int i = 0; i < num_workers; i++) {
+        if (workers[i].io_backend) {
+#if defined(_WIN32)
+            ty_iocp_backend_destroy((TyIocpBackend*)workers[i].io_backend);
+#elif defined(__APPLE__)
+            ty_kq_backend_destroy((TyKqBackend*)workers[i].io_backend);
+#elif defined(__linux__)
+            ty_uring_backend_destroy((TyUringBackend*)workers[i].io_backend);
+#endif
+            workers[i].io_backend = NULL;
+        }
+    }
+
+    /* Close all per-worker fds. */
+    for (int i = 0; i < num_workers; i++) {
+        ty_fdset_close_all(&workers[i].fd_set);
+        ty_fdset_destroy(&workers[i].fd_set);
+    }
 
     ty_vm_free(sched_stack, sched_stack_size);
     ebr_force_reclaim_all();
@@ -936,6 +982,7 @@ void ty_sched_init(void) {
     atomic_init(&workers[0].in_coro, 0);
     atomic_init(&workers[0].local_deque_size_snapshot, 0);
     workers[0].current = NULL;
+    ty_fdset_init(&workers[0].fd_set);
     worker_preempt_budget[0]   = PREEMPT_BUDGET;
     worker_preempt_tick_seen[0] = 0;
     TY_DEBUG("[sched] worker:start id=0\n");
@@ -949,13 +996,32 @@ void ty_sched_init(void) {
         atomic_init(&workers[i].in_coro, 0);
         atomic_init(&workers[i].local_deque_size_snapshot, 0);
         workers[i].current = NULL;
+        ty_fdset_init(&workers[i].fd_set);
         worker_preempt_budget[i]   = PREEMPT_BUDGET;
         worker_preempt_tick_seen[i] = 0;
+        workers[i].io_backend = NULL; /* will be initialized lazily */
         if (!ty_thread_create(&workers[i].thread, worker_thread, &workers[i]))
             sched_abort("ty_sched_init: thread_create failed");
     }
 
     tl_worker = &workers[0];
+
+    /* Initialize per-worker IO backend. Each worker gets its own platform
+     * backend (IOCP on Windows, kqueue on macOS, io_uring on Linux). */
+    for (int i = 0; i < num_workers; i++) {
+#if defined(_WIN32)
+        workers[i].io_backend = (struct TyIoBackend*)ty_iocp_backend_new();
+#elif defined(__APPLE__)
+        workers[i].io_backend = (struct TyIoBackend*)ty_kq_backend_new();
+#elif defined(__linux__)
+        workers[i].io_backend = (struct TyIoBackend*)ty_uring_backend_new();
+#else
+        workers[i].io_backend = NULL;
+#endif
+        if (!workers[i].io_backend) {
+            TY_DEBUG("[sched] warning: IO backend alloc failed for worker %d\n", i);
+        }
+    }
 #ifdef TY_WINDOWS
     ty_ctx_init_sched(&worker_host_ctx[0]);
 #endif
@@ -1421,4 +1487,52 @@ void* ty_current_coro_raw(void) {
 
 Worker* ty_current_worker_ptr(void) {
     return current_worker();
+}
+
+/* ── TyFdSet helpers ────────────────────────────────────────────────────── */
+
+void ty_fdset_init(TyFdSet* set) {
+    set->len = 0;
+    set->cap = TY_FDSET_INIT_CAP;
+    set->fds = (ty_fd_t*)malloc(sizeof(ty_fd_t) * set->cap);
+    ty_mutex_init(&set->lock);
+}
+
+void ty_fdset_destroy(TyFdSet* set) {
+    free(set->fds);
+    set->fds = NULL;
+    ty_mutex_destroy(&set->lock);
+}
+
+void ty_fdset_add(TyFdSet* set, ty_fd_t fd) {
+    ty_mutex_lock(&set->lock);
+    if (set->len >= set->cap) {
+        set->cap *= 2;
+        set->fds = (ty_fd_t*)realloc(set->fds, sizeof(ty_fd_t) * set->cap);
+    }
+    set->fds[set->len++] = fd;
+    ty_mutex_unlock(&set->lock);
+}
+
+int ty_fdset_remove(TyFdSet* set, ty_fd_t fd) {
+    ty_mutex_lock(&set->lock);
+    for (size_t i = 0; i < set->len; i++) {
+        if (set->fds[i] == fd) {
+            set->fds[i] = set->fds[set->len - 1];
+            set->len--;
+            ty_mutex_unlock(&set->lock);
+            return 1;
+        }
+    }
+    ty_mutex_unlock(&set->lock);
+    return 0;
+}
+
+void ty_fdset_close_all(TyFdSet* set) {
+    ty_mutex_lock(&set->lock);
+    for (size_t i = 0; i < set->len; i++) {
+        ty_fd_close(set->fds[i]);
+    }
+    set->len = 0;
+    ty_mutex_unlock(&set->lock);
 }

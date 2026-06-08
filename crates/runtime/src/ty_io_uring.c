@@ -5,9 +5,9 @@
  * submit() fills an SQE, sets user_data = op, and calls io_uring_enter.
  * poll() peeks CQEs in a loop and calls wake(coro, result) for each.
  *
- * ACCEPT: uses readiness-based approach.  submit() registers the
- * listener fd for EVFILT_READ (via io_uring poll), and poll() calls
- * accept() when the completion fires.  This avoids the complexity of
+ * ACCEPT: uses readiness-based approach. submit() registers the
+ * listener fd for readability via IORING_OP_POLL_ADD, and poll() calls
+ * accept() when the completion fires. This avoids the complexity of
  * IORING_OP_ACCEPT which requires pre-allocated socket fds.
  */
 
@@ -70,24 +70,24 @@ static int uring_submit_op(TyIoBackend* base, const TyIoOp* op) {
     struct io_uring_sqe* sqe = &((struct io_uring_sqe*)b->sqes)[idx];
     memset(sqe, 0, sizeof(*sqe));
 
-    if (op->type == TY_IO_OP_READ) {
-        sqe->opcode = IORING_OP_READV;
-    } else if (op->type == TY_IO_OP_WRITE) {
-        sqe->opcode = IORING_OP_WRITEV;
-    } else if (op->type == TY_IO_OP_ACCEPT) {
+    if (op->type == TY_IO_OP_ACCEPT) {
         /* Use IORING_OP_POLL_ADD with POLLIN to detect when the
-         * listener socket has a pending connection.  When the
-         * completion fires, poll() calls accept() to get the fd. */
+         * listener socket has a pending connection. When the
+         * completion fires, poll() calls accept() to get the fd.
+         *
+         * POLL_ADD uses sqe->fd for the target fd and sqe->len
+         * for the poll mask; sqe->addr is unused. */
         sqe->opcode = IORING_OP_POLL_ADD;
-        sqe->addr = (uint64_t)(uintptr_t)op->fd;
+        sqe->fd = (int)op->fd;
         sqe->len = POLLIN;
     } else {
-        return -1;
-    }
-
-    /* sqe->fd is __s32; ty_fd_t is int on Linux, so cast is safe.
-     * For POLL_ADD, fd goes in the addr field above, not here. */
-    if (op->type != TY_IO_OP_ACCEPT) {
+        if (op->type == TY_IO_OP_READ) {
+            sqe->opcode = IORING_OP_READV;
+        } else if (op->type == TY_IO_OP_WRITE) {
+            sqe->opcode = IORING_OP_WRITEV;
+        } else {
+            return -1;
+        }
         sqe->fd = (int)op->fd;
         sqe->addr = (uint64_t)(uintptr_t)op->buf;
         sqe->len = (uint32_t)op->len;
@@ -136,13 +136,40 @@ static int uring_poll_op(TyIoBackend* base, TySchedWakeFn wake) {
             int64_t result;
 
             if (op->type == TY_IO_OP_ACCEPT) {
-                /* POLL_ADD completion — the listener is readable.
-                 * Call accept() to get the new client fd. */
+                /* POLL_ADD completion — the listener may be readable.
+                 * Call accept() to get the new client fd.
+                 * Spurious readiness is possible: POLL_ADD can fire
+                 * even when no connection is pending.  If accept()
+                 * returns EAGAIN, re-submit POLL_ADD and do NOT wake
+                 * the coroutine — it stays parked until a real
+                 * connection arrives. */
                 if (res >= 0) {
                     int c = accept((int)op->fd, NULL, NULL);
+                    if (c < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        /* Spurious POLL_ADD — re-register and skip wake. */
+                        struct io_uring_sqe* rsqe;
+                        uint32_t* sq_tail_ptr2 = (uint32_t*)((uint8_t*)b->sq_ring + b->sq_tail_off);
+                        uint32_t* sq_array2 = (uint32_t*)((uint8_t*)b->sq_ring + b->sq_array_off);
+                        uint32_t tail2 = *sq_tail_ptr2;
+                        uint32_t idx2 = tail2 & b->sq_mask;
+                        rsqe = &((struct io_uring_sqe*)b->sqes)[idx2];
+                        memset(rsqe, 0, sizeof(*rsqe));
+                        rsqe->opcode = IORING_OP_POLL_ADD;
+                        rsqe->fd = (int)op->fd;
+                        rsqe->len = POLLIN;
+                        rsqe->user_data = (uint64_t)(uintptr_t)op;
+                        sq_array2[idx2] = idx2;
+                        __sync_synchronize();
+                        *sq_tail_ptr2 = tail2 + 1;
+                        __sync_synchronize();
+                        uring_enter(b->ring_fd, 1, 0, 0);
+                        continue; /* skip wake — coro stays parked */
+                    }
                     result = (c < 0) ? -(int64_t)errno : (int64_t)c;
                 } else {
-                    /* POLL_ADD itself failed */
+                    /* POLL_ADD itself failed — propagate the error
+                     * so the accept loop in ty_net.c can handle it
+                     * (e.g. retry on EINVAL from old kernels). */
                     result = (int64_t)res;
                 }
             } else if (res < 0) {

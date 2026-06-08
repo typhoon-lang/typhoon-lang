@@ -63,9 +63,14 @@ static int64_t io_sys_write(int fd, const char* buf, size_t len);
 
 static int64_t io_sys_write(int fd, const char* buf, size_t len) {
     if (fd == 1 || fd == 2) {
-        /* stdout/stderr — use WriteConsoleA for proper console output */
+        /* stdout/stderr: console uses WriteConsoleA, redirected handles use CRT. */
         HANDLE h = (fd == 1) ? GetStdHandle(STD_OUTPUT_HANDLE) : GetStdHandle(STD_ERROR_HANDLE);
         if (h == INVALID_HANDLE_VALUE) return -1;
+        DWORD mode = 0;
+        if (!GetConsoleMode(h, &mode)) {
+            int n = _write(fd, buf, (unsigned int)len);
+            return (int64_t)n;
+        }
         DWORD written = 0;
         BOOL ok = WriteConsoleA(h, buf, (DWORD)len, &written, NULL);
         return ok ? (int64_t)written : -1;
@@ -84,9 +89,14 @@ static int64_t io_sys_write(int fd, const char* buf, size_t len) {
 
 static int64_t io_sys_read(int fd, char* buf, size_t len) {
     if (fd == 0) {
-        /* stdin — use ReadConsoleA for console input */
+        /* stdin: console uses ReadConsoleA, redirected handles use CRT. */
         HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
         if (h == INVALID_HANDLE_VALUE) return -1;
+        DWORD mode = 0;
+        if (!GetConsoleMode(h, &mode)) {
+            int n = _read(fd, buf, (unsigned int)len);
+            return (int64_t)n;
+        }
         DWORD got = 0;
         BOOL ok = ReadConsoleA(h, buf, (DWORD)len, &got, NULL);
         return ok ? (int64_t)got : -1;

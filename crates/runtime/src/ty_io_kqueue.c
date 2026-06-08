@@ -103,8 +103,22 @@ static int kq_poll(TyIoBackend* base, TySchedWakeFn wake) {
             ssize_t w = write((int)op->fd, op->buf, op->len);
             result = (w < 0) ? -(int64_t)errno : (int64_t)w;
         } else if (op->type == TY_IO_OP_ACCEPT) {
-            /* Listener is readable — call accept() to get the new fd. */
+            /* Listener may be readable — call accept() to get the new fd.
+             * Spurious EVFILT_READ is possible (e.g. listen backlog
+             * signal).  If accept() returns EAGAIN, re-register the
+             * kevent and do NOT wake the coroutine. */
             int c = accept((int)op->fd, NULL, NULL);
+            if (c < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                /* Spurious wake — re-arm EVFILT_READ and skip wake. */
+                struct kevent64_s re_ev;
+                memset(&re_ev, 0, sizeof(re_ev));
+                re_ev.ident = (uint64_t)op->fd;
+                re_ev.filter = EVFILT_READ;
+                re_ev.flags = EV_ADD | EV_ENABLE | EV_ONESHOT;
+                re_ev.udata = (uint64_t)(uintptr_t)req;
+                kevent64(b->kq, &re_ev, 1, NULL, 0, 0, NULL);
+                continue; /* skip wake + pool_free — req stays alive */
+            }
             result = (c < 0) ? -(int64_t)errno : (int64_t)c;
         } else {
             /* TY_IO_OP_READ */

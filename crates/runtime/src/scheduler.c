@@ -807,6 +807,7 @@ static void shutdown_sched_loop(uint32_t hi, uint32_t lo) {
                     atomic_load_explicit(&active_coros, memory_order_relaxed),
                     (long)atomic_load_explicit(&w->local_deque_size_snapshot, memory_order_relaxed));
             }
+            (void)ty_io_poll();
             ty_sleep_ns(10000);
             continue;
         }
@@ -849,8 +850,7 @@ static void run_sched_loop(uint32_t hi, uint32_t lo) {
              * are per-worker and only checked via ty_io_poll(). Without this,
              * parked accept coroutines on worker 0 never get woken because
              * run_sched_loop previously skipped ty_io_poll() entirely. */
-            // (void)ty_io_poll();
-            // ty_sleep_ns(1000000);
+            (void)ty_io_poll();
             ty_sleep_ns(10000);
             continue;
         }
@@ -1455,18 +1455,24 @@ void ty_coro_block_and_yield(void) {
             (int)atomic_load_explicit(&me->state, memory_order_relaxed),
             atomic_load_explicit(&active_coros, memory_order_relaxed));
     }
-    // Only set state if not already BLOCKED (pre-set by ty_coro_set_blocked)
+    // Only set state if not already BLOCKED (pre-set by ty_coro_set_blocked).
+    // If an immediate IO completion already woke the coro, yield so the queued
+    // wake resumes it through the normal RUNNABLE -> RUNNING transition.
     CoroState cur = atomic_load_explicit(&me->state, memory_order_acquire);
-    if (cur != CORO_BLOCKED) {
+    if (cur == CORO_RUNNABLE) {
+        ty_ctx_swap(&me->ctx, &w->sched_ctx);
+        return;
+    } else if (cur != CORO_BLOCKED) {
         coro_state_store(me, CORO_BLOCKED, "io_block_and_yield");
-    } else if (cur == CORO_RUNNABLE) {
-        return; // wake already arrived, skip yield
     }
     // Confirm state is still BLOCKED right before swapping.
     CoroState expected = CORO_BLOCKED;
     if (!atomic_compare_exchange_strong_explicit(
             &me->state, &expected, CORO_BLOCKED,
             memory_order_acq_rel, memory_order_acquire)) {
+        if (expected == CORO_RUNNABLE) {
+            ty_ctx_swap(&me->ctx, &w->sched_ctx);
+        }
         return; // wake flipped us to RUNNABLE between check and swap
     }
 

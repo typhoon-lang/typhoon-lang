@@ -31,7 +31,7 @@ target_compile_definitions(runtime PRIVATE TY_DEBUG_ENABLED=0)
 
 # Phase 4: link ws2_32 on Windows (needed by ty_fd_close / closesocket in platform.h)
 if(WIN32)
-  target_link_libraries(runtime PUBLIC ws2_32)
+  target_link_libraries(runtime PUBLIC ws2_32 mswsock)
 endif()
 
 # 3. INSTALL PHASE (Replaces or complements POST-BUILD)

@@ -38,7 +38,7 @@
 
 /* Set TY_DEBUG_ENABLED=1 at compile time to enable verbose logging. */
 #ifndef TY_DEBUG
-# ifdef TY_DEBUG_ENABLED
+# if defined(TY_DEBUG_ENABLED) && TY_DEBUG_ENABLED
 # define TY_DEBUG(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 # else
 # define TY_DEBUG(fmt, ...) ((void)0)
@@ -46,7 +46,7 @@
 #endif
 
 #ifndef TY_ASSERT
-# ifdef TY_DEBUG_ENABLED
+# if defined(TY_DEBUG_ENABLED) && TY_DEBUG_ENABLED
 // Prints the assertion failure, file, line number, and custom message, then aborts
 # define TY_ASSERT(cond, fmt, ...) \
 do { \

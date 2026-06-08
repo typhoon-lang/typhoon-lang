@@ -440,6 +440,13 @@ typedef struct IocpDriver {
   TyMutex lock;
 } IocpDriver;
 
+static int iocp_fd_is_socket(ty_fd_t fd) {
+  SOCKET s = (SOCKET)fd;
+  int type = 0;
+  int len = (int)sizeof(type);
+  return getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&type, &len) == 0;
+}
+
 static IocpDriver* iocp_new(void) {
   HANDLE h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
   if (!h) return NULL;
@@ -495,13 +502,29 @@ static void iocp_submit(IocpDriver* d, PendingReq* req) {
   ov->req = req;
 
   BOOL ok;
-  if (req->is_write)
+  int is_socket = iocp_fd_is_socket(req->fd);
+  if (is_socket && req->is_write) {
+    WSABUF wb;
+    DWORD sent = 0;
+    wb.buf = (CHAR*)req->buf;
+    wb.len = (ULONG)req->len;
+    ok = (WSASend((SOCKET)req->fd, &wb, 1, &sent, 0, &ov->ov, NULL) == 0);
+  } else if (is_socket) {
+    WSABUF wb;
+    DWORD got = 0;
+    DWORD flags = 0;
+    wb.buf = (CHAR*)req->buf;
+    wb.len = (ULONG)req->len;
+    ok = (WSARecv((SOCKET)req->fd, &wb, 1, &got, &flags, &ov->ov, NULL) == 0);
+  } else if (req->is_write) {
     ok = WriteFile(fh, req->buf, (DWORD)req->len, NULL, &ov->ov);
-  else
+  } else {
     ok = ReadFile(fh, req->buf, (DWORD)req->len, NULL, &ov->ov);
+  }
 
-  DWORD err = GetLastError();
-  if (!ok && err != ERROR_IO_PENDING) {
+  DWORD err = is_socket ? (DWORD)WSAGetLastError() : GetLastError();
+  DWORD pending = is_socket ? WSA_IO_PENDING : ERROR_IO_PENDING;
+  if (!ok && err != pending) {
     /* Immediate failure — synthesize wake */
     ty_io_wake_coro(req->coro, -(int64_t)err);
     pool_free(req);
@@ -723,12 +746,14 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
   IoDriver* d = (IoDriver*)driver_ptr;
   int has_driver = (d && d->impl && atomic_load_explicit(&g_poll_running, memory_order_acquire));
 
-#if defined(_WIN32)
-  /* Never park a coroutine on stdio fds: IOCP is not reliable for them, and
-   * a parked stdio write during shutdown will hang the drain loop forever. */
-  if (fd >= 0 && fd <= 2)
-    has_driver = 0;
-#endif
+/* Never park a coroutine on stdio fds (stdin/stdout/stderr):
+ * - IOCP (Windows): not reliable for stdio handles
+ * - kqueue (macOS): EVFILT_WRITE on piped/redirected stdout may
+ *   never deliver events in CI, causing the coro to hang forever.
+ * - io_uring (Linux): works but adds unnecessary overhead
+ * Use synchronous I/O for fd 0-2 on all platforms. */
+ if (fd >= 0 && fd <= 2)
+ has_driver = 0;
 
   if (coro && has_driver) {
     PendingReq* req = pool_alloc(
@@ -777,11 +802,17 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
     result = is_write ? iocp_stdio_write((int)fd, buf, len)
                       : iocp_stdio_read((int)fd, buf, len);
   } else {
-    HANDLE h = (HANDLE)(uintptr_t)fd;
-    DWORD n = 0;
-    BOOL ok = is_write ? WriteFile(h, buf, (DWORD)len, &n, NULL)
-                       : ReadFile(h, buf, (DWORD)len, &n, NULL);
-    result = ok ? (int64_t)n : -(int64_t)GetLastError();
+    if (iocp_fd_is_socket(fd)) {
+      int n = is_write ? send((SOCKET)fd, (const char*)buf, (int)len, 0)
+                       : recv((SOCKET)fd, (char*)buf, (int)len, 0);
+      result = (n >= 0) ? (int64_t)n : -(int64_t)WSAGetLastError();
+    } else {
+      HANDLE h = (HANDLE)(uintptr_t)fd;
+      DWORD n = 0;
+      BOOL ok = is_write ? WriteFile(h, buf, (DWORD)len, &n, NULL)
+                         : ReadFile(h, buf, (DWORD)len, &n, NULL);
+      result = ok ? (int64_t)n : -(int64_t)GetLastError();
+    }
   }
 #else
   {

@@ -245,9 +245,9 @@ class Suite:
             print(f"  ({failed} failed)")
             for r in self.results:
                 if not r.passed:
-                    print(f"  ✗ {r.name}: {r.message}")
+                    print(f"  X {r.name}: {r.message}")
         else:
-            print(" ✓")
+            print(" OK")
 
     def _exit_code(self) -> int:
         return 0 if all(r.passed for r in self.results) else 1

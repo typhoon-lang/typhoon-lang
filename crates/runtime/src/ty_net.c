@@ -172,7 +172,16 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    /* Use AF_INET for wildcard addresses (0.0.0.0 / empty host) to ensure
+     * IPv4 loopback connections work. AF_UNSPEC returns IPv6 first, and
+     * even with IPV6_V6ONLY=0 some CI environments don't properly support
+     * IPv4-mapped IPv6 connections on IPv6 listeners. For explicit IPv6
+     * addresses (e.g. "[::]") we still use AF_UNSPEC to allow IPv6. */
+    if (host[0] == '\0' || strcmp(host, "0.0.0.0") == 0) {
+        hints.ai_family = AF_INET;
+    } else {
+        hints.ai_family = AF_UNSPEC;
+    }
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_PASSIVE;
@@ -197,7 +206,11 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
     int32_t last_err = 0;
     struct addrinfo* it = res;
     for (; it; it = it->ai_next) {
+#if defined(_WIN32)
+        s = (ty_sock_t)WSASocketW(it->ai_family, it->ai_socktype, it->ai_protocol, NULL, 0, WSA_FLAG_OVERLAPPED);
+#else
         s = (ty_sock_t)socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+#endif
 #if defined(_WIN32)
         if (s == INVALID_SOCKET) { last_err = ty_net_last_error(); continue; }
 #else
@@ -206,6 +219,21 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
 
         int yes = 1;
         (void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, (socklen_t)sizeof(yes));
+
+        /* For IPv6 sockets: explicitly enable dual-stack so IPv4 loopback
+         * connections (127.0.0.1) reach the listener via mapped addresses.
+         * macOS defaults to V6ONLY=0 but some CI environments override it;
+         * Windows also defaults to V6ONLY=0 but we set it explicitly. */
+        if (it->ai_family == AF_INET6) {
+            int v6only = 0;
+#if defined(_WIN32)
+            setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
+                       (const char*)&v6only, (socklen_t)sizeof(v6only));
+#else
+            setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
+                       &v6only, (socklen_t)sizeof(v6only));
+#endif
+        }
 
         if (bind(s, it->ai_addr, (socklen_t)it->ai_addrlen) != 0) {
             last_err = ty_net_last_error();
@@ -225,7 +253,14 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
         /* Set the listener socket non-blocking so accept() never stalls
          * the worker thread.  The coroutine parks via TyIoOp ACCEPT and
          * the IO backend wakes it when a connection is pending. */
+        /* On Windows: do NOT set FIONBIO on the listener. AcceptEx
+         * uses overlapped I/O for async notification — FIONBIO
+         * conflicts with IOCP completion and prevents AcceptEx
+         * completions from arriving. The IOCP backend handles async
+         * accept entirely via AcceptEx; non-blocking is unnecessary. */
+#if !defined(_WIN32)
         ty_sock_set_nonblock(s);
+#endif
 
         break;
     }
@@ -303,16 +338,20 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
 
     if (drv && coro) {
         for (;;) {
-            ty_sock_t c = (ty_sock_t)accept(self->sock, NULL, NULL);
 #if defined(_WIN32)
-            if (c != INVALID_SOCKET) {
+            /* On Windows, skip the initial accept() call entirely.
+             * The listener socket is NOT non-blocking (FIONBIO would
+             * break AcceptEx/IOCP), so accept() would block the worker
+             * thread. Instead, go directly to ty_io_submit() which
+             * posts AcceptEx via the per-worker IOCP backend. */
+            (void)0;
 #else
+            ty_sock_t c = (ty_sock_t)accept(self->sock, NULL, NULL);
             if (c >= 0) {
-#endif
                 /* Accepted socket inherits O_NONBLOCK from listener on
                  * Linux; on other platforms we set it explicitly so
                  * async read/write paths work correctly. */
-#if defined(_WIN32) || defined(__APPLE__)
+#ifdef __APPLE__
                 ty_sock_set_nonblock(c);
 #endif
                 TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
@@ -338,17 +377,12 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
             }
 
             /* accept() would block — submit async and park */
-            int would_block;
-#if defined(_WIN32)
-            would_block = (WSAGetLastError() == WSAEWOULDBLOCK);
-#else
-            would_block = (errno == EAGAIN || errno == EWOULDBLOCK);
-#endif
-            if (!would_block) {
+            if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
                 out.err = ty_net_last_error();
                 *outp = out;
                 return;
             }
+#endif /* _WIN32 / POSIX */
 
             TY_DEBUG("[net] accept: would block, parking coro=%p\n", coro);
             TyIoOp op;
@@ -376,7 +410,24 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
             int64_t result = ty_io_take_result(coro);
             TY_DEBUG("[net] accept: resumed coro=%p result=%lld\n", coro, (long long)result);
             if (result < 0) {
-                out.err = (int32_t)(-result);
+                int32_t wake_err = (int32_t)(-result);
+#if defined(_WIN32)
+                if (wake_err == WSAEWOULDBLOCK) {
+                    continue;
+                }
+#else
+                if (wake_err == EAGAIN || wake_err == EWOULDBLOCK) {
+                    continue;
+                }
+                /* EINVAL can come from io_uring POLL_ADD on older kernels
+                 * or from accept() on a socket that lost its listen state.
+                 * Fall back to yield-and-retry instead of aborting. */
+                if (wake_err == EINVAL) {
+                    ty_yield();
+                    continue;
+                }
+#endif
+                out.err = wake_err;
                 *outp = out;
                 return;
             }

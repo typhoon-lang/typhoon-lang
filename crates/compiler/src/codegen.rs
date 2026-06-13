@@ -1519,7 +1519,7 @@ impl<'a> IrBuilder<'a> {
         let raw_ptr = self.tmp();
         self.emit(format!(
             "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
-            raw_ptr, task_slot, closure_size
+            raw_ptr, task_slot, class_id
         ));
         // Bitcast the raw heap pointer to the typed closure struct pointer
         let closure_slot = self.tmp();
@@ -3744,8 +3744,12 @@ impl<'a> IrBuilder<'a> {
                             // from the layout's variants, converting LLVM types back to source names.
                             let layout = self.reg.enum_layouts.get(&ret_ty_str).cloned().unwrap();
                             // Reconstruct Result<T,E> args in canonical (Ok, Err) order.
-                            let ok_payload = layout.variants.get("Ok").and_then(|v| v.payload_ty.clone());
-                            let err_payload = layout.variants.get("Err").and_then(|v| v.payload_ty.clone());
+                            let ok_payload =
+                                layout.variants.get("Ok").and_then(|v| v.payload_ty.clone());
+                            let err_payload = layout
+                                .variants
+                                .get("Err")
+                                .and_then(|v| v.payload_ty.clone());
                             if let (Some(ok_ty), Some(err_ty)) = (ok_payload, err_payload) {
                                 let args: Vec<InferType> = vec![
                                     InferType::Con(Self::llvm_ty_to_infer_name(&ok_ty)),
@@ -3761,7 +3765,9 @@ impl<'a> IrBuilder<'a> {
                                 let args: Vec<InferType> = sorted
                                     .iter()
                                     .filter_map(|v| v.payload_ty.as_ref())
-                                    .map(|llvm_ty| InferType::Con(Self::llvm_ty_to_infer_name(llvm_ty)))
+                                    .map(|llvm_ty| {
+                                        InferType::Con(Self::llvm_ty_to_infer_name(llvm_ty))
+                                    })
                                     .collect();
                                 if !args.is_empty() {
                                     let res = InferType::App(self.reg.result_enum_name(), args);

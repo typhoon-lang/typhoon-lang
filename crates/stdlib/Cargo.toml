@@ -1,7 +1,3 @@
-# Note: This is an unstable feature
-[unstable]
-cargo-features = ["bindeps"]
-
 [package]
 name = "typhoon-stdlib"
 version.workspace = true
@@ -15,4 +11,4 @@ description = "Typhoon lang standard library"
 
 [build-dependencies]
 # Reference the 'tyc' binary from typhoon-cli
-typhoon-cli = { workspace = true, artifact = "bin", bin = "tyc" }
+typhoon-cli = { workspace = true, artifact = "bin", bin = "tyc", lib = false }

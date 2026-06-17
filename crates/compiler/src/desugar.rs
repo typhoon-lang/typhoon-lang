@@ -424,7 +424,7 @@ impl Desugar {
     }
 
     fn rename_type(&self, ty: &mut Type, aliases: &HashMap<String, String>) {
-        if ["Network", "Listener", "Socket"].contains(&ty.node.name.as_str()) {
+        if ["Network", "Listener", "Socket", "Stdout", "Stdin"].contains(&ty.node.name.as_str()) {
             return;
         }
         if let Some(n) = aliases.get(&ty.node.name) {
@@ -584,6 +584,7 @@ impl Desugar {
                 self.rename_expression(left, aliases);
                 self.rename_expression(right, aliases);
             }
+            ExpressionKind::Cast { expr: inner, .. } => self.rename_expression(inner, aliases),
             ExpressionKind::UnaryOp { expr: inner, .. } => self.rename_expression(inner, aliases),
             ExpressionKind::Call { func, args } => {
                 self.rename_expression(func, aliases);
@@ -983,6 +984,7 @@ impl Desugar {
                 self.desugar_expression(left)?;
                 self.desugar_expression(right)
             }
+            ExpressionKind::Cast { expr: inner, .. } => self.desugar_expression(inner),
             ExpressionKind::UnaryOp { expr: inner, .. } => self.desugar_expression(inner),
             ExpressionKind::Call { func, args } => {
                 self.desugar_expression(func)?;

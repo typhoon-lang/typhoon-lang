@@ -31,9 +31,8 @@ int main(void) {
   TyNetwork* net = ty_net_global();
   assert(net != NULL);
 
-  TyResult_Listener_i32 l = {0};
-  __ty_rt__Network__listen(NULL, net, "127.0.0.1:30379", &l);
-  assert(l.ok == 1 && l.value != NULL);
+  TyResult_Listener_i32 l = __ty_rt__Network__listen(NULL, net, "127.0.0.1:30379");
+  assert(l.tag == 1 && l.value != NULL);
 
   test_sock_t c = socket(AF_INET, SOCK_STREAM, 0);
   assert((int)c >= 0);
@@ -45,13 +44,12 @@ int main(void) {
   sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   assert(connect(c, (struct sockaddr*)&sa, sizeof(sa)) == 0);
 
-  TyResult_Socket_i32 accepted = {0};
-  __ty_rt__Listener__accept(NULL, l.value, &accepted);
-  assert(accepted.ok == 1 && accepted.value != NULL);
+  TyResult_Socket_i32 accepted = __ty_rt__Listener__accept(NULL, l.value);
+  assert(accepted.tag == 1 && accepted.value != NULL);
 
   char msg[] = "phase2";
   TyResult_i32_i32 wr = __ty_rt__Socket__write(NULL, accepted.value, msg, (int32_t)strlen(msg));
-  assert(wr.ok == 1);
+  assert(wr.tag == 1);
 
   __ty_rt__Socket__close(NULL, accepted.value);
   __ty_rt__Listener__close(NULL, l.value);

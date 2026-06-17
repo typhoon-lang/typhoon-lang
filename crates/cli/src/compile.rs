@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use typhoon_compiler::ast::*;
 use typhoon_compiler::codegen::Codegen;
 use typhoon_compiler::driver::compile_project;
 use typhoon_compiler::liveness::LiveAnalyzer;
@@ -12,7 +13,7 @@ pub fn compile(input: &str, output: &str) {
 }
 
 pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
-    let (module, imports) = match compile_project(Path::new(input)) {
+    let (module, imports, original_ns_by_symbol) = match compile_project(Path::new(input)) {
         Ok(m) => m,
         Err(errs) => {
             for e in errs {
@@ -39,7 +40,13 @@ pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
         }
     };
 
-    let ir = Codegen::lower_module(&module, checker.types(), &checker.specializations, result);
+    let ir = Codegen::lower_module(
+        &module,
+        checker.types(),
+        &checker.specializations,
+        result,
+        &original_ns_by_symbol,
+    );
     let ir_text = ir.to_llvm_ir();
 
     let ll_path = Path::new(output).with_extension("ll");

@@ -32,13 +32,14 @@
 
 /* Helper: create listener on ephemeral port, return actual port.
  * Uses raw OS socket to find the assigned port after listen on port 0. */
-static int listen_ephemeral(TyNetwork* net, TyResult_Listener_i32* out) {
+static int listen_ephemeral(TyNetwork* net, TyResult_Listener_i32* _out) {
   /* Use a known port range for testing — 31000+ to avoid conflicts */
   static int next_port = 31000;
   int port = next_port++;
+  TyResult_Listener_i32 out;
 
-  __ty_rt__Network__listen(NULL, net, "127.0.0.1:0", out);
-  if (!out->ok) return -1;
+  out = __ty_rt__Network__listen(NULL, net, "127.0.0.1:0");
+  if (!out.tag) return -1;
 
   /* To get the ephemeral port, we'd need to access the listener's fd,
    * but TyListener is opaque. Instead, just use port 0 and connect
@@ -47,19 +48,19 @@ static int listen_ephemeral(TyNetwork* net, TyResult_Listener_i32* out) {
    * This is a simple workaround. */
 
   /* Actually, just close the port-0 listener and re-listen on a known port. */
-  __ty_rt__Listener__close(NULL, out->value);
-  memset(out, 0, sizeof(*out));
+  __ty_rt__Listener__close(NULL, out.value);
+  // memset(out, 0, sizeof(out));
 
   char addr[64];
   snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
-  __ty_rt__Network__listen(NULL, net, addr, out);
-  if (!out->ok) {
+  out = __ty_rt__Network__listen(NULL, net, addr);
+  if (!out.tag) {
     /* Port in use — try next */
     port = next_port++;
     snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
-    __ty_rt__Network__listen(NULL, net, addr, out);
+    out = __ty_rt__Network__listen(NULL, net, addr);
   }
-  return out->ok ? port : -1;
+  return out.tag ? port : -1;
 }
 
 /* ── Test 1: listen creates listener and close frees it ─────────────────── */
@@ -70,9 +71,8 @@ static void test_listen_close(void) {
   TyNetwork* net = ty_net_global();
   assert(net != NULL);
 
-  TyResult_Listener_i32 l = {0};
-  __ty_rt__Network__listen(NULL, net, "127.0.0.1:0", &l);
-  assert(l.ok == 1);
+  TyResult_Listener_i32 l = __ty_rt__Network__listen(NULL, net, "127.0.0.1:0");
+  assert(l.tag == 1);
   assert(l.value != NULL);
 
   /* Close listener — should not crash, no global registry to walk */
@@ -92,7 +92,7 @@ static void test_accept_close(void) {
   TyResult_Listener_i32 l = {0};
   int port = listen_ephemeral(net, &l);
   assert(port > 0);
-  assert(l.ok == 1);
+  assert(l.tag == 1);
 
   /* Connect a client */
 #if defined(_WIN32)
@@ -112,9 +112,8 @@ static void test_accept_close(void) {
   assert(rc == 0);
 
   /* Accept */
-  TyResult_Socket_i32 accepted = {0};
-  __ty_rt__Listener__accept(NULL, l.value, &accepted);
-  assert(accepted.ok == 1);
+  TyResult_Socket_i32 accepted = __ty_rt__Listener__accept(NULL, l.value);
+  assert(accepted.tag == 1);
   assert(accepted.value != NULL);
 
   /* Close socket — should not crash */
@@ -140,13 +139,11 @@ static void test_listen_invalid_addr(void) {
   ty_net_init();
   TyNetwork* net = ty_net_global();
 
-  TyResult_Listener_i32 l = {0};
-  __ty_rt__Network__listen(NULL, net, "not_a_valid_addr", &l);
-  assert(l.ok == 0);
+  TyResult_Listener_i32 l = __ty_rt__Network__listen(NULL, net, "not_a_valid_addr");
+  assert(l.tag == 0);
 
-  TyResult_Listener_i32 l2 = {0};
-  __ty_rt__Network__listen(NULL, net, ":", &l2);
-  assert(l2.ok == 0);
+  TyResult_Listener_i32 l2 = __ty_rt__Network__listen(NULL, net, ":");
+  assert(l2.tag == 0);
 
   ty_net_shutdown();
   printf("[phase4] net listen invalid addr — PASS\n");
@@ -158,10 +155,10 @@ static void test_sequential_listen_close(void) {
   ty_net_init();
   TyNetwork* net = ty_net_global();
 
+TyResult_Listener_i32 l;
   for (int i = 0; i < 10; i++) {
-    TyResult_Listener_i32 l = {0};
-    __ty_rt__Network__listen(NULL, net, "127.0.0.1:0", &l);
-    assert(l.ok == 1);
+    l = __ty_rt__Network__listen(NULL, net, "127.0.0.1:0");
+    assert(l.tag == 1);
     __ty_rt__Listener__close(NULL, l.value);
   }
 
@@ -194,14 +191,13 @@ static void test_socket_write_close(void) {
   sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   connect(c, (struct sockaddr*)&sa, sizeof(sa));
 
-  TyResult_Socket_i32 accepted = {0};
-  __ty_rt__Listener__accept(NULL, l.value, &accepted);
-  assert(accepted.ok == 1);
+  TyResult_Socket_i32 accepted = __ty_rt__Listener__accept(NULL, l.value);
+  assert(accepted.tag == 1);
 
   /* Write data through the socket */
   char msg[] = "hello phase4";
   TyResult_i32_i32 wr = __ty_rt__Socket__write(NULL, accepted.value, msg, (int32_t)strlen(msg));
-  assert(wr.ok == 1);
+  assert(wr.tag == 1);
   assert(wr.value == (int32_t)strlen(msg));
 
   /* Close everything */

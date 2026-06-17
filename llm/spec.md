@@ -140,6 +140,8 @@ Identifiers begin with a letter or underscore, followed by letters, digits, or u
   ```
   Cross-hierarchy (Int → Float or Float → Int) always requires `as`.
 
+Widening applies **uniformly** at every type-check boundary: binary arithmetic, function-call argument positions, struct field assignment, and return-value unification. The compiler's `Solver::unify` permits widening whenever two integer (or two float) constructors are compared and one is wider than the other. Codegen emits the correct `sext`/`zext`/`fpext` cast at the call boundary so the LLVM IR matches the declared parameter type. The user never writes the cast; the cost is one extra instruction per widening call.
+
 ### The `Str` Type
 
 `Str` is a **fat pointer** — a `(ptr: *const Byte, len: Int32)` pair. It does not own memory and never allocates. It is always a view into bytes that live somewhere else:
@@ -1109,6 +1111,38 @@ Without `@repr(C)`, the compiler may reorder fields for alignment. `@repr(C)` pr
 
 Any function containing `unsafe` or `Ptr<T>` in its body or signature must be documented with the invariants the caller must uphold. The standard library marks all such functions explicitly in their doc comments.
 
+### Stdlib/C Runtime Boundaries
+
+The standard library is split into a **Typhoon-written** upper layer (`crates/stdlib/src/std/*.ty`) and a thin **C runtime** (`crates/runtime/src/*.c`). The boundary is held by three LLVM IR annotations that the `.ll` parser reads to drive the type checker and codegen without hardcoding anything in Rust:
+
+| Annotation | Meaning | Codegen effect |
+|------------|---------|----------------|
+| `@ty_ns Name::Method` | The declare belongs to namespace `Name::Method`. Lets `.ll` declares back Typhoon-side `impl` blocks without colliding with `.ty` source files. | Used for resolution only. |
+| `@ty_sig fn Method(self, args) -> Ret` | Declares the **Typhoon-visible** signature of the function for the type checker. Codegen calls the entry point as if sources were always typed this way. | Sets `func_sigs` and `extern_fns` in `TypeRegistry`. |
+| `@ty_out_result` | Marks a C function whose `void` return + trailing `Result*` parameter is the out-param ABI for `Result<T, E>`. | Codegen emits an `alloca %struct.Result…`, passes the pointer as the last arg, then `load`s the result. |
+
+The compiler **does not** include any hardcoded lists of method signatures or function bodies. Every Typhoon-side `impl Foo { fn bar(self, ...) }` block is parsed from `.ty` source and codegen'd as a function body — no `__ty_method__*` wrappers needed in `.ll`. Networking methods stay as `.ll` `define` wrappers because the out-param C ABI for `Result<...>` is too complex to express directly in `.ty`.
+
+C runtime exports are intentionally minimal:
+
+- `ty_sys_write(fd: Int32, ptr: Str, n: Int64) -> Int64`
+- `ty_sys_read(fd: Int32, ptr: Ptr<Byte>, cap: Int64) -> Int64`
+- `ty_stdout_new()`, `ty_stdin_new()` — per-instance handle constructors. Each holds its own `Buf*` plus a Windows console handle (where applicable). **No global buffer** — two `Stdout{}` instances in two coroutines produce two independent buffers; concurrency is safe.
+- `ty_stdout_flush(self)`, `ty_stdout_getbuf(self) -> Buf` — instance methods.
+- `ty_buf_new`, `ty_buf_push_byte`, `ty_buf_push_str`, `ty_buf_into_str`, `ty_str_len`, `ty_str_byte` — buffer + string primitives. All other formatting (integer-to-string, percent-spec parsing) is **pure Typhoon** in `crates/stdlib/src/std/io.ty`.
+
+This split makes the dependency direction one-way: `.ty` stdlib may call C, but C knows nothing about Typhoon syntax or types — it provides only opaque handles and raw byte I/O.
+
+### `Str` ABI delta
+
+The spec describes `Str` as a fat pointer `(ptr, len)`. The current LLVM ABI is the simpler **NUL-terminated** `i8*` (matches C strings, simplifies FFI). This delta is tracked here so the `Str` definition above matches the implementation until the fat-pointer refactor lands.
+
+- `ty_str_len(s: Str) -> Int64` and `ty_str_byte(s: Str, i: Int64) -> Int8` operate on the NUL-terminated representation.
+- Strings may not contain embedded NULs.
+- String literals in source map to `.rodata` static `i8*` constants.
+
+Future versions may switch back to fat pointers without source-level change.
+
 ---
 
 ## 14. Standard Library
@@ -1579,7 +1613,7 @@ The following concerns are identified but deferred. They do not block the implem
 
 **WebAssembly target differences.** Wasm has no threads in the base spec (threads require the Atomics proposal), no `mmap`, and no signal-based preemption. The scheduler and slab allocator need Wasm-specific implementations. This is a platform variant, not a language change.
 
-**Numeric coercion.** Does `Int8 + Int32` compile? Does it require an explicit cast? Implicit widening is convenient but masks bugs. Explicit casting (`42i8 as Int32`) is safer. Recommendation: no implicit numeric coercion; explicit `as` for all cross-type arithmetic.
+**Numeric coercion (RESOLVED).** `Int8 + Int32` compiles silently via implicit widening (see §5 — Numeric coercion rules). Cross-family (Int↔Float) and narrowing still require explicit `as`. Codegen emits `sext`/`zext`/`fpext` at the call site when the actual argument is narrower than the parameter's declared type. Widening is invisible in source.
 
 **Panic vs `Result`.** Some operations that cannot return `Result` (out-of-memory, stack overflow, divide by zero in release) need a panic mechanism. The design currently traps on overflow in debug. A full panic story — including panic hooks, stack unwinding vs abort — is needed before production use.
 

@@ -42,7 +42,11 @@ typedef struct Buf {
 
 Buf*  ty_buf_new(SlabArena* arena);
 void  ty_buf_push_str(SlabArena* arena, Buf* b, char* s);
+void  ty_buf_push_byte(SlabArena* arena, Buf* b, char c);
 char* ty_buf_into_str(SlabArena* arena, Buf* b);
+
+int64_t ty_str_len(char* s);
+char    ty_str_byte(char* s, int64_t idx);
 
 /* ── TyArray (dynamic array) ────────────────────────────────────────────────── */
 

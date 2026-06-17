@@ -4,7 +4,7 @@ use std::process::Command;
 
 fn main() {
     // Get paths from Cargo environment
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let workspace_dir = PathBuf::from(env::var("CARGO_WORKSPACE_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // Calculate workspace root (crates/stdlib -> crates -> root)
@@ -12,7 +12,7 @@ fn main() {
     let target_dir = workspace_root.join("target");
 
     let stdlib_src = manifest_dir.join("src");
-    let stdlib_out = out_dir.join("typhoon-stdlib");
+    let stdlib_out = workspace_dir.join("typhoon-stdlib");
 
     // Skip if no source directory
     if !stdlib_src.exists() {
@@ -38,6 +38,7 @@ fn main() {
         .unwrap_or_else(|| panic!("tyc binary not found. Run: cargo build -p typhoon-cli"));
 
     println!("cargo:warning=Using tyc: {}", tyc.display());
+    println!("cargo:warning=Output path: {}", stdlib_out.display());
 
     // Create output directory
     std::fs::create_dir_all(&stdlib_out).expect("Failed to create output dir");

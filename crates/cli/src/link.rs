@@ -13,32 +13,110 @@ fn find_stdlib_ll() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("typhoon-stdlib.ll"))
 }
 
+/// Returns true if a `define` line is a net method wrapper whose correct body
+/// is provided by typhoon-stdlib.ll.  Codegen emits broken self-recursive stubs
+/// for these; we strip them from user IR so the stdlib definition wins.
+fn is_net_method_wrapper(define_line: &str) -> bool {
+    define_line.contains("@__ty_method__Network__")
+        || define_line.contains("@__ty_method__Listener__")
+        || define_line.contains("@__ty_method__Socket__")
+}
+
 fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::io::Result<()> {
     let user_ir = std::fs::read_to_string(ir_file)?;
-    let user_ir = user_ir
-        .lines()
-        .filter(|line| {
-            let line = line.trim_start();
-            !(line.starts_with("declare ") && line.contains("@__ty_method__"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let (user_ir_filtered, user_struct_types) = {
+        let lines: Vec<&str> = user_ir.lines().collect();
+        let mut struct_types = std::collections::HashSet::new();
+        for &line in &lines {
+            let trimmed = line.trim_start();
+            // Collect struct type names defined in user IR
+            if trimmed.starts_with("%struct.")
+                || trimmed.starts_with("%enum.")
+                || trimmed.starts_with("%newtype.")
+            {
+                if let Some(name) = trimmed.split_whitespace().next() {
+                    struct_types.insert(name.to_string());
+                }
+            }
+        }
+        // Strip from user IR:
+        //   - any `declare @__ty_method__*`  (forward decls the stdlib defines)
+        //   - any `define @__ty_method__Network__*`, `@__ty_method__Listener__*`,
+        //     or `@__ty_method__Socket__*` function bodies — codegen emits
+        //     self-recursive stubs for these; the correct bodies live in the stdlib.
+        let mut filtered: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim_start();
+            // Drop declare-stubs for any __ty_method__ symbol.
+            if trimmed.starts_with("declare ") && trimmed.contains("@__ty_method__") {
+                i += 1;
+                continue;
+            }
+            // Drop codegen-emitted define bodies for net method wrappers.
+            if trimmed.starts_with("define ") && is_net_method_wrapper(trimmed) {
+                // Skip the entire function body by counting braces.
+                let mut depth = 0i32;
+                let mut entered = false;
+                while i < lines.len() {
+                    let l = lines[i];
+                    depth += l.matches('{').count() as i32;
+                    depth -= l.matches('}').count() as i32;
+                    i += 1;
+                    if depth > 0 {
+                        entered = true;
+                    }
+                    if entered && depth <= 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            filtered.push(lines[i]);
+            i += 1;
+        }
+        (filtered.join("\n"), struct_types)
+    };
     let stdlib_ir = std::fs::read_to_string(stdlib_ll)?;
-    let stdlib_without_types = stdlib_ir
-        .lines()
-        .filter(|line| {
-            let line = line.trim_start();
-            !line.starts_with("declare ")
-                && !(line.contains(" = type ")
-                    && (line.starts_with("%struct.")
-                        || line.starts_with("%enum.")
-                        || line.starts_with("%newtype.")))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let stdlib_lines: Vec<&str> = stdlib_ir.lines().collect();
+    let mut stdlib_out_lines = Vec::new();
+    let mut i = 0;
+    while i < stdlib_lines.len() {
+        let line = stdlib_lines[i].trim_start();
+        // Drop `declare` lines from stdlib — they are already present in user IR
+        // (codegen emits them) and duplicates cause llvm errors.
+        if line.starts_with("declare ") {
+            i += 1;
+            continue;
+        }
+        // Drop struct/enum/newtype type definitions that the user IR already defines.
+        if line.contains(" = type ")
+            && (line.starts_with("%struct.")
+                || line.starts_with("%enum.")
+                || line.starts_with("%newtype."))
+        {
+            if let Some(name) = line.split_whitespace().next() {
+                // Always drop monomorphised Result/Option from stdlib —
+                // codegen unconditionally emits the concrete definitions.
+                if name.starts_with("%struct.Result__") || name.starts_with("%struct.Option__") {
+                    i += 1;
+                    continue;
+                }
+                // For everything else, only drop if user IR already defines it.
+                if user_struct_types.contains(name) {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // Everything else — including the correct net wrapper define bodies — is kept.
+        stdlib_out_lines.push(stdlib_lines[i]);
+        i += 1;
+    }
+    let stdlib_out = stdlib_out_lines.join("\n");
     std::fs::write(
         merged_path,
-        format!("{}\n{}\n", user_ir, stdlib_without_types),
+        format!("{}\n{}\n", user_ir_filtered, stdlib_out),
     )
 }
 

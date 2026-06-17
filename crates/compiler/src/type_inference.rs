@@ -65,6 +65,19 @@ pub struct Solver {
     rigid: HashSet<TypeVarId>,
 }
 
+fn numeric_rank(name: &str) -> Option<u8> {
+    match name {
+        "Int8" => Some(0),
+        "Int16" => Some(1),
+        "Int32" => Some(2),
+        "Int64" => Some(3),
+        "Float16" => Some(10),
+        "Float32" => Some(11),
+        "Float64" => Some(12),
+        _ => None,
+    }
+}
+
 impl Solver {
     pub fn new() -> Self {
         Self {
@@ -116,10 +129,51 @@ impl Solver {
     ) -> Result<(), TypeError> {
         let left = self.apply(left);
         let right = self.apply(right);
+        if std::env::var_os("TY_DEBUG_TYPES").is_some() {
+            eprintln!("[ty-debug] unify {:?} ~ {:?} @ {:?}", left, right, span);
+        }
         match (left, right) {
             (InferType::Var(a), InferType::Var(b)) if a == b => Ok(()),
             (InferType::Var(a), ty) | (ty, InferType::Var(a)) => self.bind_var(a, ty, span),
             (InferType::Con(a), InferType::Con(b)) if a == b => Ok(()),
+            (InferType::Con(a), InferType::Con(b)) => {
+                // Implicit widening per spec: Int8 -> Int16 -> Int32 -> Int64,
+                // Float16 -> Float32 -> Float64. Wider wins, narrower stays at
+                // compile time but codegen inserts a sext/zext/fpext at the
+                // call site so the ABI matches. Cross-family (Int vs Float)
+                // and narrowing still require an explicit `as` and error here.
+                if let (Some(ar), Some(br)) = (numeric_rank(&a), numeric_rank(&b)) {
+                    let a_int = ar < 10;
+                    let b_int = br < 10;
+                    if a_int != b_int {
+                        // Different families: int <-> float always needs `as`.
+                        return Err(TypeError::TypeMismatch {
+                            expected: InferType::Con(a.clone()),
+                            actual: InferType::Con(b.clone()),
+                            context: "unification (cross-family needs `as` cast)".into(),
+                            span,
+                        });
+                    }
+                    if ar == br {
+                        // Same rank, different names: not in our hierarchy.
+                        return Err(TypeError::TypeMismatch {
+                            expected: InferType::Con(a.clone()),
+                            actual: InferType::Con(b.clone()),
+                            context: "unification".into(),
+                            span,
+                        });
+                    }
+                    // a_int == b_int && ar != br: implicit widening, accept.
+                    return Ok(());
+                }
+                // Not in any rank; treat as mismatch.
+                Err(TypeError::TypeMismatch {
+                    expected: InferType::Con(a.clone()),
+                    actual: InferType::Con(b.clone()),
+                    context: "unification".into(),
+                    span,
+                })
+            }
             (InferType::FixedArray(a_elem, a_len), InferType::FixedArray(b_elem, b_len))
                 if a_len == b_len =>
             {
@@ -152,7 +206,15 @@ impl Solver {
                 self.unify(&*a_ret, &*b_ret, span)
             }
             (expected, actual) => Err(TypeError::TypeMismatch {
-                expected,
+                expected: {
+                    if std::env::var_os("TY_DEBUG_TYPES").is_some() {
+                        eprintln!(
+                            "[ty-debug] unify mismatch expected={:?} actual={:?} @ {:?}",
+                            expected, actual, span
+                        );
+                    }
+                    expected
+                },
                 actual,
                 context: "unification".into(),
                 span,
@@ -262,6 +324,25 @@ impl TypeChecker {
 
     pub fn types(&self) -> &HashMap<NodeId, InferType> {
         &self.types
+    }
+
+    fn debug_types_enabled() -> bool {
+        std::env::var_os("TY_DEBUG_TYPES").is_some()
+    }
+
+    fn debug_type_event(&self, event: &str, span: Span, ty: &InferType) {
+        if Self::debug_types_enabled() {
+            eprintln!(
+                "[ty-debug] {} @ {}:{}-{}:{} => {:?}",
+                event, span.line, span.col, span.line, span.end, ty
+            );
+        }
+    }
+
+    fn debug_type_note(&self, event: &str) {
+        if Self::debug_types_enabled() {
+            eprintln!("[ty-debug] {}", event);
+        }
     }
 
     pub fn seed_builtins(&mut self) {
@@ -402,7 +483,13 @@ impl TypeChecker {
                                 generics,
                                 params,
                                 return_type,
+                                out_result,
+                                ..
                             } = &sig.node;
+                            if name.name.contains("ty_str_byte")
+                                || name.name.starts_with("ty_buf_push")
+                            {
+                            }
                             let mut generic_vars = HashMap::new();
                             for g in generics {
                                 generic_vars.insert(g.node.name.name.clone(), {
@@ -414,15 +501,35 @@ impl TypeChecker {
                                     }
                                 });
                             }
-                            let param_tys: Vec<InferType> = params
+                            let (effective_params, effective_ret) = if *out_result {
+                                // out_result=true means the stored params/return_type ARE
+                                // already the Typhoon-level signature; register as-is.
+                                (params.clone(), return_type.clone())
+                            } else if params.last().map(|p| p.name.name == "out") == Some(true)
+                                && return_type.is_none()
+                            {
+                                // Raw C-ABI shape snuck in without @ty_sig: strip the trailing
+                                // out-param and use its type as the return.
+                                let mut ps = params.clone();
+                                let out_param = ps.pop().unwrap();
+                                (ps, Some(out_param.type_annotation))
+                            } else {
+                                (params.clone(), return_type.clone())
+                            };
+
+                            let param_tys: Vec<InferType> = effective_params
                                 .iter()
                                 .map(|p| self.lower_type(&p.type_annotation, &generic_vars))
                                 .collect::<Result<_, _>>()?;
-                            let ret_ty = match return_type {
+                            let ret_ty = match &effective_ret {
                                 Some(ty) => self.lower_type(ty, &generic_vars)?,
                                 None => InferType::Con("Unit".into()),
                             };
                             let fn_ty = InferType::Fn(param_tys.clone(), Box::new(ret_ty.clone()));
+                            self.debug_type_note(&format!(
+                                "predeclare extern `{}` params={:?} ret={:?}",
+                                name.name, param_tys, ret_ty
+                            ));
                             let scheme = self.generalize(&fn_ty, None);
                             self.set_global(name.name.clone(), scheme);
                             self.registry.extern_fns.insert(name.name.clone());
@@ -518,9 +625,11 @@ impl TypeChecker {
                                 EnumVariantPayloadKind::Tuple(types) if types.len() == 1 => {
                                     Some(self.lower_type(&types[0], &generic_vars)?)
                                 }
+                                EnumVariantPayloadKind::Unit(ty) => {
+                                    Some(self.lower_type(ty, &generic_vars)?)
+                                }
                                 EnumVariantPayloadKind::Tuple(_)
-                                | EnumVariantPayloadKind::Struct(_)
-                                | EnumVariantPayloadKind::Unit(_) => Some(self.solver.fresh_var()),
+                                | EnumVariantPayloadKind::Struct(_) => Some(self.solver.fresh_var()),
                             },
                         };
                         self.registry.enum_variants.insert(
@@ -650,11 +759,7 @@ impl TypeChecker {
     }
 
     fn try_inner_func(&self, ty: String) -> bool {
-        [
-            "break", "continue", "print", "println", "printf", "fprint", "fprintln", "fprintf",
-            "sprint", "sprintln", "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
-        ]
-        .contains(&ty.as_str())
+        ["break", "continue"].contains(&ty.as_str())
     }
 
     fn try_inner_type(&self, ty: &InferType) -> Option<InferType> {
@@ -697,7 +802,13 @@ impl TypeChecker {
         match &pattern.node {
             PatternKind::Wildcard => Ok(()),
             PatternKind::Identifier(id) => {
-                self.insert_local(id.name.clone(), Scheme::mono(self.solver.apply(expected)));
+                let bound_ty = self.solver.apply(expected);
+                self.debug_type_event(
+                    &format!("bind pattern `{}`", id.name),
+                    pattern.span,
+                    &bound_ty,
+                );
+                self.insert_local(id.name.clone(), Scheme::mono(bound_ty));
                 Ok(())
             }
             PatternKind::Literal(lit) => {
@@ -803,7 +914,7 @@ impl TypeChecker {
             | Operator::DivAssign => {
                 let result_ty = match (&left_ty, &right_ty) {
                     (InferType::Con(l), InferType::Con(r)) => {
-                        match (Self::numeric_rank(l), Self::numeric_rank(r)) {
+                        match (numeric_rank(l), numeric_rank(r)) {
                             (Some(lr), Some(rr)) if (lr < 10) == (rr < 10) => {
                                 if lr >= rr {
                                     left_ty.clone()
@@ -845,6 +956,8 @@ impl TypeChecker {
             | Operator::Gt
             | Operator::Le
             | Operator::Ge => {
+                let _ = self.solver.apply(&left_ty);
+                let _ = self.solver.apply(&right_ty);
                 self.solver.unify(&left_ty, &right_ty, Some(span))?;
                 Ok(InferType::Con("Bool".into()))
             }
@@ -856,19 +969,6 @@ impl TypeChecker {
                 Ok(InferType::Con("Bool".into()))
             }
             _ => Ok(self.solver.fresh_var()),
-        }
-    }
-
-    fn numeric_rank(name: &str) -> Option<u8> {
-        match name {
-            "Int8" => Some(0),
-            "Int16" => Some(1),
-            "Int32" => Some(2),
-            "Int64" => Some(3),
-            "Float16" => Some(10),
-            "Float32" => Some(11),
-            "Float64" => Some(12),
-            _ => None,
         }
     }
 
@@ -1120,20 +1220,65 @@ impl TypeChecker {
         let ty = match &expr.node {
             ExpressionKind::Literal(lit) => self.literal_type(lit, expr.span)?,
             ExpressionKind::Identifier(id) => {
-                if id.name.as_str() == "chan" {
-                    return Ok(InferType::App("Chan".into(), vec![self.solver.fresh_var()]));
+                if id.name.as_str() == "chan" && self.lookup(&id.name).is_none() {
+                    let ty = InferType::App("Chan".into(), vec![self.solver.fresh_var()]);
+                    self.debug_type_event(
+                        &format!("builtin identifier `{}`", id.name),
+                        expr.span,
+                        &ty,
+                    );
+                    return Ok(ty);
                 }
                 if self.try_inner_func(id.name.clone()) {
                     return Ok(InferType::Con("Unit".into()));
                 }
-                return self
+                let ty = self
                     .lookup(&id.name)
                     .cloned()
                     .ok_or_else(|| TypeError::UnknownIdentifier {
                         name: id.name.clone(),
                         span: Some(id.span),
                     })
-                    .map(|s| self.instantiate(&s));
+                    .map(|s| self.instantiate(&s))?;
+                self.debug_type_event(&format!("identifier `{}`", id.name), expr.span, &ty);
+                return Ok(ty);
+            }
+            ExpressionKind::Cast {
+                expr: inner,
+                target_type,
+            } => {
+                let src_raw = self.infer_expression(inner)?;
+                let src_ty = self.solver.apply(&src_raw);
+                let dst_ty = self.lower_type(target_type, &HashMap::new())?;
+                let is_scalar = |t: &InferType| {
+                    matches!(t,
+                        InferType::Con(n) if matches!(n.as_str(),
+                            "Int8" | "Int16" | "Int32" | "Int64" |
+                            "Byte" | "Float16" | "Float32" | "Float64" |
+                            "Bool" | "Str" | "Char"
+                        )
+                    )
+                };
+                let is_ptr_like = |t: &InferType| {
+                    matches!(t,
+                        InferType::Con(n) if matches!(n.as_str(),
+                            "Str" | "Buf" | "Chan" | "Network" | "Listener" | "Socket" | "Stdout" | "Stdin"
+                        )
+                    )
+                };
+                // Reject struct/enum -> numeric (and vice-versa) early with a
+                // clear error; every other combination is left to codegen.
+                let src_is_aggregate = !is_scalar(&src_ty) && !is_ptr_like(&src_ty);
+                let dst_is_aggregate = !is_scalar(&dst_ty) && !is_ptr_like(&dst_ty);
+                if src_is_aggregate || dst_is_aggregate {
+                    return Err(TypeError::TypeMismatch {
+                        expected: dst_ty,
+                        actual: src_ty,
+                        context: "invalid cast".into(),
+                        span: Some(inner.span),
+                    });
+                }
+                dst_ty
             }
             ExpressionKind::UnaryOp { op, expr: inner } => {
                 let ty = self.infer_expression(inner)?;
@@ -1165,6 +1310,18 @@ impl TypeChecker {
                             "Ref".into(),
                             vec![InferType::App("Chan".into(), vec![self.solver.fresh_var()])],
                         ));
+                    }
+                }
+                // Handle builtins that are variadic/untyped at call site
+                if let ExpressionKind::Identifier(id) = &func.node {
+                    if id.name == "chan" {
+                        return Ok(InferType::App(
+                            "Ref".into(),
+                            vec![InferType::App("Chan".into(), vec![self.solver.fresh_var()])],
+                        ));
+                    }
+                    if args.is_empty() && self.registry.struct_fields.contains_key(&id.name) {
+                        return Ok(InferType::Con(id.name.clone()));
                     }
                     if self.try_inner_func(id.name.clone()) {
                         for arg in args {
@@ -1235,6 +1392,10 @@ impl TypeChecker {
                                     )?,
                                 }
                             } else {
+                                self.debug_type_note(&format!(
+                                    "dispatch method `{}.{}` base={:?} args={:?}",
+                                    name, field.name, base_ty, arg_tys
+                                ));
                                 self.infer_method_call(
                                     &name,
                                     &field.name,
@@ -1271,6 +1432,10 @@ impl TypeChecker {
                     arg_tys.push(self.infer_expression(arg)?);
                 }
                 let callee = self.infer_expression(func)?;
+                self.debug_type_note(&format!(
+                    "generic call callee={:?} args={:?}",
+                    callee, arg_tys
+                ));
                 let ret = self.solver.fresh_var();
                 self.solver.unify(
                     &callee,
@@ -1387,6 +1552,7 @@ impl TypeChecker {
         };
         let applied = self.solver.apply(&ty);
         self.types.insert(expr.id, applied.clone());
+        self.debug_type_event("expression", expr.span, &applied);
         Ok(applied)
     }
 
@@ -1411,6 +1577,10 @@ impl TypeChecker {
             });
         };
         let callee = self.instantiate(&scheme);
+        self.debug_type_note(&format!(
+            "infer_method_call {}.{} callee={:?} base={:?} args={:?}",
+            type_name, method, callee, base_ty, arg_tys
+        ));
         let full_args = match self.solver.apply(&callee) {
             InferType::Fn(params, _) if params.len() == arg_tys.len() => arg_tys,
             InferType::Fn(params, _) if params.len() == arg_tys.len() + 1 => {

@@ -21,7 +21,7 @@ jobs:
       matrix:
         os: [windows-2022, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -59,7 +59,7 @@ jobs:
         run: echo "TY_BIN=.\target\debug\tyc.exe" >> $env:GITHUB_ENV
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -136,7 +136,7 @@ jobs:
 
       - name: Upload server log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-log-${{ matrix.os }}
           path: |

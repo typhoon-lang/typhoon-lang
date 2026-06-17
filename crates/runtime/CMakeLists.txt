@@ -27,7 +27,7 @@ add_library(runtime STATIC
   src/ty_net.c
   src/ty_io.c)
 target_include_directories(runtime PUBLIC include/)
-target_compile_definitions(runtime PRIVATE TY_DEBUG_ENABLED=0)
+target_compile_definitions(runtime PRIVATE TY_DEBUG_ENABLED=1)
 
 # Phase 4: link ws2_32 on Windows (needed by ty_fd_close / closesocket in platform.h)
 if(WIN32)

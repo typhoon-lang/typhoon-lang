@@ -73,6 +73,7 @@ fn parse_llvm_to_namespace_unit(
     // Track pending @ty_sig: annotation
     let mut pending_ty_sig: Option<String> = None;
     let mut pending_ty_ns: Option<String> = None;
+    let mut pending_ty_out_result: bool = false;
 
     let mut push_decl = |ns: &str, decl: Declaration| {
         let entry = units
@@ -90,6 +91,12 @@ fn parse_llvm_to_namespace_unit(
         if line.is_empty() {
             pending_ty_sig = None;
             pending_ty_ns = None;
+            pending_ty_out_result = false;
+            continue;
+        }
+
+        if line == "; @ty_out_result" {
+            pending_ty_out_result = true;
             continue;
         }
 
@@ -215,7 +222,7 @@ fn parse_llvm_to_namespace_unit(
                                 type_name, method_name, rest
                             )]
                         })?;
-                        let mut sig = parse_ty_signature(&explicit_sig).ok_or_else(|| {
+                        let mut sig = parse_ty_signature(&explicit_sig, true).ok_or_else(|| {
                             vec![format!(
                                 "Invalid @ty_sig annotation for method {}::{}: {}",
                                 type_name, method_name, explicit_sig
@@ -238,14 +245,27 @@ fn parse_llvm_to_namespace_unit(
                     // Free function - only emit from 'declare', not 'define'
                     if kind == "declare" {
                         let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
-                        if let Some(sig) = parse_ll_declare_signature(rest) {
-                            push_decl(&ns, make_extern_fn_decl(name.to_string(), sig, &ns));
+                        if let Some(sig_str) = pending_ty_sig.take() {
+                            if let Some(sig) = parse_ty_signature(&sig_str, false) {
+                                push_decl(
+                                    &ns,
+                                    make_extern_fn_decl(
+                                        name.to_string(),
+                                        (sig.params, sig.return_type),
+                                        &ns,
+                                        pending_ty_out_result,
+                                    ),
+                                );
+                            }
+                        } else if let Some(sig) = parse_ll_declare_signature(rest) {
+                            push_decl(&ns, make_extern_fn_decl(name.to_string(), sig, &ns, false));
                         }
                     }
                 }
             }
             pending_ty_sig = None;
             pending_ty_ns = None;
+            pending_ty_out_result = false;
         }
     }
 
@@ -285,7 +305,7 @@ fn parse_llvm_to_namespace_unit(
             params.extend(sig.params.clone());
             push_decl(
                 ns,
-                make_extern_fn_decl(mangled, (params, sig.return_type.clone()), ns),
+                make_extern_fn_decl(mangled, (params, sig.return_type.clone()), ns, false),
             );
         }
     }
@@ -293,7 +313,7 @@ fn parse_llvm_to_namespace_unit(
     Ok(units)
 }
 
-fn make_struct_decl(name: &str, ns: &str) -> Declaration {
+fn make_struct_decl(name: &str, _ns: &str) -> Declaration {
     Declaration {
         node: DeclarationKind::Struct {
             name: Identifier {
@@ -431,7 +451,12 @@ fn make_enum_decl(name: &str, generics: Option<&str>, body: &str) -> Declaration
     }
 }
 
-fn make_extern_fn_decl(name: String, sig: (Vec<Parameter>, Option<Type>), ns: &str) -> Declaration {
+fn make_extern_fn_decl(
+    name: String,
+    sig: (Vec<Parameter>, Option<Type>),
+    _ns: &str,
+    out_result: bool,
+) -> Declaration {
     Declaration {
         node: DeclarationKind::UnsafeOrExtern(
             UnsafeOrExternKind::Extern {
@@ -445,6 +470,7 @@ fn make_extern_fn_decl(name: String, sig: (Vec<Parameter>, Option<Type>), ns: &s
                         generics: vec![],
                         params: sig.0,
                         return_type: sig.1,
+                        out_result,
                     },
                     Span::default(),
                 )],
@@ -456,6 +482,7 @@ fn make_extern_fn_decl(name: String, sig: (Vec<Parameter>, Option<Type>), ns: &s
     }
 }
 
+#[allow(dead_code)]
 fn parse_ll_method_signature(
     rest: &str,
     type_name: &str,
@@ -487,6 +514,7 @@ fn parse_ll_method_signature(
             generics: vec![],
             params: vec![],
             return_type: ret,
+            out_result: false,
         });
     }
 
@@ -537,6 +565,7 @@ fn parse_ll_method_signature(
         generics: vec![],
         params,
         return_type: ret,
+        out_result: false,
     })
 }
 
@@ -616,7 +645,28 @@ fn parse_ll_declare_signature(rest: &str) -> Option<(Vec<Parameter>, Option<Type
     Some((params, ret))
 }
 
-fn parse_ty_signature(sig: &str) -> Option<FunctionSignatureKind> {
+fn split_respecting_angles(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        result.push(&s[start..]);
+    }
+    result
+}
+
+fn parse_ty_signature(sig: &str, is_method: bool) -> Option<FunctionSignatureKind> {
     // Parse "fn method(self, arg: Type) -> Ret"
     let body = sig.trim();
     let body = body.strip_prefix("fn")?.trim();
@@ -631,13 +681,16 @@ fn parse_ty_signature(sig: &str) -> Option<FunctionSignatureKind> {
     let mut params = Vec::new();
     let mut self_added = false;
 
-    for (i, param) in params_part.split(',').enumerate() {
+    let param_tokens = split_respecting_angles(params_part);
+
+    for (i, param) in param_tokens.iter().enumerate() {
         let param = param.trim();
         if param.is_empty() {
             continue;
         }
 
         if !self_added
+            && is_method
             && i == 0
             && (param.starts_with("self")
                 || param.starts_with("self:")
@@ -686,6 +739,7 @@ fn parse_ty_signature(sig: &str) -> Option<FunctionSignatureKind> {
         generics: vec![],
         params,
         return_type: ret,
+        out_result: false,
     })
 }
 
@@ -705,6 +759,7 @@ fn parse_ty_type(ty: &str) -> Type {
             .split(',')
             .map(|a| parse_ty_type(a.trim()))
             .collect();
+        let name = if name == "ref" { "Ref" } else { name };
         TypeKind {
             name: name.to_string(),
             generic_args: args,
@@ -719,6 +774,7 @@ fn parse_ty_type(ty: &str) -> Type {
     }
 }
 
+#[allow(dead_code)]
 fn make_runtime_method_extern_from_sig(
     type_name: &str,
     method_name: &str,
@@ -742,12 +798,13 @@ fn make_runtime_method_extern_from_sig(
         format!("__ty_rt__{}__{}", type_name, method_name),
         (params, sig.return_type.clone()),
         "std",
+        false,
     )
 }
 
 /// Parse LLVM type node (e.g., "i8*", "%struct.Network*", "i64") to Typhoon type string
 fn parse_ll_type_node(ll: &str) -> String {
-    let ll = ll.trim().trim_end_matches('*');
+    let ll = ll.trim();
     ll_type_to_ty(ll).to_string()
 }
 
@@ -855,6 +912,19 @@ fn build_namespace_decl_maps(
                     }
                 }
             }
+            // Collect function names from UnsafeOrExtern (extern "C" blocks from .ll)
+            if let DeclarationKind::UnsafeOrExtern(Spanned {
+                node: UnsafeOrExternKind::Extern { declarations, .. },
+                ..
+            }) = &decl.node
+            {
+                for sig in declarations {
+                    let fname = sig.node.name.name.clone();
+                    if !map.contains_key(&fname) {
+                        map.insert(fname.clone(), mangle(ns, &fname));
+                    }
+                }
+            }
         }
         out.insert(ns.clone(), map);
     }
@@ -864,6 +934,98 @@ fn build_namespace_decl_maps(
     } else {
         Err(errors)
     }
+}
+
+/// Gather all function/method names from a declaration, including names from
+/// `Impl` blocks (mangled to `__ty_method__Type__method`) and `UnsafeOrExtern` blocks.
+fn gather_decl_function_names(decl: &Declaration) -> Vec<String> {
+    let mut names = Vec::new();
+    match &decl.node {
+        DeclarationKind::Impl {
+            type_name, methods, ..
+        } => {
+            let base = format!("__ty_method__{}__", type_name.node.name);
+            for m in methods {
+                if let DeclarationKind::Function { name, .. } = &m.node {
+                    names.push(format!("{}{}", base, name.name));
+                }
+            }
+        }
+        DeclarationKind::Extension {
+            type_constraint,
+            methods,
+            ..
+        } => {
+            let base = format!("__ty_method__{}__", type_constraint.node.name);
+            for m in methods {
+                if let DeclarationKind::Function { name, .. } = &m.node {
+                    names.push(format!("{}{}", base, name.name));
+                }
+            }
+        }
+        DeclarationKind::UnsafeOrExtern(Spanned {
+            node: UnsafeOrExternKind::Extern { declarations, .. },
+            ..
+        }) => {
+            for sig in declarations {
+                names.push(sig.node.name.name.clone());
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
+fn record_decl_original_ns(
+    decl: &Declaration,
+    ns: &str,
+    original_ns_by_symbol: &mut HashMap<String, String>,
+) {
+    if let Some(id) = decl_name(decl) {
+        original_ns_by_symbol.insert(id.name.clone(), ns.to_string());
+    }
+    if let DeclarationKind::Enum { variants, .. } = &decl.node {
+        for variant in variants {
+            original_ns_by_symbol.insert(variant.node.name.name.clone(), ns.to_string());
+        }
+    }
+    if let DeclarationKind::UnsafeOrExtern(Spanned {
+        node: UnsafeOrExternKind::Extern { declarations, .. },
+        ..
+    }) = &decl.node
+    {
+        for sig in declarations {
+            original_ns_by_symbol.insert(sig.node.name.name.clone(), ns.to_string());
+        }
+    }
+}
+
+fn record_units_original_ns(
+    units: &HashMap<String, NamespaceUnit>,
+    decl_maps: &HashMap<String, HashMap<String, String>>,
+    order: &[String],
+) -> HashMap<String, String> {
+    let mut desugar = Desugar::new();
+    let mut original_ns_by_symbol = HashMap::new();
+
+    for ns in order {
+        let unit = units.get(ns).unwrap();
+        let alias = match build_alias_map(ns, units, decl_maps) {
+            Ok(alias) => alias,
+            Err(_) => continue,
+        };
+        for mut decl in unit.declarations.clone() {
+            desugar.rename_declaration(&mut decl, &alias);
+            if desugar.desugar_declaration(&mut decl).is_err() {
+                continue;
+            }
+            for expanded in expand_impl_and_extension_decls(decl) {
+                record_decl_original_ns(&expanded, ns, &mut original_ns_by_symbol);
+            }
+        }
+    }
+
+    original_ns_by_symbol
 }
 
 fn use_target(path: &UsePath) -> Option<(String, Option<String>, bool)> {
@@ -1033,7 +1195,19 @@ fn build_alias_map(
                 }
             }
         } else if let Some(name) = imported_name {
-            let Some(mangled) = target_map.get(&name) else {
+            let mangled = target_map.get(&name).cloned().or_else(|| {
+                units.get(&target_ns).and_then(|unit| {
+                    for decl in &unit.declarations {
+                        if let DeclarationKind::Enum { variants, .. } = &decl.node {
+                            if variants.iter().any(|v| v.node.name.name == name) {
+                                return Some(mangle(&target_ns, &name));
+                            }
+                        }
+                    }
+                    None
+                })
+            });
+            let Some(mangled) = mangled else {
                 errors.push(format!(
                     "Unknown import '{}' from namespace '{}' (imported by '{}')",
                     name, target_ns, ns
@@ -1041,14 +1215,37 @@ fn build_alias_map(
                 continue;
             };
             if let Some(existing) = alias.get(&name) {
-                if existing != mangled {
+                if existing != &mangled {
                     errors.push(format!(
                         "Conflicting import '{}' in namespace '{}' ({} vs {})",
                         name, ns, existing, mangled
                     ));
                 }
             } else {
-                alias.insert(name, mangled.clone());
+                alias.insert(name.clone(), mangled.clone());
+            }
+
+            if let Some(unit) = units.get(&target_ns) {
+                for decl in &unit.declarations {
+                    if let DeclarationKind::Enum { name: enum_name, variants, .. } = &decl.node {
+                        if enum_name.name == name {
+                            for variant in variants {
+                                let vname = variant.node.name.name.clone();
+                                let vmangled = mangle(&target_ns, &vname);
+                                if let Some(existing) = alias.get(&vname) {
+                                    if existing != &vmangled {
+                                        errors.push(format!(
+                                            "Conflicting import '{}' in namespace '{}' ({} vs {})",
+                                            vname, ns, existing, vmangled
+                                        ));
+                                    }
+                                } else {
+                                    alias.insert(vname, vmangled);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1127,10 +1324,35 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
 
 pub fn compile_project(
     path: &Path,
-) -> Result<(Module, HashMap<String, crate::resolver::DeclInfo>), Vec<String>> {
+) -> Result<(
+    Module,
+    HashMap<String, crate::resolver::DeclInfo>,
+    HashMap<String, String>,
+), Vec<String>> {
     let mut files = collect_ty_files(path).map_err(|e| vec![e])?;
-    files.sort();
-    files.dedup();
+
+    // Discover stdlib .ty source files (next to binary, like typhoon-stdlib.ll)
+    let stdlib_ty_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent()?.parent()?.parent()?.to_owned().into())
+        .map(|d| d.join("crates").join("stdlib").join("src").join("std"))
+        .filter(|p| p.exists());
+    if let Some(dir) = &stdlib_ty_dir {
+        if let Ok(std_files) = collect_ty_files(dir) {
+            files.extend(std_files);
+        }
+    }
+
+    let mut canonical_files = Vec::new();
+    let mut seen_files = HashSet::new();
+    for file in files {
+        let canonical = fs::canonicalize(&file).unwrap_or(file);
+        if seen_files.insert(canonical.clone()) {
+            canonical_files.push(canonical);
+        }
+    }
+    canonical_files.sort();
+    canonical_files.dedup();
 
     let entry_file = if path.is_file() {
         path.to_path_buf()
@@ -1143,7 +1365,7 @@ pub fn compile_project(
     let mut errors = Vec::new();
     let mut parsed_files = HashSet::new();
 
-    for file in files {
+    for file in canonical_files {
         if parsed_files.contains(&file) {
             continue;
         }
@@ -1181,24 +1403,86 @@ pub fn compile_project(
 
         let stdlib_units = parse_llvm_to_namespace_unit(&ll_source)?;
         for (ns_name, unit) in stdlib_units {
-            let entry = units.entry(ns_name).or_insert_with(|| NamespaceUnit {
-                declarations: Vec::new(),
-                uses: Vec::new(),
-            });
+            let entry = units
+                .entry(ns_name.clone())
+                .or_insert_with(|| NamespaceUnit {
+                    declarations: Vec::new(),
+                    uses: Vec::new(),
+                });
             let mut existing_decls = entry
                 .declarations
                 .iter()
                 .filter_map(decl_name)
                 .map(|i| i.name.clone())
                 .collect::<HashSet<_>>();
+            for decl in &entry.declarations {
+                for name in gather_decl_function_names(decl) {
+                    existing_decls.insert(name);
+                }
+            }
             for decl in unit.declarations {
+                let method_names: HashSet<String> =
+                    gather_decl_function_names(&decl).into_iter().collect();
                 if let Some(id) = decl_name(&decl) {
                     if existing_decls.contains(&id.name) {
                         continue;
                     }
                     existing_decls.insert(id.name.clone());
+                    existing_decls.extend(method_names);
+                    entry.declarations.push(decl);
+                } else if !method_names.is_empty() {
+                    match &decl.node {
+                        DeclarationKind::Impl { .. } | DeclarationKind::Extension { .. } => {
+                            let any_new = method_names.iter().any(|n| !existing_decls.contains(n));
+                            if !any_new {
+                                continue;
+                            }
+                            entry.declarations.retain(|d| {
+                                !gather_decl_function_names(d)
+                                    .iter()
+                                    .any(|n| method_names.contains(n))
+                            });
+                            existing_decls.extend(method_names);
+                            entry.declarations.push(decl);
+                        }
+                        DeclarationKind::UnsafeOrExtern(_) => {
+                            let already_in_impl = entry.declarations.iter().any(|d| {
+                                matches!(
+                                    &d.node,
+                                    DeclarationKind::Impl { .. }
+                                        | DeclarationKind::Extension { .. }
+                                ) && gather_decl_function_names(d)
+                                    .iter()
+                                    .any(|n| method_names.contains(n))
+                            });
+                            if already_in_impl {
+                                continue;
+                            }
+                            entry.declarations.retain(|d| {
+                                let dnames = gather_decl_function_names(d);
+                                if dnames.iter().any(|n| method_names.contains(n)) {
+                                    false
+                                } else if let DeclarationKind::UnsafeOrExtern(Spanned {
+                                    node: UnsafeOrExternKind::Extern { declarations, .. },
+                                    ..
+                                }) = &d.node
+                                {
+                                    declarations
+                                        .iter()
+                                        .all(|s| !method_names.contains(&s.node.name.name))
+                                } else {
+                                    true
+                                }
+                            });
+                            existing_decls.extend(method_names);
+                            entry.declarations.push(decl);
+                        }
+                        _ => {
+                            existing_decls.extend(method_names);
+                            entry.declarations.push(decl);
+                        }
+                    }
                 }
-                entry.declarations.push(decl);
             }
         }
     }
@@ -1212,6 +1496,16 @@ pub fn compile_project(
                     "Result".to_string(),
                 ],
                 wildcard: false,
+            },
+            Span::default(),
+        ));
+    }
+
+    if let Some(io_unit) = units.get_mut("std::io") {
+        io_unit.uses.push(Spanned::new_dummy(
+            UsePathKind {
+                segments: vec!["std".to_string(), "buf".to_string()],
+                wildcard: true,
             },
             Span::default(),
         ));
@@ -1242,6 +1536,7 @@ pub fn compile_project(
         });
     let decl_maps = build_namespace_decl_maps(&units)?;
     let order = compute_transitive(&units, &entry_ns)?;
+    let original_ns_by_symbol = record_units_original_ns(&units, &decl_maps, &order);
 
     // 1. Collect declarations from transitive namespaces only.
     let mut global_symbols = HashMap::new();
@@ -1260,13 +1555,17 @@ pub fn compile_project(
                     DeclarationKind::Enum { variants, .. } => {
                         let mut variant_map = HashMap::new();
                         for v in variants {
+                            let vname = v.node.name.name.clone();
                             variant_map.insert(
-                                v.node.name.name.clone(),
+                                vname.clone(),
                                 crate::resolver::EnumVariantInfo {
-                                    name: v.node.name.name.clone(),
+                                    name: vname.clone(),
                                     payload: v.node.payload.clone().map(|p| p.node),
                                 },
                             );
+                            global_symbols
+                                .entry(vname)
+                                .or_insert(crate::resolver::DeclInfo::Function);
                         }
                         crate::resolver::DeclInfo::Enum {
                             variants: variant_map,
@@ -1275,6 +1574,19 @@ pub fn compile_project(
                     _ => crate::resolver::DeclInfo::Unresolved,
                 };
                 global_symbols.insert(id.name.clone(), info);
+            }
+            // Also collect function names from UnsafeOrExtern (extern "C" / runtime helpers)
+            if let DeclarationKind::UnsafeOrExtern(Spanned {
+                node: UnsafeOrExternKind::Extern { declarations, .. },
+                ..
+            }) = &decl.node
+            {
+                for sig in declarations {
+                    let fname = sig.node.name.name.clone();
+                    if !global_symbols.contains_key(&fname) {
+                        global_symbols.insert(fname, crate::resolver::DeclInfo::Function);
+                    }
+                }
             }
         }
     }
@@ -1285,26 +1597,59 @@ pub fn compile_project(
         let own_decl_names: HashSet<String> = unit
             .declarations
             .iter()
-            .filter_map(decl_name)
-            .map(|id| id.name.clone())
+            .flat_map(|decl| {
+                let mut names = Vec::new();
+                if let Some(id) = decl_name(decl) {
+                    names.push(id.name.clone());
+                }
+                if let DeclarationKind::Enum { variants, .. } = &decl.node {
+                    for variant in variants {
+                        names.push(variant.node.name.name.clone());
+                    }
+                }
+                if let DeclarationKind::UnsafeOrExtern(Spanned {
+                    node: UnsafeOrExternKind::Extern { declarations, .. },
+                    ..
+                }) = &decl.node
+                {
+                    for sig in declarations {
+                        names.push(sig.node.name.name.clone());
+                    }
+                }
+                names
+            })
             .collect();
         let alias = build_alias_map(ns, &units, &decl_maps)?;
         let imports_for_ns: HashMap<String, crate::resolver::DeclInfo> = alias
             .keys()
             .filter(|name| !own_decl_names.contains(*name))
-            .filter_map(|name| {
-                global_symbols
-                    .get(name)
-                    .map(|info| (name.clone(), info.clone()))
+            .map(|name| {
+                (
+                    name.clone(),
+                    global_symbols
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(crate::resolver::DeclInfo::Function),
+                )
             })
             .collect();
 
         // Expand impl/extension blocks so the resolver sees individual fn declarations
         let expanded_decls: Vec<Declaration> = unit
-            .declarations
+            .uses
             .iter()
             .cloned()
-            .flat_map(|d| expand_impl_and_extension_decls(d))
+            .map(|path| Declaration {
+                node: DeclarationKind::Use(path),
+                span: Span::default(),
+                id: NodeId(0),
+            })
+            .chain(
+                unit.declarations
+                    .iter()
+                    .cloned()
+                    .flat_map(|d| expand_impl_and_extension_decls(d)),
+            )
             .collect();
 
         let module = Module {
@@ -1343,25 +1688,27 @@ pub fn compile_project(
             span: Span::default(),
         },
         global_symbols,
+        original_ns_by_symbol,
     ))
 }
 
 fn ll_type_to_ty(ll: &str) -> &str {
-    let ll = ll.trim().trim_end_matches('*');
+    let ll = ll.trim();
     match ll {
         "void" => "Unit",
-        "i8" | "i8*" => "Str", // opaque ptr / string
+        "i8" => "Int8",
+        "i8*" => "Str",
         "i16" => "Int16",
         "i32" => "Int32",
         "i64" => "Int64",
         "float" => "Float32",
         "double" => "Float64",
-        s if s.starts_with("%struct.Result__") => "Result", // instantiated generic types
-        s if s.starts_with("%struct.Option__") => "Option", // instantiated generic types
-        s if s.starts_with("%struct.") => {
-            // "%struct.Buf*" -> "Buf", "%struct.TyArray" -> "TyArray"
-            s.trim_start_matches("%struct.")
+        s if s.starts_with("%struct.Result__") => "Result",
+        s if s.starts_with("%struct.Option__") => "Option",
+        s if s.ends_with('*') && s.starts_with("%struct.") => {
+            s.trim_start_matches("%struct.").trim_end_matches('*')
         }
-        _ => "Str", // fallback: treat unknown ptrs as opaque
+        s if s.starts_with("%struct.") => s.trim_start_matches("%struct."),
+        _ => "Str",
     }
 }

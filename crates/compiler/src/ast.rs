@@ -88,6 +88,10 @@ pub type Expression = Spanned<ExpressionKind>;
 pub enum ExpressionKind {
     Literal(Literal),
     Identifier(Identifier),
+    Cast {
+        expr: Box<Expression>,
+        target_type: Type,
+    },
     BinaryOp {
         op: Operator,
         left: Box<Expression>,
@@ -378,6 +382,7 @@ pub struct FunctionSignatureKind {
     pub generics: Vec<GenericParam>,
     pub params: Vec<Parameter>,
     pub return_type: Option<Type>,
+    pub out_result: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

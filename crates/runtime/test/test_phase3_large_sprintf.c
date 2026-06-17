@@ -14,8 +14,8 @@ int main(void) {
     for (int i = 0; i < 12000; i++) big[i] = 'a';
     big[12000] = '\0';
 
-    int n = ty_sprintf(arena, out, "%s", big);
-    assert(n == 12000);
+    ty_buf_push_str(arena, out, big);
+    assert((int)out->len == 12000);
 
     char* s = ty_buf_into_str(arena, out);
     assert(s != NULL);

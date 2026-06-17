@@ -145,28 +145,24 @@ static void ty_sock_set_nonblock(ty_sock_t s) {
 #endif
 }
 
-void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* outp) {
+void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* out) {
     (void)task;
     (void)self;
 
-    TyResult_Listener_i32 out;
-    out.ok = 0;
-    out.value = NULL;
-    out.err = -1;
+    TyResult_Listener_i32 result;
+    result.tag = 1;
+    result.value = NULL;
+    result.err = -1;
 
-    if (!outp) {
-        TY_DEBUG("[net] listen BUG: out=NULL\n");
-        return;
-    }
-    TY_DEBUG("[net] listen enter addr_ptr=%p out_ptr=%p\n", (void*)addr, (void*)outp);
+    TY_DEBUG("[net] listen enter addr_ptr=%p out_ptr=%p\n", (void*)addr, &result);
 
     char* host = NULL;
     char* port = NULL;
     if (!split_host_port(addr, &host, &port)) {
-        out.err = -2;
+        result.err = -2;
         TY_DEBUG("[net] listen invalid addr=\"%s\" (expected host:port)\n",
             addr ? addr : "(null)");
-        *outp = out;
+        *out = result;
         return;
     }
 
@@ -190,7 +186,7 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
     int gai = getaddrinfo((host[0] == '\0') ? NULL : host, port, &hints, &res);
     if (gai != 0 || !res) {
         free(host);
-        out.err = (int32_t)gai;
+        result.err = (int32_t)gai;
 #if defined(_WIN32)
         TY_DEBUG("[net] listen getaddrinfo failed addr=\"%s\" gai=%d (%s)\n",
             addr ? addr : "(null)", gai, gai_strerrorA(gai));
@@ -198,7 +194,7 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
         TY_DEBUG("[net] listen getaddrinfo failed addr=\"%s\" gai=%d (%s)\n",
             addr ? addr : "(null)", gai, gai_strerror(gai));
 #endif
-        *outp = out;
+        *out = result;
         return;
     }
 
@@ -270,20 +266,20 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
 
 #if defined(_WIN32)
     if (s == INVALID_SOCKET) {
-        out.err = last_err ? last_err : ty_net_last_error();
+        result.err = last_err ? last_err : ty_net_last_error();
         char msg[256];
         TY_DEBUG("[net] listen failed addr=\"%s\" wsa=%ld (%s)\n",
-            addr ? addr : "(null)", (long)out.err,
-            ty_net_errstr_win32(out.err, msg, sizeof(msg)));
-        *outp = out;
+            addr ? addr : "(null)", (long)result.err,
+            ty_net_errstr_win32(result.err, msg, sizeof(msg)));
+        *out = result;
         return;
     }
 #else
     if (s < 0) {
-        out.err = last_err ? last_err : ty_net_last_error();
+        result.err = last_err ? last_err : ty_net_last_error();
         TY_DEBUG("[net] listen failed addr=\"%s\" errno=%d (%s)\n",
-            addr ? addr : "(null)", (int)out.err, ty_net_errstr_errno(out.err, NULL, 0));
-        *outp = out;
+            addr ? addr : "(null)", (int)result.err, ty_net_errstr_errno(result.err, NULL, 0));
+        *out = result;
         return;
     }
 #endif
@@ -291,10 +287,10 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
     TyListener* listener = (TyListener*)malloc(sizeof(TyListener));
     if (!listener) {
         ty_sock_close(s);
-        out.err = -3;
+        result.err = -3;
         TY_DEBUG("[net] listen OOM allocating listener for addr=\"%s\"\n",
             addr ? addr : "(null)");
-        *outp = out;
+        *out = result;
         return;
     }
     listener->sock = s;
@@ -305,22 +301,21 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
         ty_fdset_add(&w->fd_set, (ty_fd_t)s);
     }
 
-    out.ok = 1;
-    out.value = listener;
-    out.err = 0;
-    *outp = out;
-    return;
+    result.tag = 0;
+    result.value = listener;
+    result.err = 0;
+    *out = result;
 }
 
-void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* outp) {
-    TyResult_Socket_i32 out;
-    out.ok = 0;
-    out.value = NULL;
-    out.err = -1;
+void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* out) {
+    TyResult_Socket_i32 result;
+    result.tag = 1;
+    result.value = NULL;
+    result.err = -1;
 
     if (!self) {
-        out.err = -2;
-        *outp = out;
+        result.err = -2;
+        *out = result;
         return;
     }
 
@@ -357,8 +352,8 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
                 TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
                 if (!sock) {
                     ty_sock_close(c);
-                    out.err = -3;
-                    *outp = out;
+                    result.err = -3;
+                    *out = result;
                     return;
                 }
                 sock->sock = c;
@@ -369,17 +364,17 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
                     ty_fdset_add(&w->fd_set, (ty_fd_t)c);
                 }
 
-                out.ok = 1;
-                out.value = sock;
-                out.err = 0;
-                *outp = out;
+                result.tag = 0;
+                result.value = sock;
+                result.err = 0;
+                *out = result;
                 return;
             }
 
             /* accept() would block — submit async and park */
             if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
-                out.err = ty_net_last_error();
-                *outp = out;
+                result.err = ty_net_last_error();
+                *out = result;
                 return;
             }
 #endif /* _WIN32 / POSIX */
@@ -407,10 +402,10 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
              * The backend poll() performed the actual accept() syscall and
              * stored the resulting fd as the io_result.  On error the result
              * is the negative errno/WSA error. */
-            int64_t result = ty_io_take_result(coro);
-            TY_DEBUG("[net] accept: resumed coro=%p result=%lld\n", coro, (long long)result);
-            if (result < 0) {
-                int32_t wake_err = (int32_t)(-result);
+            int64_t io_result = ty_io_take_result(coro);
+            TY_DEBUG("[net] accept: resumed coro=%p result=%lld\n", coro, (long long)io_result);
+            if (io_result < 0) {
+                int32_t wake_err = (int32_t)(-io_result);
 #if defined(_WIN32)
                 if (wake_err == WSAEWOULDBLOCK) {
                     continue;
@@ -427,19 +422,19 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
                     continue;
                 }
 #endif
-                out.err = wake_err;
-                *outp = out;
+                result.err = wake_err;
+                *out = result;
                 return;
             }
 
-            ty_sock_t accepted = (ty_sock_t)result;
+            ty_sock_t accepted = (ty_sock_t)io_result;
             /* Set accepted socket non-blocking for async read/write. */
             ty_sock_set_nonblock(accepted);
             TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
             if (!sock) {
                 ty_sock_close(accepted);
-                out.err = -3;
-                *outp = out;
+                result.err = -3;
+                *out = result;
                 return;
             }
             sock->sock = accepted;
@@ -450,10 +445,10 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
                 ty_fdset_add(&w->fd_set, (ty_fd_t)accepted);
             }
 
-            out.ok = 1;
-            out.value = sock;
-            out.err = 0;
-            *outp = out;
+            result.tag = 0;
+            result.value = sock;
+            result.err = 0;
+            *out = result;
             return;
         }
     }
@@ -463,14 +458,14 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     c = (ty_sock_t)accept(self->sock, NULL, NULL);
 #if defined(_WIN32)
     if (c == INVALID_SOCKET) {
-        out.err = ty_net_last_error();
-        *outp = out;
+        result.err = ty_net_last_error();
+        *out = result;
         return;
     }
 #else
     if (c < 0) {
-        out.err = ty_net_last_error();
-        *outp = out;
+        result.err = ty_net_last_error();
+        *out = result;
         return;
     }
 #endif
@@ -481,8 +476,8 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
     if (!sock) {
         ty_sock_close(c);
-        out.err = -3;
-        *outp = out;
+        result.err = -3;
+        *out = result;
         return;
     }
     sock->sock = c;
@@ -494,10 +489,10 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
         ty_fdset_add(&w->fd_set, (ty_fd_t)c);
     }
 
-    out.ok = 1;
-    out.value = sock;
-    out.err = 0;
-    *outp = out;
+    result.tag = 0;
+    result.value = sock;
+    result.err = 0;
+    *out = result;
     return;
 }
 
@@ -592,54 +587,55 @@ void __ty_rt__Socket__consume(void* task, TySocket* self, void* ch) {
  *
  * Blocks the calling coroutine until a byte arrives on the channel or the
  * channel is closed (remote EOF / error). Returns:
- * ok=1, value=byte — byte received, connection still open
- * ok=0, err=0 — channel closed (EOF), caller should stop reading
- * ok=0, err=-1 — self or chan is NULL (programming error)
+ * tag=0, value=byte — byte received, connection still open
+ * tag=1, err=0 — channel closed (EOF), caller should stop reading
+ * tag=1, err=-1 — self or chan is NULL (programming error)
  *
  * Maps to: let Some(i) = ch.recv() else { break; }
  */
-TyResult_i32_i32 __ty_rt__Socket__recv(void* task, TySocket* self, struct TyChan* chan) {
-    TyResult_i32_i32 out;
-    out.ok = 0;
-    out.value = 0;
-    out.err = -1;
+void __ty_rt__Socket__recv(void* task, TySocket* self, struct TyChan* chan, TyResult_i32_i32* out) {
+    TyResult_i32_i32 result;
+    result.tag = 1;
+    result.value = 0;
+    result.err = -1;
 
-    if (!self || !chan) return out;
+    if (!self || !chan) { *out = result; return; }
 
     int8_t byte = 0;
     /* ty_chan_recv now returns 1 (data) or -1 (closed/EOF). */
     int status = ty_chan_recv(task, chan, &byte);
     if (status == -1) {
         /* Channel closed — signal EOF cleanly, not as an error. */
-        out.err = 0;
-        return out;
+        result.err = 0;
+        *out = result;
+        return;
     }
 
-    out.ok = 1;
-    out.value = (int32_t)(uint8_t)byte;
-    out.err = 0;
-    return out;
+    result.tag = 0;
+    result.value = (int32_t)(uint8_t)byte;
+    result.err = 0;
+    *out = result;
 }
 
 /*
  * Socket__try_recv — non-blocking receive.
  *
  * Returns immediately whether or not a byte is available:
- * ok=1, value=byte — byte received
- * ok=0, err=1 — would block (no data yet, connection still open)
- * ok=0, err=0 — channel closed (EOF)
- * ok=0, err=-1 — self or chan is NULL
+ * tag=0, value=byte — byte received
+ * tag=1, err=1 — would block (no data yet, connection still open)
+ * tag=1, err=0 — channel closed (EOF)
+ * tag=1, err=-1 — self or chan is NULL
  *
  * Maps to: let Some(i) = ch.try_recv() else { break; }
  * Callers MUST distinguish err=1 (retry later) from err=0 (stop reading).
  */
-TyResult_i32_i32 __ty_rt__Socket__try_recv(void* task, TySocket* self, struct TyChan* chan) {
-    TyResult_i32_i32 out;
-    out.ok = 0;
-    out.value = 0;
-    out.err = -1;
+void __ty_rt__Socket__try_recv(void* task, TySocket* self, struct TyChan* chan, TyResult_i32_i32* out) {
+    TyResult_i32_i32 result;
+    result.tag = 1;
+    result.value = 0;
+    result.err = -1;
 
-    if (!self || !chan) return out;
+    if (!self || !chan) { *out = result; return; }
 
     int8_t byte = 0;
     /* ty_chan_try_recv returns:
@@ -648,25 +644,25 @@ TyResult_i32_i32 __ty_rt__Socket__try_recv(void* task, TySocket* self, struct Ty
      * -1 — channel closed (EOF) (TY_CHAN_CLOSED) → err=0 */
     int status = ty_chan_try_recv(task, chan, &byte);
     if (status == 1) {
-        out.ok = 1;
-        out.value = (int32_t)(uint8_t)byte;
-        out.err = 0;
+        result.tag = 0;
+        result.value = (int32_t)(uint8_t)byte;
+        result.err = 0;
     } else if (status == 0) {
-        out.err = 1; /* would block — not an error, not EOF */
+        result.err = 1; /* would block — not an error, not EOF */
     } else {
-        out.err = 0; /* -1 == closed — EOF */
+        result.err = 0; /* -1 == closed — EOF */
     }
-    return out;
+    *out = result;
 }
 
-TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, int32_t len) {
+void __ty_rt__Socket__write(void* task, TySocket* self, char* buf, int32_t len, TyResult_i32_i32* out) {
     (void)task;
-    TyResult_i32_i32 out;
-    out.ok = 0;
-    out.value = 0;
-    out.err = -1;
+    TyResult_i32_i32 result;
+    result.tag = 1;
+    result.value = 0;
+    result.err = -1;
 
-    if (!self || !buf) return out;
+    if (!self || !buf) { *out = result; return; }
 
     /* Phase 4: use async driver when inside a coroutine. */
     SlabArena* arena = (SlabArena*)task;
@@ -676,26 +672,29 @@ TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, i
         ty_io_write(drv, arena, coro, self->sock, (const uint8_t*)buf, (size_t)len);
         int64_t r = ty_io_take_result(coro);
         if (r < 0) {
-            out.err = (int32_t)(-r);
-            return out;
+            result.err = (int32_t)(-r);
+            *out = result;
+            return;
         }
-        out.ok = 1;
-        out.value = (int32_t)r;
-        out.err = 0;
-        return out;
+        result.tag = 0;
+        result.value = (int32_t)r;
+        result.err = 0;
+        *out = result;
+        return;
     }
 
     /* sync fallback */
     int r = send(self->sock, buf, len, 0);
     if (r < 0) {
-        out.err = ty_net_last_error();
-        return out;
+        result.err = ty_net_last_error();
+        *out = result;
+        return;
     }
 
-    out.ok = 1;
-    out.value = r;
-    out.err = 0;
-    return out;
+    result.tag = 0;
+    result.value = r;
+    result.err = 0;
+    *out = result;
 }
 
 /*
@@ -706,13 +705,13 @@ TyResult_i32_i32 __ty_rt__Socket__write(void* task, TySocket* self, char* buf, i
  * Returns (Socket, buf, Result<Int32, IoError>) — Socket returned so liveness
  * checker can track the resource after the call.
  */
-TyResult_i32_i32 __ty_rt__Socket__read(void* task, TySocket* self, char* buf, int32_t cap) {
-    TyResult_i32_i32 out;
-    out.ok = 0;
-    out.value = 0;
-    out.err = -1;
+void __ty_rt__Socket__read(void* task, TySocket* self, char* buf, int32_t cap, TyResult_i32_i32* out) {
+    TyResult_i32_i32 result;
+    result.tag = 1;
+    result.value = 0;
+    result.err = -1;
 
-    if (!self || !buf) return out;
+    if (!self || !buf) { *out = result; return; }
 
     SlabArena* arena = (SlabArena*)task;
     void* coro = ty_current_coro_raw();
@@ -730,13 +729,15 @@ TyResult_i32_i32 __ty_rt__Socket__read(void* task, TySocket* self, char* buf, in
         /* Coroutine is parked by ty_io_submit; resumes when completion fires. */
         int64_t r = ty_io_take_result(coro);
         if (r < 0) {
-            out.err = (int32_t)(-r);
-            return out;
+            result.err = (int32_t)(-r);
+            *out = result;
+            return;
         }
-        out.ok = 1;
-        out.value = (int32_t)r;
-        out.err = 0;
-        return out;
+        result.tag = 0;
+        result.value = (int32_t)r;
+        result.err = 0;
+        *out = result;
+        return;
     }
 
     /* sync fallback — outside coroutine context */
@@ -747,13 +748,14 @@ TyResult_i32_i32 __ty_rt__Socket__read(void* task, TySocket* self, char* buf, in
     do { n = recv(self->sock, buf, (size_t)cap, 0); } while (n < 0 && errno == EINTR);
 #endif
     if (n < 0) {
-        out.err = ty_net_last_error();
-        return out;
+        result.err = ty_net_last_error();
+        *out = result;
+        return;
     }
-    out.ok = 1;
-    out.value = (int32_t)n;
-    out.err = 0;
-    return out;
+    result.tag = 0;
+    result.value = (int32_t)n;
+    result.err = 0;
+    *out = result;
 }
 
 void __ty_rt__Listener__close(void* task, TyListener* self) {

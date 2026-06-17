@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug)]
 struct LiveBinding {
     consumed: bool,
+    ptr: bool,
+    copy: bool,
     origin: String,
     span: Span,
 }
@@ -31,6 +33,8 @@ impl LiveSet {
         origin: &str,
         mutable: bool,
         shared: bool,
+        ptr: bool,
+        copy: bool,
     ) -> Result<(), String> {
         if self.bindings.contains_key(&name.name)
             || self.mutables.contains(&name.name)
@@ -48,6 +52,8 @@ impl LiveSet {
                 name.name.clone(),
                 LiveBinding {
                     consumed: false,
+                    ptr,
+                    copy,
                     origin: origin.to_string(),
                     span: name.span,
                 },
@@ -61,6 +67,9 @@ impl LiveSet {
             return Ok(());
         }
         if let Some(binding) = self.bindings.get_mut(name) {
+            if binding.ptr || binding.copy {
+                return Ok(());
+            }
             if binding.consumed {
                 Err(format!(
                     "Binding '{}' already consumed ({}) [span {}]",
@@ -122,7 +131,11 @@ impl LiveAnalyzer {
                 self.push();
                 for param in params {
                     let shared = is_ref_type(&param.type_annotation);
-                    if let Err(err) = self.insert_binding(&param.name, "parameter", false, shared) {
+                    let ptr = is_ptr_type(&param.type_annotation);
+                    let copy = is_copy_type(&param.type_annotation);
+                    if let Err(err) =
+                        self.insert_binding(&param.name, "parameter", false, shared, ptr, copy)
+                    {
                         self.errors.push(err);
                         break;
                     }
@@ -171,8 +184,11 @@ impl LiveAnalyzer {
         origin: &str,
         mutable: bool,
         shared: bool,
+        ptr: bool,
+        copy: bool,
     ) -> Result<(), String> {
-        self.current().insert(name, origin, mutable, shared)
+        self.current()
+            .insert(name, origin, mutable, shared, ptr, copy)
     }
 
     fn consume_identifier(&mut self, name: &Identifier, context: &str) -> Result<(), String> {
@@ -242,16 +258,27 @@ impl LiveAnalyzer {
                     .as_ref()
                     .map(|ty| is_ref_type(ty))
                     .unwrap_or(false);
-                // insert_pattern_bindings walks the full pattern tree via
-                // collect_pattern_binders, so Ok(x), Some(i), tuples, etc. all work.
-                // For mutable or shared bindings we still need the single-name fast path
-                // because insert_pattern_bindings always inserts as immutable/non-shared.
+                let ptr = if let Some(ty) = type_annotation.as_ref() {
+                    is_ptr_type(ty)
+                } else {
+                    expr_is_ptr(initializer)
+                };
+                let copy = if type_annotation
+                    .as_ref()
+                    .map_or(false, |ty| is_copy_type(ty))
+                {
+                    true
+                } else if !type_annotation.is_some() {
+                    expr_is_copy(initializer)
+                } else {
+                    false
+                };
                 if *mutable || shared {
                     if let Some(name) = pattern.get_identifier() {
-                        self.insert_binding(name, "let binding", *mutable, shared)?;
+                        self.insert_binding(name, "let binding", *mutable, shared, ptr, copy)?;
                     }
                 } else {
-                    self.insert_pattern_bindings(pattern, "let binding")?;
+                    self.insert_pattern_bindings(pattern, "let binding", ptr, copy)?;
                 }
                 // The else block runs when the pattern doesn't match — analyze it in a
                 // fresh scope so it can't see the bindings introduced by the pattern.
@@ -290,7 +317,17 @@ impl LiveAnalyzer {
                 // Phase 1: find which outer bindings the conc body captures and consume them.
                 let captures = self.collect_free_identifiers(body);
                 for name in &captures {
-                    // consume_identifier already skips mutables and shared (ref) bindings
+                    // Isolation Guard (spec §11): `mut` bindings cannot cross the conc boundary.
+                    // The programmer must freeze a mut into an immutable let before moving it in.
+                    let is_mutable = self.stack.iter().any(|s| s.mutables.contains(name));
+                    if is_mutable {
+                        return Err(format!(
+                            "Cannot capture `mut` binding '{}' into a `conc` block; \
+                             re-bind it as an immutable `let` first to freeze it",
+                            name
+                        ));
+                    }
+
                     for set in self.stack.iter_mut().rev() {
                         if set.bindings.contains_key(name)
                             || set.mutables.contains(name)
@@ -329,7 +366,8 @@ impl LiveAnalyzer {
                         // Pass 1: validate body with loop var in scope (unchanged)
                         self.push();
                         if let PatternKind::Identifier(id) = &pattern.node {
-                            self.insert_binding(id, "for loop", false, false)?;
+                            // Skip duplicate-binding errors from clone bookkeeping; insert normally.
+                            let _ = self.insert_binding(id, "for loop", false, false, true, true);
                         }
                         self.analyze_block_no_drops(body)?;
                         self.pop();
@@ -339,7 +377,7 @@ impl LiveAnalyzer {
                         let mut for_scope = LiveSet::new();
                         if let PatternKind::Identifier(id) = &pattern.node {
                             // ignore duplicate-binding error; this is a fresh scope
-                            let _ = for_scope.insert(id, "for loop", false, false);
+                            let _ = for_scope.insert(id, "for loop", false, false, true, true);
                         }
                         for_base.push(for_scope);
 
@@ -383,6 +421,55 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
+            // StatementKind::Select { arms } => {
+            //     // select waits on multiple channels; exactly one arm fires.
+            //     // Liveness rule (spec §18): all arms must consume the same set of external
+            //     // live bindings — same as match.
+            //     let base = self.stack.clone();
+            //     let mut branch_results = Vec::new();
+            //     for arm in arms {
+            //         let mut branch = LiveAnalyzer {
+            //             stack: base.clone(),
+            //             errors: Vec::new(),
+            //             structured_drops: HashMap::new(),
+            //         };
+            //         // The channel expression in the recv/send arm is consumed.
+            //         if let Some(chan_expr) = &arm.node.channel {
+            //             branch.consume_identifiers_in_expression(chan_expr)?;
+            //         }
+            //         // The receive binding, if any, is introduced for the arm body.
+            //         branch.push();
+            //         if let Some(binding) = &arm.node.binding {
+            //             // Received value is a fresh linear binding inside the arm.
+            //             let _ = branch.insert_binding(
+            //                 binding,
+            //                 "select arm",
+            //                 false,
+            //                 false,
+            //                 false,
+            //                 false,
+            //             );
+            //         }
+            //         branch.analyze_block_no_drops(&arm.node.body)?;
+            //         branch.pop();
+            //         if !branch.errors.is_empty() {
+            //             return Err(branch.errors.join("; "));
+            //         }
+            //         branch_results.push(branch.stack);
+            //     }
+            //     if let Some(first) = branch_results.first() {
+            //         for (idx, branch) in branch_results.iter().enumerate().skip(1) {
+            //             self.ensure_branch_consistency(
+            //                 &base,
+            //                 first,
+            //                 branch,
+            //                 &format!("select arm {}", idx),
+            //             )?;
+            //         }
+            //         self.merge_branch_result(first);
+            //     }
+            //     Ok(())
+            // }
             _ => Err("Unsupported statement type".to_string()),
         }
     }
@@ -426,6 +513,7 @@ impl LiveAnalyzer {
                 self.analyze_expression(right)?;
                 Ok(())
             }
+            ExpressionKind::Cast { expr, .. } => self.analyze_expression(expr),
             ExpressionKind::UnaryOp { expr, .. } => self.analyze_expression(expr),
             ExpressionKind::FieldAccess { base, .. } => {
                 // Accessing a field or calling a method on a binding is a borrow, not a move.
@@ -452,17 +540,47 @@ impl LiveAnalyzer {
                 Ok(())
             }
             ExpressionKind::Match { expr, arms } => {
-                self.analyze_expression(expr)?;
+                // Consume the scrutinee — it is moved into the match (spec §10).
+                self.consume_identifiers_in_expression(expr)?;
+                // Each arm runs in its own scope with pattern bindings introduced.
+                let base = self.stack.clone();
+                let mut branch_results = Vec::new();
                 for arm in arms {
-                    // Match-arm patterns introduce new bindings that must be in-scope
-                    // for the arm's guard and body.
-                    self.push();
-                    self.insert_pattern_bindings(&arm.node.pattern, "match binding")?;
-                    if let Some(guard) = &arm.node.guard {
-                        self.analyze_expression(guard)?;
+                    let mut branch = LiveAnalyzer {
+                        stack: base.clone(),
+                        errors: Vec::new(),
+                        structured_drops: HashMap::new(),
+                    };
+                    branch.push();
+                    if let Err(err) = branch.insert_pattern_bindings(
+                        &arm.node.pattern,
+                        "match binding",
+                        false,
+                        false,
+                    ) {
+                        return Err(err);
                     }
-                    self.analyze_expression(&arm.node.body)?;
-                    self.pop();
+                    if let Some(guard) = &arm.node.guard {
+                        branch.analyze_expression(guard)?;
+                    }
+                    branch.consume_identifiers_in_expression(&arm.node.body)?;
+                    branch.pop();
+                    if !branch.errors.is_empty() {
+                        return Err(branch.errors.join("; "));
+                    }
+                    branch_results.push(branch.stack);
+                }
+                // Enforce branch consistency across all arms (spec §10).
+                if let Some(first) = branch_results.first() {
+                    for (idx, branch) in branch_results.iter().enumerate().skip(1) {
+                        self.ensure_branch_consistency(
+                            &base,
+                            first,
+                            branch,
+                            &format!("match arm {}", idx),
+                        )?;
+                    }
+                    self.merge_branch_result(first);
                 }
                 Ok(())
             }
@@ -528,6 +646,7 @@ impl LiveAnalyzer {
                 self.consume_identifiers_in_expression(right)?;
                 Ok(())
             }
+            ExpressionKind::Cast { expr, .. } => self.consume_identifiers_in_expression(expr),
             ExpressionKind::UnaryOp { expr, .. } => self.consume_identifiers_in_expression(expr),
             ExpressionKind::FieldAccess { base, .. } => {
                 // Accessing a field or calling a method on a binding is a borrow, not a move.
@@ -554,18 +673,92 @@ impl LiveAnalyzer {
                 Ok(())
             }
             ExpressionKind::Match { expr, arms } => {
+                // Consume the scrutinee inside a scope that contains EACH arm's
+                // pattern bindings as well, so a binding in the scrutinee that is
+                // also bound by an arm pattern refers to the arm binding, not the
+                // outer one — preserving shadow semantics for liveness.
+                //
+                // We snapshot the current stack, push the pattern bindings on a
+                // copy, consume the scrutinee once at the union-of-patterns level,
+                // and then merge back the consumptions.
+                if arms.is_empty() {
+                    return self.consume_identifiers_in_expression(expr);
+                }
+                let pre_stack = self.stack.clone();
+                // Pick the first arm as representative for a single scrutinee
+                // consumption. For arms whose pattern doesn't bind the consumed
+                // name, we still want that consumption — the consume applied to
+                // pre_stack will use whichever binding is closest.
+                self.push();
+                if let Some(first) = arms.first() {
+                    self.insert_pattern_bindings(
+                        &first.node.pattern,
+                        "match binding",
+                        false,
+                        false,
+                    )?;
+                }
                 self.consume_identifiers_in_expression(expr)?;
+                // For each subsequent arm, ensure pattern-bound names are also
+                // present so consumption sees the right binding if the scrutinee
+                // is evaluated under that arm's scope too.
+                for arm in arms.iter().skip(1) {
+                    // Sync arm bindings into the current scope for free-id lookup,
+                    // but only for identifiers not already there.
+                    let mut binders: HashMap<String, Identifier> = HashMap::new();
+                    self.collect_pattern_binders(&arm.node.pattern, &mut binders);
+                    for (name, id) in binders {
+                        if !self.name_in_any_scope(&name) {
+                            let _ = self.insert_binding(
+                                &id,
+                                "match binding",
+                                false,
+                                false,
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                }
+                // Now drop the temporary scope but preserve consumption marks on
+                // bindings still in the outer scope. We do this by replaying
+                // consumption: any binding still consumed at the temp scope's
+                // top is also marked consumed in the next-outer scope if the
+                // name's binding there is identical (i.e., not shadowed here).
+                let top = self.stack.last().cloned().unwrap();
+                self.pop();
+                // For each consumed binding in the temp top:
+                for (name, top_binding) in &top.bindings {
+                    if top_binding.consumed {
+                        if let Some(outer) = self.stack.last_mut() {
+                            if let Some(outer_binding) = outer.bindings.get_mut(name) {
+                                // Only mark consumed if not shadowed here (ptr types ok)
+                                if !outer_binding.ptr {
+                                    outer_binding.consumed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Now analyze each arm with pattern bindings pushed.
                 for arm in arms {
-                    // Match-arm patterns introduce new bindings that must be in-scope
-                    // for the arm's guard and body.
                     self.push();
-                    self.insert_pattern_bindings(&arm.node.pattern, "match binding")?;
+                    if let Err(err) = self.insert_pattern_bindings(
+                        &arm.node.pattern,
+                        "match binding",
+                        false,
+                        false,
+                    ) {
+                        self.pop();
+                        return Err(err);
+                    }
                     if let Some(guard) = &arm.node.guard {
                         self.consume_identifiers_in_expression(guard)?;
                     }
                     self.consume_identifiers_in_expression(&arm.node.body)?;
                     self.pop();
                 }
+                let _ = pre_stack;
                 Ok(())
             }
             ExpressionKind::Pipe { left, right } => {
@@ -735,6 +928,12 @@ impl LiveAnalyzer {
                     self.collect_free_in_expr(&arm.node.body, bound, free);
                 }
             }
+            ExpressionKind::Cast { expr, .. } => {
+                self.collect_free_in_expr(expr, bound, free);
+            }
+            ExpressionKind::UnaryOp { expr, .. } => {
+                self.collect_free_in_expr(expr, bound, free);
+            }
             ExpressionKind::Block(block) => self.collect_free_in_block(block, bound, free),
             _ => {}
         }
@@ -778,21 +977,7 @@ impl LiveAnalyzer {
             for (name, base_binding) in &base_set.bindings {
                 let after = loop_stack[depth].bindings.get(name).unwrap_or(base_binding);
 
-                // If it's a parameter, it's a copy.
-                if base_binding.origin == "parameter" {
-                    continue;
-                }
-
-                // If it is in any shared set (including the one we are iterating on),
-                // it's shared and thus safe.
-                // ALSO, for now, if it is a `ref` type, let's just allow it for all
-                // identifiers that were declared as `ref`.
-                // For now, I will just print the bindings that are causing trouble.
-
-                // A loop body must not consume a binding from the outer scope —
-                // the loop might run zero times, so the binding would escape unconsumed.
                 if !base_binding.consumed && after.consumed {
-                    // Check if it is shared in any set
                     if base.iter().any(|s| s.shared.contains(name)) {
                         continue;
                     }
@@ -842,7 +1027,9 @@ impl LiveAnalyzer {
         };
 
         branch.push();
-        if let Err(err) = branch.insert_pattern_bindings(&arm.node.pattern, "match binding") {
+        if let Err(err) =
+            branch.insert_pattern_bindings(&arm.node.pattern, "match binding", false, false)
+        {
             branch.errors.push(err);
         }
         if let Some(guard) = &arm.node.guard {
@@ -862,7 +1049,13 @@ impl LiveAnalyzer {
         }
     }
 
-    fn insert_pattern_bindings(&mut self, pattern: &Pattern, origin: &str) -> Result<(), String> {
+    fn insert_pattern_bindings(
+        &mut self,
+        pattern: &Pattern,
+        origin: &str,
+        ptr: bool,
+        copy: bool,
+    ) -> Result<(), String> {
         let mut binders: HashMap<String, Identifier> = HashMap::new();
         self.collect_pattern_binders(pattern, &mut binders);
         for (name, id) in binders {
@@ -870,7 +1063,7 @@ impl LiveAnalyzer {
             if self.name_in_outer_scopes(&name) {
                 continue;
             }
-            self.insert_binding(&id, origin, false, false)?;
+            self.insert_binding(&id, origin, false, false, ptr, copy)?;
         }
         Ok(())
     }
@@ -880,6 +1073,14 @@ impl LiveAnalyzer {
             return false;
         }
         self.stack[..self.stack.len() - 1].iter().any(|set| {
+            set.bindings.contains_key(name)
+                || set.mutables.contains(name)
+                || set.shared.contains(name)
+        })
+    }
+
+    fn name_in_any_scope(&self, name: &str) -> bool {
+        self.stack.iter().any(|set| {
             set.bindings.contains_key(name)
                 || set.mutables.contains(name)
                 || set.shared.contains(name)
@@ -924,9 +1125,70 @@ fn format_span(span: Span) -> String {
 }
 
 fn is_ref_type(ty: &Type) -> bool {
-    // Parser canonicalizes `ref T` (and `&T`) to a type named "Ref".
-    // Keep accepting lowercase "ref" for any hand-constructed ASTs/tests.
     matches!(ty.node.name.as_str(), "Ref" | "ref")
+}
+
+fn is_copy_type(ty: &Type) -> bool {
+    matches!(
+        ty.node.name.as_str(),
+        "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "Byte"
+            | "Float16"
+            | "Float32"
+            | "Float64"
+            | "Bool"
+            | "Char"
+            | "Unit"
+    )
+}
+
+// Opaque runtime handles that are NOT owned resources: views/fat-pointers only.
+// Socket and Listener are intentionally excluded — they are linear resources
+// whose single-owner semantics are enforced by the liveness checker (spec §16).
+fn is_ptr_type(ty: &Type) -> bool {
+    matches!(
+        ty.node.name.as_str(),
+        "Str" | "Stdout" | "Stdin" | "Network" | "Buf"
+    )
+}
+
+fn expr_is_copy(expr: &Expression) -> bool {
+    match &expr.node {
+        ExpressionKind::Literal(lit) => match &lit.kind {
+            LiteralKind::Int(_, _) => true,
+            LiteralKind::Float(_, _) => true,
+            LiteralKind::Bool(_) => true,
+            LiteralKind::Str(_) => false,
+            LiteralKind::Array(_) => false,
+        },
+        ExpressionKind::Cast { target_type, .. } => is_copy_type(target_type),
+        ExpressionKind::BinaryOp { .. } => true,
+        ExpressionKind::UnaryOp { .. } => true,
+        _ => false,
+    }
+}
+
+fn expr_is_ptr(expr: &Expression) -> bool {
+    match &expr.node {
+        ExpressionKind::StructInit { name, .. } => {
+            // Socket and Listener are linear resources — they must NOT be ptr-exempt.
+            matches!(name.name.as_str(), "Stdout" | "Stdin" | "Network" | "Buf")
+        }
+        ExpressionKind::Call { func, .. } => {
+            if let ExpressionKind::Identifier(id) = &func.node {
+                matches!(
+                    id.name.as_str(),
+                    "ty_stdout_getbuf" | "ty_buf_new" | "ty_stdout_new" | "ty_stdin_new"
+                )
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1026,10 +1288,8 @@ mod tests {
 
     #[test]
     fn double_consumption_error() {
-        let errors = analyze(
-            "fn twice() -> Int32 { let value: Int32 = 0; let copy: Int32 = value; return value; }",
-        )
-        .unwrap_err();
+        let errors =
+            analyze("fn twice() -> Token { let b = Token{}; let c = b; return b; }").unwrap_err();
         assert!(errors.iter().any(|msg| msg.contains("already consumed")));
     }
 
@@ -1049,7 +1309,7 @@ mod tests {
                 name: mk_ident("cond"),
                 generics: vec![],
                 params: vec![mk_param("flag", "Bool")],
-                return_type: Some(mk_type("Int32")),
+                return_type: Some(mk_type("Token")),
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
@@ -1057,11 +1317,11 @@ mod tests {
                             PatternKind::Identifier(mk_ident("value")),
                             dummy_span(),
                         ),
-                        type_annotation: Some(mk_type("Int32")),
-                        initializer: mk_expr(ExpressionKind::Literal(Literal {
-                            kind: LiteralKind::Int(1, None),
-                            span: dummy_span(),
-                        })),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: mk_expr(ExpressionKind::StructInit {
+                            name: mk_ident("Token"),
+                            fields: vec![],
+                        }),
                         else_block: None,
                     }),
                     mk_stmt(StatementKind::If {
@@ -1070,12 +1330,10 @@ mod tests {
                             ExpressionKind::Identifier(mk_ident("value")),
                         ))))]),
                         else_branch: Some(mk_else(ElseBranchKind::Block(mk_block(vec![mk_stmt(
-                            StatementKind::Return(Some(mk_expr(ExpressionKind::Literal(
-                                Literal {
-                                    kind: LiteralKind::Int(0, None),
-                                    span: dummy_span(),
-                                },
-                            )))),
+                            StatementKind::Return(Some(mk_expr(ExpressionKind::StructInit {
+                                name: mk_ident("Token"),
+                                fields: vec![],
+                            }))),
                         )])))),
                     }),
                 ]),
@@ -1101,7 +1359,7 @@ mod tests {
                 name: mk_ident("looping"),
                 generics: vec![],
                 params: vec![],
-                return_type: Some(mk_type("Int32")),
+                return_type: Some(mk_type("Token")),
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
@@ -1109,11 +1367,11 @@ mod tests {
                             PatternKind::Identifier(mk_ident("token")),
                             dummy_span(),
                         ),
-                        type_annotation: Some(mk_type("Int32")),
-                        initializer: mk_expr(ExpressionKind::Literal(Literal {
-                            kind: LiteralKind::Int(1, None),
-                            span: dummy_span(),
-                        })),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: mk_expr(ExpressionKind::StructInit {
+                            name: mk_ident("Token"),
+                            fields: vec![],
+                        }),
                         else_block: None,
                     }),
                     mk_stmt(StatementKind::Loop {
@@ -1135,11 +1393,11 @@ mod tests {
 
     #[test]
     fn conc_consumes_captured_bindings() {
-        let lit_int = |n: i64| {
-            mk_expr(ExpressionKind::Literal(Literal {
-                kind: LiteralKind::Int(n, None),
-                span: dummy_span(),
-            }))
+        let tok_init = || {
+            mk_expr(ExpressionKind::StructInit {
+                name: mk_ident("Token"),
+                fields: vec![],
+            })
         };
         let module = Module {
             name: None,
@@ -1147,7 +1405,7 @@ mod tests {
                 name: mk_ident("conc"),
                 generics: vec![],
                 params: vec![],
-                return_type: Some(mk_type("Int32")),
+                return_type: Some(mk_type("Token")),
                 body: mk_block(vec![
                     mk_stmt(StatementKind::LetBinding {
                         mutable: false,
@@ -1155,8 +1413,8 @@ mod tests {
                             PatternKind::Identifier(mk_ident("value")),
                             dummy_span(),
                         ),
-                        type_annotation: Some(mk_type("Int32")),
-                        initializer: lit_int(1),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: tok_init(),
                         else_block: None,
                     }),
                     mk_stmt(StatementKind::Conc {
@@ -1175,6 +1433,105 @@ mod tests {
         let mut analyzer = LiveAnalyzer::new();
         let err = analyzer.analyze_module(&module).unwrap_err();
         assert!(err.iter().any(|msg| msg.contains("already consumed")));
+    }
+
+    #[test]
+    fn conc_mut_capture_rejected() {
+        // Isolation Guard: capturing a `let mut` binding into a conc block must be
+        // a compile error (spec §11). The programmer must freeze it into an
+        // immutable `let` first.
+        let module = Module {
+            name: None,
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("bad_conc"),
+                generics: vec![],
+                params: vec![],
+                return_type: None,
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: true,
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("data")),
+                            dummy_span(),
+                        ),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: mk_expr(ExpressionKind::StructInit {
+                            name: mk_ident("Token"),
+                            fields: vec![],
+                        }),
+                        else_block: None,
+                    }),
+                    mk_stmt(StatementKind::Conc {
+                        body: mk_block(vec![mk_stmt(StatementKind::Expression(mk_expr(
+                            ExpressionKind::Identifier(mk_ident("data")),
+                        )))]),
+                    }),
+                ]),
+            })],
+            span: dummy_span(),
+        };
+
+        let mut analyzer = LiveAnalyzer::new();
+        let err = analyzer.analyze_module(&module).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|msg| msg.contains("mut") && msg.contains("conc")),
+            "expected isolation guard error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn conc_frozen_mut_accepted() {
+        // Freezing a mut into an immutable let before the conc block is the
+        // spec-correct pattern (spec §11 Isolation Guard workflow).
+        let module = Module {
+            name: None,
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("good_conc"),
+                generics: vec![],
+                params: vec![],
+                return_type: None,
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: true,
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("data")),
+                            dummy_span(),
+                        ),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: mk_expr(ExpressionKind::StructInit {
+                            name: mk_ident("Token"),
+                            fields: vec![],
+                        }),
+                        else_block: None,
+                    }),
+                    // Freeze: re-bind as immutable let.
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        pattern: Spanned::new_dummy(
+                            PatternKind::Identifier(mk_ident("frozen")),
+                            dummy_span(),
+                        ),
+                        type_annotation: Some(mk_type("Token")),
+                        initializer: mk_expr(ExpressionKind::Identifier(mk_ident("data"))),
+                        else_block: None,
+                    }),
+                    mk_stmt(StatementKind::Conc {
+                        body: mk_block(vec![mk_stmt(StatementKind::Expression(mk_expr(
+                            ExpressionKind::Identifier(mk_ident("frozen")),
+                        )))]),
+                    }),
+                ]),
+            })],
+            span: dummy_span(),
+        };
+
+        let mut analyzer = LiveAnalyzer::new();
+        assert!(
+            analyzer.analyze_module(&module).is_ok(),
+            "frozen-mut pattern should be accepted by the isolation guard"
+        );
     }
 
     #[test]

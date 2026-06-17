@@ -168,7 +168,9 @@ impl Resolver {
                                     self.resolve_type(scope, ty, &type_params)?;
                                 }
                             }
-                            _ => {}
+                            EnumVariantPayloadKind::Unit(ty) => {
+                                self.resolve_type(scope, ty, &type_params)?;
+                            }
                         }
                     }
                 }
@@ -183,13 +185,7 @@ impl Resolver {
     }
 
     fn internal_name(&self, name: &str) -> bool {
-        let internal = [
-            // flow control
-            "break", "continue", // type
-            "chan",     // stdio
-            "print", "println", "printf", "fprint", "fprintln", "fprintf", "sprint", "sprintln",
-            "sprintf", "scan", "scanf", "fscan", "fscanf", "sscan", "sscanf",
-        ];
+        let internal = ["break", "continue", "chan"];
         return internal.contains(&name);
     }
 
@@ -255,8 +251,10 @@ impl Resolver {
             DeclarationKind::UnsafeOrExtern(uoe) => {
                 if let UnsafeOrExternKind::Extern { declarations, .. } = &uoe.node {
                     for Spanned { node, .. } in declarations {
-                        let decl_id = self.declare(scope, node.name.clone())?;
-                        self.decls.insert(decl_id, DeclInfo::Function);
+                        if self.lookup(scope, &node.name.name).is_none() {
+                            let decl_id = self.declare(scope, node.name.clone())?;
+                            self.decls.insert(decl_id, DeclInfo::Function);
+                        }
                     }
                 }
                 Ok(DeclId(0))
@@ -275,13 +273,24 @@ impl Resolver {
                 let decl_id = self.declare(scope, name.clone())?;
                 let mut variant_map = HashMap::new();
                 for variant in variants {
+                    let vname = variant.node.name.name.clone();
                     variant_map.insert(
-                        variant.node.name.name.clone(),
+                        vname.clone(),
                         EnumVariantInfo {
-                            name: variant.node.name.name.clone(),
+                            name: vname.clone(),
                             payload: variant.node.payload.clone().map(|p| p.node),
                         },
                     );
+                    if self.lookup(scope, &vname).is_none() {
+                        let vdecl = self.declare(
+                            scope,
+                            Identifier {
+                                name: vname.clone(),
+                                span: variant.node.name.span,
+                            },
+                        )?;
+                        self.decls.insert(vdecl, DeclInfo::Unresolved);
+                    }
                 }
                 self.decls.insert(
                     decl_id,
@@ -303,14 +312,16 @@ impl Resolver {
             }
             DeclarationKind::Use(path) => {
                 if let Some(segment) = path.node.segments.last() {
-                    let decl_id = self.declare(
-                        scope,
-                        Identifier {
-                            name: segment.clone(),
-                            span: path.span,
-                        },
-                    )?;
-                    self.decls.insert(decl_id, DeclInfo::Use);
+                    if self.lookup(scope, segment).is_none() {
+                        let decl_id = self.declare(
+                            scope,
+                            Identifier {
+                                name: segment.clone(),
+                                span: path.span,
+                            },
+                        )?;
+                        self.decls.insert(decl_id, DeclInfo::Use);
+                    }
                 }
                 Ok(DeclId(0))
             }
@@ -404,14 +415,16 @@ impl Resolver {
     fn resolve_expression(&mut self, scope: ScopeId, expr: &Expression) -> Result<(), String> {
         match &expr.node {
             ExpressionKind::Identifier(id) => {
-                // Allow built-in identifiers
+                // Allow built-in identifiers and enum variant constructors.
                 match self.internal_name(&id.name) {
                     true => Ok(()),
                     false => {
-                        if self.lookup(scope, &id.name).is_none() {
-                            Err(format!("Unresolved identifier '{}'", id.name))
-                        } else {
+                        if self.lookup(scope, &id.name).is_some() {
                             Ok(())
+                        } else if self.visible_enum_variant(scope, &id.name) {
+                            Ok(())
+                        } else {
+                            Err(format!("Unresolved identifier '{}'", id.name))
                         }
                     }
                 }
@@ -477,6 +490,24 @@ impl Resolver {
             }
         }
         None
+    }
+
+    fn visible_enum_variant(&self, mut scope: ScopeId, name: &str) -> bool {
+        loop {
+            for decl_id in self.scopes[scope.0].symbols.values() {
+                if let Some(DeclInfo::Enum { variants }) = self.decls.get(decl_id) {
+                    if variants.contains_key(name) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(parent) = self.scopes[scope.0].parent {
+                scope = parent;
+            } else {
+                break;
+            }
+        }
+        false
     }
 
     fn declare_pattern(&mut self, scope: ScopeId, pattern: &Pattern) -> Result<(), String> {

@@ -13,7 +13,7 @@ build
 *.pdb
 
 # Generated files
-#*.ll
+*.ll
 *.exe
 *.out
 

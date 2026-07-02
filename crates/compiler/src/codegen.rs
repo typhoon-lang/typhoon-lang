@@ -21,6 +21,7 @@ struct EnumVariantDef {
 
 #[derive(Debug, Clone)]
 struct EnumLayout {
+    #[allow(dead_code)]
     llvm_struct_ty: String,
     tag_ty: String,
     variants: HashMap<String, EnumVariantLayout>,
@@ -47,6 +48,11 @@ pub struct IrFunction {
     pub body: String,
     pub ret_type: String,
     pub params: Vec<(String, String)>,
+    /// Annotation comment lines emitted directly above the `define` line,
+    /// matching the typhoon-stdlib.ll convention:
+    ///   "; @ty_ns: std::net"
+    ///   "; @ty_sig: fn listen(self, addr: Str) -> Result<Listener, Int32>"
+    pub annotations: Vec<String>,
 }
 
 impl IrModule {
@@ -59,6 +65,9 @@ impl IrModule {
                 .map(|(n, ty)| format!("{} %{}", ty, n))
                 .collect::<Vec<_>>()
                 .join(", ");
+            for ann in &func.annotations {
+                out.push(ann.clone());
+            }
             out.push(format!(
                 "define {} @{}({}) {{",
                 func.ret_type, func.name, params
@@ -81,6 +90,7 @@ struct FnContext {
     locals_type: HashMap<String, String>,
     mutable_vars: HashSet<String>,
     next_tmp: usize,
+    chan_elem_tys: HashMap<String, String>,
 }
 
 // ── Type/preamble registry (split from emit state) ────────────────────────────
@@ -91,9 +101,14 @@ struct TypeRegistry {
     struct_fields: HashMap<String, Vec<(String, String)>>,
     func_sigs: HashMap<String, (String, Vec<String>)>,
     extern_fns: HashSet<String>,
+    out_result_funcs: HashSet<String>,
     string_pool: HashMap<String, (String, usize)>,
     enum_defs: HashMap<String, EnumDef>,
     enum_layouts: HashMap<String, EnumLayout>,
+    /// Tracks every symbol name (type or function) already emitted into the
+    /// preamble so that neither `register_runtime_decls` nor
+    /// `register_module_sigs` ever emits a duplicate `declare` or `type` line.
+    declared_syms: HashSet<String>,
 }
 
 impl TypeRegistry {
@@ -104,9 +119,78 @@ impl TypeRegistry {
             struct_fields: HashMap::new(),
             func_sigs: HashMap::new(),
             extern_fns: HashSet::new(),
+            out_result_funcs: HashSet::new(),
             string_pool: HashMap::new(),
             enum_defs: HashMap::new(),
             enum_layouts: HashMap::new(),
+            declared_syms: HashSet::new(),
+        }
+    }
+
+    /// Push a `declare …` line into `extra_preamble` only if `sym` has not
+    /// been declared before.  Returns `true` when the line was actually added.
+    fn push_declare(&mut self, sym: &str, line: String) -> bool {
+        if self.declared_syms.insert(sym.to_string()) {
+            self.extra_preamble.push(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Push a type-definition line into `type_decls` only if `sym` has not
+    /// been declared before.  Returns `true` when the line was actually added.
+    fn push_type_decl(&mut self, sym: &str, line: String) -> bool {
+        let sym = sym
+            .strip_prefix("%struct.")
+            .or_else(|| sym.strip_prefix("%enum."))
+            .or_else(|| sym.strip_prefix("%newtype."))
+            .unwrap_or(sym);
+        if self.declared_syms.insert(sym.to_string()) {
+            self.type_decls.push(line);
+            true
+        } else {
+            // Allow upgrading an opaque stub to a full definition.
+            // Opaque stubs come from empty struct declarations (e.g.
+            // `struct Listener {}`) or from enum-to-struct monomorphisation
+            // placeholder entries.  Later, ensure_enum_layout produces the
+            // real concrete layout, which must replace the opaque line.
+            let is_opaque = line.contains("= type opaque");
+            if !is_opaque {
+                // Find and replace the old opaque entry.
+                let stripped = sym; // already stripped of %struct./%enum./%newtype.
+                // Reconstruct the prefix-pattern: e.g. "%struct.Result__struct_Listenerptr__i32 = type opaque"
+                let prefix = if line.starts_with("%struct.") {
+                    "%struct."
+                } else if line.starts_with("%enum.") {
+                    "%enum."
+                } else if line.starts_with("%newtype.") {
+                    "%newtype."
+                } else {
+                    ""
+                };
+                let old_opaque = format!("{}{} = type opaque", prefix, stripped);
+                // A stored entry may be a single line, or an `@ty_ns` comment
+                // glued to the type line with an embedded '\n' (see the
+                // annotated_line construction above). An exact whole-string
+                // match against `old_opaque` alone misses the annotated case
+                // entirely — match on the entry's last line instead so both
+                // forms upgrade correctly.
+                if let Some(pos) = self
+                    .type_decls
+                    .iter()
+                    .position(|d| d.rsplit('\n').next() == Some(old_opaque.as_str()))
+                {
+                    self.type_decls[pos] = line;
+                    return true;
+                }
+                // If no opaque stub existed, still insert (first concrete def).
+                self.type_decls.push(line);
+                true
+            } else {
+                // New decl is also opaque — don't overwrite existing.
+                false
+            }
         }
     }
 
@@ -163,8 +247,12 @@ impl TypeRegistry {
         base_ty
             .trim_end_matches('*')
             .strip_prefix("%struct.")
-            .map(|name| format!("__ty_method__{}__{}", name, method))
-        // removed: let normalized = name.strip_prefix("struct_").unwrap_or(name);
+            .map(|name| {
+                // Always use __ty_method__ — these are the value-returning wrappers
+                // defined in typhoon-stdlib.ll. __ty_rt__ is the internal out-param
+                // ABI used only by the method wrappers themselves, never by call sites.
+                format!("__ty_method__{}__{}", name, method)
+            })
     }
 
     /// Compute an enum layout from a definition + concrete type args, emit the
@@ -173,7 +261,7 @@ impl TypeRegistry {
         &mut self,
         def: &EnumDef,
         llvm_args: &[String],
-        lower_type: &dyn Fn(&str, &str) -> String, // (ty_name, subst_name) -> llvm_ty
+        _lower_type: &dyn Fn(&str, &str) -> String,
         lower_payload: &mut dyn FnMut(
             &EnumVariantPayloadKind,
             &HashMap<String, String>,
@@ -189,7 +277,7 @@ impl TypeRegistry {
             subst.insert(p.clone(), a.clone());
         }
 
-        let tag_ty = "i8".to_string();
+        let tag_ty = "i32".to_string();
         let mut variants_layout = HashMap::new();
         let mut payload_fields: Vec<String> = Vec::new();
 
@@ -214,8 +302,17 @@ impl TypeRegistry {
         } else {
             format!("{{ {}, {} }}", tag_ty, payload_fields.join(", "))
         };
-        self.type_decls
-            .push(format!("{} = type {}", llvm_struct_ty, body));
+        // Route through push_type_decl (not a raw type_decls.push) so that a
+        // pre-existing opaque stub for this exact mangled name — e.g. one
+        // synthesized from a driver.rs-loaded stdlib symbol and re-emitted by
+        // register_module_sigs — gets upgraded in place instead of duplicated.
+        // A raw push here produces two `%struct.Result__...` type lines for
+        // the same symbol in one compilation unit: LLVM's "redefinition of
+        // type" error.
+        self.push_type_decl(
+            &llvm_struct_ty,
+            format!("{} = type {}", llvm_struct_ty, body),
+        );
         self.enum_layouts.insert(
             llvm_struct_ty.clone(),
             EnumLayout {
@@ -253,13 +350,17 @@ struct IrBuilder<'a> {
     // External state
     types: Option<*const HashMap<NodeId, InferType>>,
     drop_map: &'a HashMap<NodeId, Vec<DropInfo>>,
+    original_ns_by_symbol: &'a HashMap<String, String>,
 
     // Completed trampolines waiting to be appended
     conc_functions: Vec<IrFunction>,
 }
 
 impl<'a> IrBuilder<'a> {
-    fn new(drop_map: &'a HashMap<NodeId, Vec<DropInfo>>) -> Self {
+    fn new(
+        drop_map: &'a HashMap<NodeId, Vec<DropInfo>>,
+        original_ns_by_symbol: &'a HashMap<String, String>,
+    ) -> Self {
         Self {
             lines: Vec::new(),
             entry_allocas: Vec::new(),
@@ -275,6 +376,7 @@ impl<'a> IrBuilder<'a> {
             adt_structs: HashMap::new(),
             types: None,
             drop_map,
+            original_ns_by_symbol,
             conc_functions: Vec::new(),
             chan_elem_tys: HashMap::new(),
         }
@@ -292,6 +394,7 @@ impl<'a> IrBuilder<'a> {
             locals_type: std::mem::take(&mut self.locals_type),
             mutable_vars: std::mem::take(&mut self.mutable_vars),
             next_tmp: self.next_tmp,
+            chan_elem_tys: std::mem::take(&mut self.chan_elem_tys),
         }
     }
 
@@ -304,6 +407,7 @@ impl<'a> IrBuilder<'a> {
         self.locals_type = ctx.locals_type;
         self.mutable_vars = ctx.mutable_vars;
         self.next_tmp = ctx.next_tmp;
+        self.chan_elem_tys = ctx.chan_elem_tys;
     }
 
     fn reset_for_function(&mut self, name: &str, ret_ty: &str) {
@@ -402,14 +506,17 @@ impl<'a> IrBuilder<'a> {
         self.reg = TypeRegistry::new();
         self.adt_structs.clear();
 
-        self.reg.type_decls.extend([
-            "%struct.Buf = type { i8*, i64, i64 }".to_string(),
+        self.reg
+            .push_type_decl("Buf", "%struct.Buf = type { i8*, i64, i64 }".to_string());
+
+        self.reg.push_type_decl(
+            "TyArray",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }".to_string(),
-        ]);
+        );
 
         self.collect_enum_defs(module);
-        self.register_runtime_decls();
         self.register_module_sigs(module);
+        self.register_runtime_decls();
 
         for decl in &module.declarations {
             self.scan_decl_for_adts(decl);
@@ -448,18 +555,47 @@ impl<'a> IrBuilder<'a> {
                 );
             }
         }
-
+        // That's it. No hardcoded Option<Int8>. No hardcoded Result<Listener, Int32>.
+        // No manual variants dict insertions. Just pure AST harvesting.
+        //
+        //
+        // Previously:
+        //
         // Pre-generate layouts for networking Result types used by runtime intrinsics.
-        let res_name = self.result_enum_name();
-        for second in ["Listener", "Socket"] {
-            self.ensure_enum_layout_for_infer(&InferType::App(
-                res_name.clone(),
-                vec![
-                    InferType::Con(second.into()),
-                    InferType::Con("Int32".into()),
-                ],
-            ));
-        }
+        //
+        // We cannot use ensure_enum_layout_for_infer here: Result/Option live in stdlib
+        // modules that are compiled separately, so enum_defs never contains "Result" when
+        // the user module is processed. That causes the lookup to return None and silently
+        // skip registration. Later, the type-checker inference walk may register the same
+        // mangled name with wrong i8 payload types (from an unresolved generic placeholder),
+        // producing extractvalue type mismatches in LLVM.
+        //
+        // Fix: insert the layouts directly, bypassing the enum-def lookup entirely.
+        // The runtime C ABI uses an `ok` byte, not source enum ordinal tags:
+        // ok=1 means Ok(payload), ok=0 means Err(err).
+        // ── Result<Listener, Int32> and Result<Socket, Int32> ────────────────
+        //
+        // ── Option<Int8> and Option<Int32> ───────────────────────────────────
+        //
+        // Option lives in the stdlib module and is never in enum_defs when the
+        // user module is compiled, so ensure_enum_layout_for_infer silently
+        // returns without registering anything.  The mangled type name is still
+        // emitted at use sites (alloca, load, extractvalue), so LLVM would see
+        // an undefined type.
+        //
+        // Worse: if the first use of any Option<T> triggers ensure_enum_layout
+        // via a path where lower_infer_type returns "i8" as a fallback (e.g.
+        // because the channel element type wasn't resolved yet), the layout is
+        // registered with an i8 payload and cached under the mangled name.
+        // A later correct resolution of the same name is a no-op (the cache hit
+        // guard at the top of ensure_enum_layout returns early), so the wrong
+        // layout persists for the entire compilation and every Option<Int32>
+        // alloca is only 2 bytes wide — causing a 4-byte ty_chan_recv to
+        // overflow it on every popcount drain.
+        //
+        // Fix: pre-register the correct layouts here, before any use site can
+        // race to register the wrong ones.  Extend this list as new element
+        // types become common (Int64, Bool, Str, …).
     }
 
     fn register_runtime_decls(&mut self) {
@@ -468,6 +604,7 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_sched_run      ()",
             "declare void @ty_sched_shutdown ()",
             "declare i8*  @ty_spawn          (i8*, i8*, i8*)", // task, fn_ptr, arg
+            "declare i8*  @ty_spawn_closure  (i8*, i8*, i8*, i64)", // task, fn_ptr, closure_ptr, size
             "declare void @ty_yield          ()",
             "declare void @ty_safepoint      ()",
             "declare void @ty_await          (i8*, i8*)", // task, coro_handle
@@ -476,10 +613,6 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_chan_recv      (i8*, i8*, i8*)", // task, chan, out_ptr
             "declare i32  @ty_chan_try_recv  (i8*, i8*, i8*)", // task, chan, out_ptr -> i32 (0/1)
             "declare void @ty_chan_close     (i8*)",      // chan
-            // ── Buf (all now take task first) ──
-            "declare %struct.Buf* @ty_buf_new      (i8* %task)",
-            "declare void         @ty_buf_push_str (i8*, %struct.Buf*, i8*)",
-            "declare i8*          @ty_buf_into_str (i8*, %struct.Buf*)",
             // ── TyArray (all now take task first) ──
             "declare %struct.TyArray* @ty_array_from_fixed (i8*, i8*, i64, i64, i64)",
             "declare void             @ty_array_push       (i8*, %struct.TyArray*, i8*)",
@@ -489,45 +622,36 @@ impl<'a> IrBuilder<'a> {
             "declare i8*  @slab_alloc      (i8* %task, i32 %size_class)",
             "declare void @slab_free       (i8* %task, i8* %ptr, i32 %size_class)",
             "declare void @slab_arena_free (i8*)",
-            // ── I/O driver (file ops) ──────────────────────────────────────────────────
+            // ── I/O subsystem lifecycle (bootstrap only, not user-facing) ─────
             "declare void @ty_io_subsystem_init     ()",
             "declare void @ty_io_subsystem_shutdown ()",
-            "declare i32  @ty_io_open               (i8* %driver, i8* %path, i32 %flags, i32 %mode)",
-            "declare void @ty_io_close              (i8* %driver, i32 %fd)",
-            // ── networking ───────────────────────────────────────────────────────────
+            // ── networking ───────────────────────────────────────────────────────
             "declare void @ty_net_init              ()",
             "declare void @ty_net_shutdown          ()",
             "declare %struct.Network* @ty_net_global()",
-            // ── print family ──────────────────────────────────────────────────────────
-            "declare void @ty_print    (i8* %task, i8* %s)",
-            "declare void @ty_println  (i8* %task, i8* %s)",
-            // ty_printf is varargs — LLVM declares varargs with "..."
-            "declare void @ty_printf   (i8* %task, i8* %fmt, ...)",
-            "declare void @ty_fprint   (i8* %task, i32 %fd, i8* %s)",
-            "declare void @ty_fprintln (i8* %task, i32 %fd, i8* %s)",
-            "declare void @ty_fprintf  (i8* %task, i32 %fd, i8* %fmt, ...)",
-            "declare void @ty_sprint   (i8* %task, %struct.Buf* %out, i8* %s)",
-            "declare void @ty_sprintln (i8* %task, %struct.Buf* %out, i8* %s)",
-            "declare void @ty_sprintf  (i8* %task, %struct.Buf* %out, i8* %fmt, ...)",
-            // ── scan family ───────────────────────────────────────────────────────────
-            "declare i8*  @ty_scan     (i8* %task)",
-            "declare i32  @ty_scanf    (i8* %task, i8* %fmt, ...)",
-            "declare i8*  @ty_fscan    (i8* %task, i32 %fd)",
-            "declare i32  @ty_fscanf   (i8* %task, i32 %fd, i8* %fmt, ...)",
-            "declare i8*  @ty_sscan    (i8* %task, i8* %src, i8** %rest_out)",
-            "declare i32  @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)",
+            // ── IO syscalls (thin wrappers, no task) ─────────────────────────────
+            "declare i64  @ty_sys_write (i32 %fd, i8* %buf, i64 %len)",
+            "declare i64  @ty_sys_read  (i32 %fd, i8* %buf, i64 %len)",
         ];
         for d in decls {
-            self.reg.extra_preamble.push(d.to_string());
+            // Extract the symbol name from "declare <ret> @name(...)" so we
+            // can deduplicate against anything already pushed by
+            // register_module_sigs or a previous call.
+            let sym = d
+                .split('@')
+                .nth(1)
+                .and_then(|s| s.split('(').next())
+                .unwrap_or(d)
+                .trim()
+                .to_string();
+            self.reg.push_declare(&sym, d.to_string());
         }
 
-        // func_sigs for buf/array/scheduler
+        // func_sigs for array/scheduler
         let sigs: &[(&str, &str, &[&str])] = &[
-            ("__ty_buf_new", "%struct.Buf*", &[]),
-            ("__ty_buf_push_str", "void", &["%struct.Buf*", "i8*"]),
-            ("__ty_buf_into_str", "i8*", &["%struct.Buf*"]),
             ("ty_array_push", "void", &["%struct.TyArray*", "i8*"]),
             ("ty_spawn", "i8*", &["i8*", "i8*"]),
+            ("ty_spawn_closure", "i8*", &["i8*", "i8*", "i64"]),
             ("ty_await", "void", &["i8*"]),
             ("ty_yield", "void", &[]),
             ("ty_safepoint", "void", &[]),
@@ -546,72 +670,78 @@ impl<'a> IrBuilder<'a> {
                 ),
             );
         }
-
-        // stdio intrinsics keyed under both source and runtime names
-        let stdio: &[(&str, &str, &str, &[&str])] = &[
-            ("print", "ty_print", "void", &["i8*"]),
-            ("println", "ty_println", "void", &["i8*"]),
-            ("printf", "ty_printf", "void", &["i8*"]),
-            ("fprint", "ty_fprint", "void", &["i32", "i8*"]),
-            ("fprintln", "ty_fprintln", "void", &["i32", "i8*"]),
-            ("fprintf", "ty_fprintf", "void", &["i32", "i8*"]),
-            ("sprint", "ty_sprint", "void", &["%struct.Buf*", "i8*"]),
-            ("sprintln", "ty_sprintln", "void", &["%struct.Buf*", "i8*"]),
-            ("sprintf", "ty_sprintf", "void", &["%struct.Buf*", "i8*"]),
-            ("scan", "ty_scan", "i8*", &[]),
-            ("scanf", "ty_scanf", "i32", &["i8*"]),
-            ("fscan", "ty_fscan", "i8*", &["i32"]),
-            ("fscanf", "ty_fscanf", "i32", &["i32", "i8*"]),
-            ("sscan", "ty_sscan", "i8*", &["i8*", "i8**"]),
-            ("sscanf", "ty_sscanf", "i32", &["i8*", "i8*"]),
-        ];
-        for (src, rt, ret, params) in stdio {
-            let sig = (
-                ret.to_string(),
-                params.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            );
-            self.reg.func_sigs.insert(src.to_string(), sig.clone());
-            self.reg.func_sigs.insert(rt.to_string(), sig);
-        }
+        // Net method stub and IO func_sigs are now derived from .ll @ty_sig
+        // annotations via register_module_sigs — no hardcoded entries needed.
     }
 
     fn register_module_sigs(&mut self, module: &Module) {
+        let module_ns = module.name.as_deref().unwrap_or("");
         for decl in &module.declarations {
+            let ns_comment = annotation_ns_for_decl(module_ns, decl, self.original_ns_by_symbol)
+                .map(|ns| format!("; @ty_ns: {}", ns));
             match &decl.node {
                 DeclarationKind::Struct { name, fields, .. } => {
                     let mut field_types = Vec::new();
                     let mut field_map = Vec::new();
                     for (id, ty) in fields {
-                        let lt = Self::lower_type(
-                            ty,
-                            &self.option_enum_name(),
-                            &self.result_enum_name(),
-                        );
+                        let lt = Self::lower_type(ty);
                         field_types.push(lt.clone());
                         field_map.push((id.name.clone(), lt));
                     }
-                    self.reg.type_decls.push(format!(
-                        "%struct.{} = type {{ {} }}",
+                    let line = format!(
+                        "%struct.{} = type {}",
                         name.name,
-                        field_types.join(", ")
-                    ));
+                        if field_types.is_empty() {
+                            "opaque".to_string()
+                        } else {
+                            format!("{{ {} }}", field_types.join(", "))
+                        }
+                    );
+                    // Only emit the type line if this struct hasn't already been
+                    // declared (e.g. Buf / TyArray are pre-declared as concrete
+                    // layout types in collect_types and must not be overwritten
+                    // with an opaque stub from the source-level `struct Buf {}`).
+                    let annotated_line = if let Some(ref ns) = ns_comment {
+                        format!(
+                            "{}
+{}",
+                            ns, line
+                        )
+                    } else {
+                        line
+                    };
+                    self.reg.push_type_decl(&name.name, annotated_line);
                     self.reg.struct_fields.insert(name.name.clone(), field_map);
                 }
                 DeclarationKind::Enum { name, .. } => {
-                    self.reg
-                        .type_decls
-                        .push(format!("%enum.{} = type opaque", name.name));
+                    let line = format!("%enum.{} = type opaque", name.name);
+                    let annotated = if let Some(ref ns) = ns_comment {
+                        format!(
+                            "{}
+{}",
+                            ns, line
+                        )
+                    } else {
+                        line
+                    };
+                    self.reg.push_type_decl(&name.name, annotated);
                 }
                 DeclarationKind::Newtype { name, type_alias } => {
-                    self.reg.type_decls.push(format!(
+                    let line = format!(
                         "%newtype.{} = type {}",
                         name.name,
-                        Self::lower_type(
-                            type_alias,
-                            &self.option_enum_name(),
-                            &self.result_enum_name()
+                        Self::lower_type(type_alias,)
+                    );
+                    let annotated = if let Some(ref ns) = ns_comment {
+                        format!(
+                            "{}
+{}",
+                            ns, line
                         )
-                    ));
+                    } else {
+                        line
+                    };
+                    self.reg.push_type_decl(&name.name, annotated);
                 }
                 DeclarationKind::Function {
                     name,
@@ -621,19 +751,11 @@ impl<'a> IrBuilder<'a> {
                 } => {
                     let ret_ty = return_type
                         .as_ref()
-                        .map(|ty| {
-                            Self::lower_type(ty, &self.option_enum_name(), &self.result_enum_name())
-                        })
+                        .map(|ty| Self::lower_type(ty))
                         .unwrap_or_else(|| "void".to_string());
                     let mut param_types: Vec<String> = params
                         .iter()
-                        .map(|p| {
-                            Self::lower_type(
-                                &p.type_annotation,
-                                &self.option_enum_name(),
-                                &self.result_enum_name(),
-                            )
-                        })
+                        .map(|p| Self::lower_type(&p.type_annotation))
                         .collect();
                     // Every function (including main, now __ty_main_body) takes task.
                     param_types.insert(0, "i8*".to_string());
@@ -648,41 +770,127 @@ impl<'a> IrBuilder<'a> {
                                 name,
                                 params,
                                 return_type,
+                                out_result,
                                 ..
                             } = node;
-                            let ret_ty = return_type
+                            // A bare by-value struct return is only safe when
+                            // it's small enough to register-pack on every
+                            // target this project builds for. Force the
+                            // out-pointer convention whenever the computed
+                            // size crosses that line, even if the .ty source
+                            // didn't explicitly mark out_result — this is
+                            // what makes Network::listen / Socket::accept /
+                            // Socket::read / Socket::write ABI-correct on
+                            // Windows without requiring every extern decl
+                            // author to reason about struct-return ABI rules
+                            // by hand.
+                            let out_result = *out_result || Self::needs_out_result_abi(return_type);
+                            let out_result = &out_result;
+                            let ty_sig_ret = return_type
                                 .as_ref()
-                                .map(|ty| {
-                                    Self::lower_type(
-                                        ty,
-                                        &self.option_enum_name(),
-                                        &self.result_enum_name(),
-                                    )
-                                })
+                                .map(|ty| Self::lower_type(ty))
                                 .unwrap_or_else(|| "void".to_string());
-                            let param_types: Vec<String> = params
+                            let mut param_types: Vec<String> = params
+                                .iter()
+                                .map(|p| Self::lower_type(&p.type_annotation))
+                                .collect();
+                            let is_method_stub = name.name.starts_with("__ty_method__");
+
+                            // Build annotation prefix lines that mirror typhoon-stdlib.ll.
+                            // These are prepended to the `declare` line so that a consumer
+                            // parsing the emitted IR can reconstruct the full ABI from
+                            // @ty_ns / @ty_sig / @ty_out_result without any hardcoded tables.
+                            let mut ann_lines: Vec<String> = Vec::new();
+                            if let Some(ns) = annotation_ns_for_symbol(
+                                module_ns,
+                                &name.name,
+                                self.original_ns_by_symbol,
+                            ) {
+                                ann_lines.push(format!("; @ty_ns: {}", ns));
+                            }
+                            // Reconstruct the Typhoon-level @ty_sig from AST types.
+                            let sig_params: Vec<String> = params
                                 .iter()
                                 .map(|p| {
-                                    Self::lower_type(
-                                        &p.type_annotation,
-                                        &self.option_enum_name(),
-                                        &self.result_enum_name(),
-                                    )
+                                    format!("{}: {}", p.name.name, ty_type_name(&p.type_annotation))
                                 })
                                 .collect();
-                            // Emit the LLVM declare (no task prefix for raw FFI)
-                            self.reg.extra_preamble.push(format!(
-                                "declare {} @{}({})",
-                                ret_ty,
+                            let sig_ret = return_type
+                                .as_ref()
+                                .map(|ty| format!(" -> {}", ty_type_name(ty)))
+                                .unwrap_or_default();
+                            ann_lines.push(format!(
+                                "; @ty_sig: fn {}({}){}",
                                 name.name,
-                                param_types.join(", ")
+                                sig_params.join(", "),
+                                sig_ret
                             ));
-                            // Register so call-sites resolve correctly
-                            // Mark as no-task by NOT prepending i8* here
-                            self.reg
-                                .func_sigs
-                                .insert(name.name.clone(), (ret_ty, param_types));
-                            self.reg.extern_fns.insert(name.name.clone());
+                            if *out_result {
+                                ann_lines.push("; @ty_out_result".to_string());
+                            }
+
+                            if *out_result {
+                                // C ABI: (task, user_params..., *result) -> void
+                                // @ty_sig describes the caller view (returns Result).
+                                // func_sigs stores the C-level signature WITH task
+                                // (codegen will NOT prepend task for extern_fns, but
+                                // out_result funcs are NOT in extern_fns — codegen
+                                // prepends task + appends result alloca).
+                                self.reg.out_result_funcs.insert(name.name.clone());
+                                let mut c_param_types = vec!["i8*".to_string()];
+                                c_param_types.extend(param_types.clone());
+                                c_param_types.push(format!("{}*", ty_sig_ret));
+                                let decl_line = format!(
+                                    "declare void @{}({})",
+                                    name.name,
+                                    c_param_types.join(", ")
+                                );
+                                let annotated = format!(
+                                    "{}
+{}",
+                                    ann_lines.join(
+                                        "
+"
+                                    ),
+                                    decl_line
+                                );
+                                self.reg.push_declare(&name.name, annotated);
+                                self.reg
+                                    .func_sigs
+                                    .insert(name.name.clone(), ("void".to_string(), c_param_types));
+                                // Do NOT add to extern_fns — codegen prepends task for these.
+                            } else {
+                                if is_method_stub {
+                                    param_types.insert(0, "i8*".to_string());
+                                } else if !is_no_task_intrinsic(&name.name) {
+                                    // Non-method C runtime helpers that take task:
+                                    // prepend task to func_sigs so codegen's
+                                    // emit_free_call aligns args correctly.
+                                    param_types.insert(0, "i8*".to_string());
+                                }
+                                let decl_line = format!(
+                                    "declare {} @{}({})",
+                                    ty_sig_ret,
+                                    name.name,
+                                    param_types.join(", ")
+                                );
+                                let annotated = format!(
+                                    "{}
+{}",
+                                    ann_lines.join(
+                                        "
+"
+                                    ),
+                                    decl_line
+                                );
+                                self.reg.push_declare(&name.name, annotated);
+                                self.reg
+                                    .func_sigs
+                                    .insert(name.name.clone(), (ty_sig_ret, param_types));
+                                if !is_method_stub && is_no_task_intrinsic(&name.name) {
+                                    self.reg.extern_fns.insert(name.name.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -698,9 +906,11 @@ impl<'a> IrBuilder<'a> {
         types: &HashMap<NodeId, InferType>,
         specializations: &HashMap<(String, Vec<InferType>), String>,
         drop_map: &HashMap<NodeId, Vec<DropInfo>>,
+        original_ns_by_symbol: &'a HashMap<String, String>,
     ) -> IrModule {
-        let mut b = IrBuilder::new(drop_map);
+        let mut b = IrBuilder::new(drop_map, original_ns_by_symbol);
         b.types = Some(types as *const _);
+        // Just pass imports down!
         b.collect_types(module);
 
         let mut all_functions: Vec<IrFunction> = module
@@ -724,7 +934,7 @@ impl<'a> IrBuilder<'a> {
 
                 let ret_ty = return_type
                     .as_ref()
-                    .map(|ty| Self::lower_type(ty, &b.option_enum_name(), &b.result_enum_name()))
+                    .map(|ty| Self::lower_type(ty))
                     .unwrap_or_else(|| "void".to_string());
 
                 if is_main(&name.name) {
@@ -737,58 +947,74 @@ impl<'a> IrBuilder<'a> {
                             ("task".to_string(), "i8*".to_string()),
                             ("arg".to_string(), "i8*".to_string()),
                         ],
+                        annotations: vec![],
                     });
                     Some(IrFunction {
                         name: "main".to_string(),
                         body: b.emit_bootstrap_main(),
                         ret_type: "i32".to_string(),
                         params: vec![],
+                        annotations: vec![],
                     })
                 } else {
                     let body_ir = b.emit_function(name, params, &ret_ty, body);
                     let mut param_list: Vec<(String, String)> = params
                         .iter()
-                        .map(|p| {
-                            (
-                                p.name.name.clone(),
-                                Self::lower_type(
-                                    &p.type_annotation,
-                                    &b.option_enum_name(),
-                                    &b.result_enum_name(),
-                                ),
-                            )
-                        })
+                        .map(|p| (p.name.name.clone(), Self::lower_type(&p.type_annotation)))
                         .collect();
                     param_list.insert(0, ("task".to_string(), "i8*".to_string()));
+                    let annotations = build_fn_annotations(
+                        annotation_ns_for_symbol(
+                            module.name.as_deref().unwrap_or(""),
+                            &name.name,
+                            b.original_ns_by_symbol,
+                        ),
+                        &name.name,
+                        params,
+                        return_type.as_ref(),
+                        &b.option_enum_name(),
+                        &b.result_enum_name(),
+                    );
                     Some(IrFunction {
                         name: link_symbol_name(&name.name),
                         body: body_ir,
                         ret_type: ret_ty,
                         params: param_list,
+                        annotations,
                     })
                 }
             })
             .collect();
 
-        for ((func_name, concrete_types), spec_name) in specializations {
+        for ((_func_name, _concrete_types), spec_name) in specializations {
+            let func_name = _func_name.clone();
             if let Some(decl) = module.declarations.iter().find(|d| {
-                matches!(&d.node, DeclarationKind::Function { name, .. } if &name.name == func_name)
+                matches!(&d.node, DeclarationKind::Function { name, .. } if name.name == func_name)
             }) {
                 if let DeclarationKind::Function { name, params, body, return_type, .. } = &decl.node {
                     let ret_ty = return_type.as_ref()
-                        .map(|ty| Self::lower_type(ty,
-                            &b.option_enum_name(),
-                            &b.result_enum_name()))
+                        .map(|ty| Self::lower_type(ty,))
                         .unwrap_or_else(|| "void".to_string());
                     let body_ir = b.emit_function(name, params, &ret_ty, body);
                     let mut param_list: Vec<(String, String)> = params.iter()
-                        .map(|p| (p.name.name.clone(), Self::lower_type(&p.type_annotation,
-                            &b.option_enum_name(),
-                            &b.result_enum_name(),)))
+                        .map(|p| (p.name.name.clone(), Self::lower_type(&p.type_annotation,)))
                         .collect();
                     param_list.insert(0, ("task".to_string(), "i8*".to_string()));
+                    let annotations = build_fn_annotations(
+                            annotation_ns_for_symbol(
+                                module.name.as_deref().unwrap_or(""),
+                                name.name.as_str(),
+                                b.original_ns_by_symbol,
+                            ),
+                            name.name.as_str(),
+                            params,
+                            return_type.as_ref(),
+                            &b.option_enum_name(),
+                            &b.result_enum_name(),
+                        );
                     all_functions.push(IrFunction {
                         name: spec_name.clone(), body: body_ir, ret_type: ret_ty, params: param_list,
+                        annotations,
                     });
                 }
             }
@@ -814,11 +1040,7 @@ impl<'a> IrBuilder<'a> {
         // All functions (including former-main, now __ty_main_body) get a task param.
         self.emit_function_param("task".to_string(), "i8*".to_string());
         for p in params {
-            let ty = Self::lower_type(
-                &p.type_annotation,
-                &self.option_enum_name(),
-                &self.result_enum_name(),
-            );
+            let ty = Self::lower_type(&p.type_annotation);
             self.emit_function_param(p.name.name.clone(), ty);
         }
 
@@ -829,15 +1051,22 @@ impl<'a> IrBuilder<'a> {
                 let val = self.emit_expr(expr);
                 let ty = self.expr_llvm_type(expr);
                 self.emit(format!("  ret {} {}", ty, val));
-            } else if !self
+            } else if self
                 .lines
                 .iter()
-                .any(|l| l.trim_start().starts_with("ret "))
+                .filter(|l| !l.trim_start().is_empty() && !l.trim_start().starts_with(';'))
+                .last()
+                .map_or(false, |l| {
+                    !l.trim_end().ends_with(':')
+                        && !l.starts_with("ret ")
+                        && !l.starts_with("unreachable")
+                })
             {
                 if ret_ty == "void" {
                     self.emit("  ret void".to_string());
                 } else {
-                    self.emit(format!("  ret {} 0", ret_ty));
+                    let z = self.zero_value(ret_ty);
+                    self.emit(format!("  ret {} {}", ret_ty, z));
                 }
             }
         }
@@ -851,7 +1080,8 @@ impl<'a> IrBuilder<'a> {
             if ret_ty == "void" {
                 self.emit("  ret void".to_string());
             } else {
-                self.emit(format!("  ret {} 0", ret_ty));
+                let z = self.zero_value(ret_ty);
+                self.emit(format!("  ret {} {}", ret_ty, z));
             }
         }
 
@@ -874,11 +1104,7 @@ impl<'a> IrBuilder<'a> {
 
         // User params (main normally has none, but handle them anyway).
         for param in params {
-            let ty = Self::lower_type(
-                &param.type_annotation,
-                &self.option_enum_name(),
-                &self.result_enum_name(),
-            );
+            let ty = Self::lower_type(&param.type_annotation);
             let slot = self.tmp();
             self.emit_alloca(&slot, &ty);
             if ty == "%struct.Network*" {
@@ -1004,9 +1230,14 @@ impl<'a> IrBuilder<'a> {
                 }
                 // Destructuring let with optional else block
                 let match_val = self.emit_expr(initializer);
+                // Use the concrete emitted LLVM type of the scrutinee SSA value for IR ops
+                // like `extractvalue`; inferred types can be equivalent but differently
+                // mangled names, which LLVM still treats as distinct nominal types.
+                // In LetBinding, prefer inferred type over value_llvm_type scraping:
                 let match_ty = self
                     .actual_inferred_type(initializer)
                     .map(|t| self.lower_infer_type(&t))
+                    .or_else(|| self.value_llvm_type(&match_val))
                     .unwrap_or_else(|| self.expr_llvm_type(initializer));
                 let then_lbl = self.label("letelse_ok");
                 let else_lbl = self.label("letelse_fail");
@@ -1016,17 +1247,32 @@ impl<'a> IrBuilder<'a> {
                     "  br i1 {}, label %{}, label %{}",
                     ok, then_lbl, else_lbl
                 ));
-                self.emit(format!("{}:", then_lbl));
-                self.bind_pattern_typed(pattern, &match_val, &match_ty, Some(initializer));
-                self.emit(format!("  br label %{}", merge_lbl));
+                // Emit else arm first to determine if it terminates.
                 self.emit(format!("{}:", else_lbl));
                 let else_term = else_block
                     .as_ref()
                     .map(|b| self.emit_block_stmts(b, ret_ty))
                     .unwrap_or(false);
                 if !else_term {
-                    self.emit(format!("  br label %{}", merge_lbl));
+                    // If we are inside a loop, branch back to the loop start
+                    // rather than falling into merge. This implements the correct
+                    // semantics of `let Ok(x) = expr else { ... }` inside a loop:
+                    // when the pattern fails, run the else block then skip the
+                    // rest of the loop body (continue). Without this, any conc{}
+                    // or other statement after the let-else would execute even
+                    // on the failure path — e.g. spawning handle_connection with
+                    // a null/stale socket when accept() fails.
+                    if let Some((loop_start, _)) = self.loop_labels.last().cloned() {
+                        self.emit(format!("  br label %{}", loop_start));
+                    } else {
+                        self.emit(format!("  br label %{}", merge_lbl));
+                    }
                 }
+                // Emit ok arm. Always br to merge — LLVM requires every
+                // basic block to end with an explicit terminator.
+                self.emit(format!("{}:", then_lbl));
+                self.bind_pattern_typed(pattern, &match_val, &match_ty, Some(initializer));
+                self.emit(format!("  br label %{}", merge_lbl));
                 self.emit(format!("{}:", merge_lbl));
                 false
             }
@@ -1063,14 +1309,18 @@ impl<'a> IrBuilder<'a> {
             .iter()
             .filter(|n| *n != "task" && *n != "arg")
             .filter_map(|name| {
-                let slot = self.locals.get(name)?.clone();
-                let ty = self
-                    .locals_type
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| "i32".to_string());
-                let is_mutable = self.mutable_vars.contains(name);
-                Some((name.clone(), slot, ty, is_mutable))
+                if let Some(slot) = self.locals.get(name) {
+                    let ty = self.locals_type.get(name).cloned().unwrap_or("i32".into());
+                    let is_mutable = self.mutable_vars.contains(name);
+                    Some((name.clone(), slot.clone(), ty, is_mutable))
+                } else {
+                    // Surface this — a missing capture is always a codegen bug upstream
+                    self.emit(format!(
+                        "  ; BUG: capture '{}' not found in locals — missing let binding?",
+                        name
+                    ));
+                    None // still skip, but now it's visible
+                }
             })
             .collect();
 
@@ -1087,21 +1337,27 @@ impl<'a> IrBuilder<'a> {
             "  {} = bitcast void(i8*, i8*)* @{} to i8*",
             fn_cast, tramp_name
         ));
-        let closure_arg = tramp_ir.1.unwrap_or_else(|| "null".to_string());
         let tv = self.emit_task_load();
-        self.emit(format!(
-            "  call i8* @ty_spawn(i8* {}, i8* {}, i8* {})",
-            tv, fn_cast, closure_arg
-        ));
+        if let Some((closure_arg, closure_size)) = tramp_ir.1 {
+            self.emit(format!(
+                "  call i8* @ty_spawn_closure(i8* {}, i8* {}, i8* {}, i64 {})",
+                tv, fn_cast, closure_arg, closure_size
+            ));
+        } else {
+            self.emit(format!(
+                "  call i8* @ty_spawn(i8* {}, i8* {}, i8* null)",
+                tv, fn_cast
+            ));
+        }
         self.conc_functions.push(tramp_ir.0);
     }
 
-    /// Returns (IrFunction, closure_raw_ptr).
+    /// Returns (IrFunction, optional (closure_i8_ptr, closure_size)).
     fn emit_conc_no_capture(
         &mut self,
         body: &Block,
         tramp_name: &str,
-    ) -> (IrFunction, Option<String>) {
+    ) -> (IrFunction, Option<(String, i64)>) {
         let ctx = self.save_context();
         self.current_fn_ret_ty = "void".to_string();
         self.current_fn_name = Some(tramp_name.to_string());
@@ -1113,6 +1369,7 @@ impl<'a> IrBuilder<'a> {
         // Free variables must be captured via emit_conc_closure, not by
         // referencing parent alloca slots that won't exist in this coroutine.
         self.emit_block_stmts(body, "void");
+        // No closure to free — nothing was heap-allocated for this trampoline.
         self.emit("  ret void".to_string());
         let saved_tmp = self.next_tmp;
         let ir = IrFunction {
@@ -1123,6 +1380,7 @@ impl<'a> IrBuilder<'a> {
                 ("task".to_string(), "i8*".to_string()),
                 ("arg".to_string(), "i8*".to_string()),
             ],
+            annotations: vec![],
         };
         self.restore_context(ctx);
         self.next_tmp = saved_tmp;
@@ -1134,7 +1392,7 @@ impl<'a> IrBuilder<'a> {
         body: &Block,
         tramp_name: &str,
         captured: &[(String, String, String, bool)],
-    ) -> (IrFunction, Option<String>) {
+    ) -> (IrFunction, Option<(String, i64)>) {
         let closure_ty = format!("%closure.{}", tramp_name);
         let closure_field_tys: Vec<String> = captured
             .iter()
@@ -1146,10 +1404,33 @@ impl<'a> IrBuilder<'a> {
                 }
             })
             .collect();
-        let closure_size: i64 = closure_field_tys
-            .iter()
-            .map(|ty| self.llvm_const_sizeof(ty))
-            .sum();
+        // Compute struct-like size with alignment/padding so it matches C sizeof(struct).
+        let mut offset: i64 = 0;
+        let mut max_align: i64 = 1;
+        for ty in &closure_field_tys {
+            let sz = self.llvm_const_sizeof(ty);
+            let al = self.llvm_const_alignof(ty);
+            if al > max_align {
+                max_align = al;
+            }
+            let pad = if offset % al == 0 {
+                0
+            } else {
+                al - (offset % al)
+            };
+            offset += pad;
+            offset += sz;
+        }
+        let closure_size: i64 = if max_align > 1 {
+            let rem = offset % max_align;
+            if rem == 0 {
+                offset
+            } else {
+                offset + (max_align - rem)
+            }
+        } else {
+            offset
+        };
         let class_id = get_size_class(closure_size);
 
         self.reg.type_decls.push(format!(
@@ -1158,29 +1439,35 @@ impl<'a> IrBuilder<'a> {
             closure_field_tys.join(", ")
         ));
 
-        // Allocate closure in parent
-        let tv = self.emit_task_load();
-        let closure_raw = self.tmp();
+        // Heap-allocate the closure via slab_alloc so it survives past the
+        // current stack frame. Using alloca here would place the closure on
+        // the caller's stack; when the accept loop iterates, the next
+        // accept() overwrites the same stack slot before the spawned coro
+        // has read it, corrupting every previously-spawned coro's captured
+        // socket pointer. slab_alloc gives each conc{} its own stable copy.
+        let task_slot = self.emit_task_load();
+        // slab_alloc(arena: i8*, size: i32) -> i8*
+        let raw_ptr = self.tmp();
         self.emit(format!(
             "  {} = call i8* @slab_alloc(i8* {}, i32 {})",
-            closure_raw, tv, class_id
+            raw_ptr, task_slot, class_id
         ));
-        let closure_typed = self.tmp();
+        // Bitcast the raw heap pointer to the typed closure struct pointer
+        let closure_slot = self.tmp();
         self.emit(format!(
             "  {} = bitcast i8* {} to {}*",
-            closure_typed, closure_raw, closure_ty
+            closure_slot, raw_ptr, closure_ty
         ));
 
         for (idx, (_, slot, ty, is_mut)) in captured.iter().enumerate() {
             let gep = self.tmp();
             self.emit(format!(
                 "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
-                gep, closure_ty, closure_ty, closure_typed, idx
+                gep, closure_ty, closure_ty, closure_slot, idx
             ));
             if *is_mut && !ty.ends_with('*') {
                 self.emit(format!("  store {}* {}, {}** {}", ty, slot, ty, gep));
             } else if !ty.ends_with('*') {
-                // If it's a struct (not a pointer), store the value directly.
                 let loaded = self.tmp();
                 self.emit(format!("  {} = load {}, {}* {}", loaded, ty, ty, slot));
                 self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, gep));
@@ -1190,6 +1477,9 @@ impl<'a> IrBuilder<'a> {
                 self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, gep));
             }
         }
+
+        // Pass the heap-allocated closure pointer (already i8* from slab_alloc)
+        let closure_i8 = raw_ptr;
 
         // Emit trampoline in saved context
         let ctx = self.save_context();
@@ -1238,6 +1528,21 @@ impl<'a> IrBuilder<'a> {
         }
 
         self.emit_block_stmts(body, "void");
+        // Free the heap-allocated closure after the body completes.
+        // slab_free(arena: i8*, ptr: i8*, size_class: i32)
+        // class_id is in scope here (computed above from closure_size).
+        let task_in_tramp = self.emit_task_load();
+        let arg_for_free = if let Some(slot) = self.locals.get("arg").cloned() {
+            let t = self.tmp();
+            self.emit(format!("  {} = load i8*, i8** {}", t, slot));
+            t
+        } else {
+            "%arg".to_string()
+        };
+        self.emit(format!(
+            "  call void @slab_free(i8* {}, i8* {}, i32 {})",
+            task_in_tramp, arg_for_free, class_id
+        ));
         self.emit("  ret void".to_string());
         let saved_tmp = self.next_tmp;
         let ir = IrFunction {
@@ -1248,10 +1553,11 @@ impl<'a> IrBuilder<'a> {
                 ("task".to_string(), "i8*".to_string()),
                 ("arg".to_string(), "i8*".to_string()),
             ],
+            annotations: vec![],
         };
         self.restore_context(ctx);
         self.next_tmp = saved_tmp;
-        (ir, Some(closure_raw))
+        (ir, Some((closure_i8, closure_size)))
     }
 
     // ── Drop helpers ──────────────────────────────────────────────────────────
@@ -1366,13 +1672,7 @@ impl<'a> IrBuilder<'a> {
                     if id.name == "chan" {
                         let elem_ty = type_annotation
                             .and_then(Self::chan_elem_type_from_annotation)
-                            .map(|t| {
-                                Self::lower_type(
-                                    t,
-                                    &self.option_enum_name(),
-                                    &self.result_enum_name(),
-                                )
-                            })
+                            .map(|t| Self::lower_type(t))
                             .unwrap_or_else(|| "i8".to_string());
                         let elem_size = self.llvm_const_sizeof(&elem_ty);
                         let chan_ptr = self.tmp();
@@ -1388,13 +1688,7 @@ impl<'a> IrBuilder<'a> {
                         ));
 
                         let ty = type_annotation
-                            .map(|t| {
-                                Self::lower_type(
-                                    t,
-                                    &self.option_enum_name(),
-                                    &self.result_enum_name(),
-                                )
-                            })
+                            .map(|t| Self::lower_type(t))
                             .unwrap_or_else(|| "i8*".to_string());
                         let slot = self.tmp();
                         self.emit_alloca(&slot, &ty);
@@ -1438,12 +1732,17 @@ impl<'a> IrBuilder<'a> {
             }
         };
         let ty = type_annotation
-            .map(|t| Self::lower_type(t, &self.option_enum_name(), &self.result_enum_name()))
+            .map(|t| Self::lower_type(t))
             .unwrap_or_else(|| init_ty.clone());
         let value = self.emit_widen(&value, &init_ty, &ty);
 
-        if !ty.ends_with('*') && ty != "void" {
-            // Slab allocation for non-pointer (struct) values
+        if !ty.ends_with('*')
+            && ty != "void"
+            && mutable
+            && ty.starts_with("%struct.")
+            && !self.reg.enum_layouts.contains_key(&ty)
+        {
+            // Slab allocation for mutable user struct values only (not enum aggregates)
             let size = self.llvm_const_sizeof(&ty);
             let class_id = get_size_class(size);
             let tv = self.emit_task_load();
@@ -1484,6 +1783,7 @@ impl<'a> IrBuilder<'a> {
         let then_lbl = self.label("then");
         let else_lbl = self.label("else");
         let merge_lbl = self.label("if_merge");
+        let cont_lbl = self.label("if_cont");
 
         self.emit(format!(
             "  br i1 {}, label %{}, label %{}",
@@ -1514,11 +1814,20 @@ impl<'a> IrBuilder<'a> {
             },
         };
 
-        self.emit(format!("{}:", merge_lbl));
+        // Merge block:
+        // - both terminate: unreachable, fully dead
+        // - both fall through: emit merge label, then `br` to cont; cont is where caller continues
+        // - exactly one terminates: merge is reachable only from the non-terminating branch;
+        //   emit merge label with `br` to cont, cont is where caller continues
+        // - the cont label is where the caller's subsequent statements resume
         if then_term && else_term {
+            self.emit(format!("{}:", merge_lbl));
             self.emit("  unreachable".to_string());
             return true;
         }
+        self.emit(format!("{}:", merge_lbl));
+        self.emit(format!("  br label %{}", cont_lbl));
+        self.emit(format!("{}:", cont_lbl));
         false
     }
 
@@ -1741,6 +2050,23 @@ impl<'a> IrBuilder<'a> {
                 tmp
             }
             ExpressionKind::StructInit { name, fields } => {
+                // Per-instance IO handles: Stdout{}/Stdin{} call C constructors
+                if name.name == "Stdout" && fields.is_empty() {
+                    let tmp = self.tmp();
+                    self.emit(format!(
+                        "  {} = call %struct.Stdout* @ty_stdout_new(i8* %task)",
+                        tmp
+                    ));
+                    return tmp;
+                }
+                if name.name == "Stdin" && fields.is_empty() {
+                    let tmp = self.tmp();
+                    self.emit(format!(
+                        "  {} = call %struct.Stdin* @ty_stdin_new(i8* %task)",
+                        tmp
+                    ));
+                    return tmp;
+                }
                 let struct_ty = format!("%struct.{}", name.name);
                 let mut cur = "undef".to_string();
                 for (field_name, field_expr) in fields {
@@ -1795,9 +2121,156 @@ impl<'a> IrBuilder<'a> {
                 then,
                 else_branch,
             } => self.emit_if_let(expr, pattern, matched, then, else_branch.as_deref()),
+            ExpressionKind::Cast {
+                expr: inner,
+                target_type,
+            } => self.emit_cast(inner, target_type),
             ExpressionKind::Placeholder(_) => "0".to_string(),
             _ => "0".to_string(),
         }
+    }
+
+    // ── Cast (as) ─────────────────────────────────────────────────────────────
+
+    fn emit_cast(&mut self, inner: &Expression, target_type: &Type) -> String {
+        let src_val = self.emit_expr(inner);
+        let src_ty = self.expr_llvm_type(inner);
+        let dst_ty = Self::lower_type(target_type);
+
+        // Recover the ACTUAL emitted type from the last emitted instruction.
+        // expr_llvm_type can lie for method calls when the types map has the
+        // wrong key due to NodeId collisions. The real value type is on the
+        // tail of the line stream (we just emitted it).
+        let actual_src_ty = match &inner.node {
+            ExpressionKind::Call { .. } => {
+                self.lines
+                    .iter()
+                    .rev()
+                    .find_map(|l| {
+                        let t = l.trim_start();
+                        if t.starts_with(&format!("{} = ", src_val)) {
+                            let after_eq = t.strip_prefix(&format!("{} = ", src_val)).unwrap_or("");
+                            // "call <ret_ty> @" — take first token after "call"
+                            if let Some(rest) = after_eq.strip_prefix("call ") {
+                                return rest.split_whitespace().next().map(|s| s.to_string());
+                            }
+                            // "load <ty>, <ty>*" — take first token
+                            if let Some(rest) = after_eq.strip_prefix("load ") {
+                                return rest.split(',').next().map(|s| s.trim().to_string());
+                            }
+                            // Other shapes: take whatever one prefix token makes sense
+                            return after_eq.split_whitespace().next().map(|s| s.to_string());
+                        }
+                        None
+                    })
+                    .unwrap_or_else(|| src_ty.clone())
+            }
+            _ => src_ty.clone(),
+        };
+
+        if actual_src_ty == dst_ty {
+            return src_val;
+        }
+
+        let int_bits = |t: &str| -> Option<u32> {
+            match t {
+                "i1" => Some(1),
+                "i8" => Some(8),
+                "i16" => Some(16),
+                "i32" => Some(32),
+                "i64" => Some(64),
+                _ => None,
+            }
+        };
+        let float_bits = |t: &str| -> Option<u32> {
+            match t {
+                "half" => Some(16),
+                "float" => Some(32),
+                "double" => Some(64),
+                _ => None,
+            }
+        };
+
+        let tmp = self.tmp();
+        let instr = match (
+            int_bits(&actual_src_ty),
+            int_bits(&dst_ty),
+            float_bits(&actual_src_ty),
+            float_bits(&dst_ty),
+        ) {
+            // int → wider int  (signed extend)
+            (Some(s), Some(d), _, _) if s < d => {
+                format!(
+                    "  {} = sext {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // int → narrower int  (truncate)
+            (Some(s), Some(d), _, _) if s > d => {
+                format!(
+                    "  {} = trunc {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // float → wider float
+            (_, _, Some(s), Some(d)) if s < d => {
+                format!(
+                    "  {} = fpext {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // float → narrower float
+            (_, _, Some(s), Some(d)) if s > d => {
+                format!(
+                    "  {} = fptrunc {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // int → float  (signed)
+            (Some(_), _, _, Some(_)) => {
+                format!(
+                    "  {} = sitofp {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // float → int  (signed, truncating)
+            (_, Some(_), Some(_), _) => {
+                format!(
+                    "  {} = fptosi {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // ptr → ptr  (bitcast)
+            _ if actual_src_ty.ends_with('*') && dst_ty.ends_with('*') => {
+                format!(
+                    "  {} = bitcast {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // int → ptr  (inttoptr)
+            (Some(_), _, _, _) if dst_ty.ends_with('*') => {
+                format!(
+                    "  {} = inttoptr {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // ptr → int  (ptrtoint)
+            (_, Some(_), _, _) if actual_src_ty.ends_with('*') => {
+                format!(
+                    "  {} = ptrtoint {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+            // bitcast for pointer/struct conversions or fallthrough
+            _ => {
+                format!(
+                    "  {} = bitcast {} {} to {}",
+                    tmp, actual_src_ty, src_val, dst_ty
+                )
+            }
+        };
+        self.emit(instr);
+        tmp
     }
 
     // ── Binary operations ─────────────────────────────────────────────────────
@@ -1828,8 +2301,12 @@ impl<'a> IrBuilder<'a> {
         }
 
         let ty = self.expr_llvm_type(left);
-        let lhs = self.emit_expr(left);
-        let rhs = self.emit_expr(right);
+        let lhs_raw = self.emit_expr(left);
+        let lhs_ty = self.expr_llvm_type(left);
+        let lhs = self.emit_widen(&lhs_raw, &lhs_ty, &ty);
+        let rhs_raw = self.emit_expr(right);
+        let rhs_ty = self.expr_llvm_type(right);
+        let rhs = self.emit_widen(&rhs_raw, &rhs_ty, &ty);
         let dst = self.tmp();
         let instr = self.arith_instr(op, &ty, &lhs, &rhs, &dst);
         self.emit(instr);
@@ -1906,12 +2383,15 @@ impl<'a> IrBuilder<'a> {
 
     fn emit_assign_op(&mut self, op: &Operator, left: &Expression, right: &Expression) -> String {
         let (slot, lval_ty) = self.resolve_lvalue(left);
-        let lhs_val = self.tmp();
+        let lhs_raw = self.tmp();
         self.emit(format!(
             "  {} = load {}, {}* {}",
-            lhs_val, lval_ty, lval_ty, slot
+            lhs_raw, lval_ty, lval_ty, slot
         ));
-        let rhs_val = self.emit_expr(right);
+        let lhs_val = self.emit_widen(&lhs_raw, &lval_ty, &lval_ty);
+        let rhs_raw = self.emit_expr(right);
+        let rhs_ty = self.expr_llvm_type(right);
+        let rhs_val = self.emit_widen(&rhs_raw, &rhs_ty, &lval_ty);
         let res = self.tmp();
         let instr = self.arith_instr(op, &lval_ty, &lhs_val, &rhs_val, &res);
         self.emit(instr);
@@ -2173,7 +2653,7 @@ impl<'a> IrBuilder<'a> {
 
         // User-defined method
         if let Some(method_sym) = self.method_symbol_for_call(&base_ty, &field.name) {
-            return self.emit_user_method_call(&method_sym, &base_val, &base_ty, args);
+            return self.emit_user_method_call(call_expr, &method_sym, &base_val, &base_ty, args);
         }
 
         "0".to_string()
@@ -2226,28 +2706,35 @@ impl<'a> IrBuilder<'a> {
     }
 
     fn emit_chan_recv(&mut self, call_expr: &Expression, chan_val: &str) -> String {
-        let ty = if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
-            ty
-        } else if let ExpressionKind::Call { func, .. } = &call_expr.node {
+        // Resolve to the element type T (not Option<T>).
+        // Check chan_elem_tys FIRST to avoid NodeId-collision pollution.
+        let mut elem_from_chan_tys: Option<InferType> = None;
+        if let ExpressionKind::Call { func, .. } = &call_expr.node {
             if let ExpressionKind::FieldAccess { base, .. } = &func.node {
                 if let ExpressionKind::Identifier(id) = &base.node {
                     if let Some(elem_ty) = self.chan_elem_tys.get(&id.name) {
-                        InferType::Con(elem_ty.clone())
-                    } else {
-                        return "0".to_string();
+                        elem_from_chan_tys = Some(InferType::Con(elem_ty.clone()));
                     }
-                } else {
-                    return "0".to_string();
                 }
-            } else {
-                return "0".to_string();
+            }
+        }
+
+        let elem_infer = if let Some(elem) = elem_from_chan_tys {
+            elem
+        } else if let Some(inferred) = self.inferred_expr_type(call_expr).cloned() {
+            let opt_name = self.option_enum_name();
+            match inferred {
+                InferType::App(ref name, ref args) if name == &opt_name && args.len() == 1 => {
+                    args[0].clone()
+                }
+                other => other,
             }
         } else {
             return "0".to_string();
         };
 
-        let elem_ty = self.lower_infer_type(&ty);
-        let opt_infer = InferType::App(self.option_enum_name(), vec![ty]);
+        let elem_ty = self.lower_infer_type(&elem_infer);
+        let opt_infer = InferType::App(self.option_enum_name(), vec![elem_infer]);
         self.ensure_enum_layout_for_infer(&opt_infer);
         let opt_ty =
             TypeRegistry::mangle_app_struct_name(&self.option_enum_name(), &[elem_ty.clone()]);
@@ -2379,57 +2866,79 @@ impl<'a> IrBuilder<'a> {
 
     fn emit_user_method_call(
         &mut self,
+        call_expr: &Expression,
         method_sym: &str,
         base_val: &str,
         base_ty: &str,
         args: &[Expression],
     ) -> String {
         let runtime_name = link_symbol_name(method_sym);
+        // Look up the func_sig registered by register_module_sigs.
+        // For stdlib methods (@__ty_method__) this is populated from the @ty_sig annotation.
+        // Fall back to empty rather than ("i32", []) so missing entries don't silently
+        // produce wrong types — callers use actual_ty / inferred type instead.
         let (ret_ty, param_types) = self
             .reg
             .func_sigs
             .get(method_sym)
             .cloned()
-            .unwrap_or_else(|| ("i32".to_string(), vec![]));
-        let self_ty = param_types
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| base_ty.to_string());
-        let tv = self.emit_task_load();
-        let mut arg_pairs = vec![format!("i8* {}", tv), format!("{} {}", self_ty, base_val)];
+            .unwrap_or_else(|| ("".to_string(), vec![]));
+        let is_extern = self.reg.extern_fns.contains(method_sym);
+        let self_ty = if is_extern {
+            param_types.get(0)
+        } else {
+            param_types.get(1)
+        }
+        .cloned()
+        .unwrap_or_else(|| base_ty.to_string());
+        let mut arg_pairs = if is_extern {
+            vec![format!("{} {}", self_ty, base_val)]
+        } else {
+            let tv = self.emit_task_load();
+            vec![format!("i8* {}", tv), format!("{} {}", self_ty, base_val)]
+        };
+        let param_offset = if is_extern { 1 } else { 2 };
         for (i, a) in args.iter().enumerate() {
             let v = self.emit_expr(a);
             let actual_ty = self.expr_llvm_type(a);
+            // Use the declared param type when available; fall back to the actual
+            // emitted type rather than a hardcoded "i32" so missing func_sig entries
+            // don't corrupt arg types (e.g. passing a string literal as i32).
             let t = param_types
-                .get(i + 2)
+                .get(i + param_offset)
                 .cloned()
-                .unwrap_or_else(|| "i32".to_string());
+                .unwrap_or_else(|| actual_ty.clone());
             let v = self.emit_widen(&v, &actual_ty, &t);
             arg_pairs.push(format!("{} {}", t, v));
         }
         let tmp = self.tmp();
         if ret_ty == "void" {
+            // Only treat last param as out-pointer if it is an extra param
+            // beyond what arg_pairs already covers (task + self + explicit args).
+            let has_out_param = param_types.len() > arg_pairs.len();
             let last_param = param_types.last().cloned().unwrap_or_default();
-            if let Some(desired_ty) = last_param
-                .strip_suffix('*')
-                .filter(|t| t.starts_with("%struct."))
-                .map(|t| t.to_string())
-            {
-                let out_slot = self.tmp();
-                self.emit_alloca(&out_slot, &desired_ty);
-                arg_pairs.push(format!("{}* {}", desired_ty, out_slot));
-                self.emit(format!(
-                    "  call void @{}({})",
-                    runtime_name,
-                    arg_pairs.join(", ")
-                ));
-                let loaded = self.tmp();
-                self.emit(format!(
-                    "  {} = load {}, {}* {}",
-                    loaded, desired_ty, desired_ty, out_slot
-                ));
-                return loaded;
-            }
+            if has_out_param {
+                if let Some(desired_ty) = last_param
+                    .strip_suffix('*')
+                    .filter(|t| t.starts_with("%struct."))
+                    .map(|t| t.to_string())
+                {
+                    let out_slot = self.tmp();
+                    self.emit_alloca(&out_slot, &desired_ty);
+                    arg_pairs.push(format!("{}* {}", desired_ty, out_slot));
+                    self.emit(format!(
+                        "  call void @{}({})",
+                        runtime_name,
+                        arg_pairs.join(", ")
+                    ));
+                    let loaded = self.tmp();
+                    self.emit(format!(
+                        "  {} = load {}, {}* {}",
+                        loaded, desired_ty, desired_ty, out_slot
+                    ));
+                    return loaded;
+                }
+            } // if has_out_param
             self.emit(format!(
                 "  call void @{}({})",
                 runtime_name,
@@ -2437,10 +2946,21 @@ impl<'a> IrBuilder<'a> {
             ));
             return "0".to_string();
         }
+        // Determine the effective return type: prefer the func_sig declaration, but if
+        // it was absent (empty string fallback) use the call-expression's inferred type.
+        let effective_ret = if ret_ty.is_empty() {
+            self.inferred_expr_type(call_expr)
+                .cloned()
+                .map(|t| self.lower_infer_type(&t))
+                .filter(|t| !t.is_empty() && t != "void")
+                .unwrap_or_else(|| "i32".to_string())
+        } else {
+            ret_ty.clone()
+        };
         self.emit(format!(
             "  {} = call {} @{}({})",
             tmp,
-            ret_ty,
+            effective_ret,
             runtime_name,
             arg_pairs.join(", ")
         ));
@@ -2480,15 +3000,13 @@ impl<'a> IrBuilder<'a> {
 
         let runtime_name =
             runtime_intrinsic_name(&id.name).unwrap_or_else(|| link_symbol_name(&id.name));
-        let (ret_ty, mut param_types) = self
+        let out_result = self.reg.out_result_funcs.contains(&id.name);
+        let (ret_ty, param_types) = self
             .reg
             .func_sigs
             .get(&id.name)
             .cloned()
             .unwrap_or_else(|| ("i32".to_string(), vec![]));
-        if param_types.is_empty() && matches!(id.name.as_str(), "printf" | "fprintf" | "sprintf") {
-            param_types = vec!["i8*".to_string()];
-        }
 
         let tail = if self.current_fn_name.as_deref() == Some(id.name.as_str()) {
             "tail "
@@ -2511,6 +3029,30 @@ impl<'a> IrBuilder<'a> {
                 .unwrap_or_else(|| actual_ty.clone());
             let v = self.emit_widen(&v, &actual_ty, &t);
             arg_pairs.push(format!("{} {}", t, v));
+        }
+        if out_result {
+            // C ABI: void return + trailing Result* out-param.
+            // The Result type is the last entry in func_sigs param_types (a pointer).
+            let result_ptr_ty = param_types
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "i8*".to_string());
+            let result_ty = result_ptr_ty.trim_end_matches('*').to_string();
+            let result_slot = self.tmp();
+            self.emit_alloca(&result_slot, &result_ty);
+            arg_pairs.push(format!("{} {}", result_ptr_ty, result_slot));
+            self.emit(format!(
+                "  {}call void @{}({})",
+                tail,
+                runtime_name,
+                arg_pairs.join(", ")
+            ));
+            let loaded = self.tmp();
+            self.emit(format!(
+                "  {} = load {}, {}* {}",
+                loaded, result_ty, result_ty, result_slot
+            ));
+            return loaded;
         }
         if ret_ty == "void" {
             self.emit(format!(
@@ -2680,7 +3222,7 @@ impl<'a> IrBuilder<'a> {
                 let v = self.emit_expr(trail);
                 if let Some((slot, ty)) = &result_slot {
                     let actual_ty = self.expr_llvm_type(trail);
-                    let store_ty = if actual_ty == "i32" {
+                    let store_ty = if actual_ty == "void" {
                         ty.clone()
                     } else {
                         actual_ty
@@ -2702,7 +3244,7 @@ impl<'a> IrBuilder<'a> {
             let v = self.emit_expr(else_expr);
             if let Some((slot, ty)) = &result_slot {
                 let actual_ty = self.expr_llvm_type(else_expr);
-                let store_ty = if actual_ty == "i32" {
+                let store_ty = if actual_ty == "void" {
                     ty.clone()
                 } else {
                     actual_ty
@@ -2814,16 +3356,12 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or_else(|| ty.to_string());
         match &pattern.node {
             PatternKind::Wildcard => "1".to_string(),
-            PatternKind::EnumVariant { variant_name, .. } => {
-                self.actual_inferred_type(scrutinee_expr)
-                    .map(|t| self.ensure_enum_layout_for_infer(&t));
-                self.emit_enum_tag_test(
-                    scrutinee_expr,
-                    &actual_ty,
-                    scrutinee_val,
-                    &variant_name.name,
-                )
-            }
+            PatternKind::EnumVariant { variant_name, .. } => self.emit_enum_tag_test(
+                scrutinee_expr,
+                &actual_ty,
+                scrutinee_val,
+                &variant_name.name,
+            ),
             _ => "1".to_string(),
         }
     }
@@ -2836,10 +3374,6 @@ impl<'a> IrBuilder<'a> {
         variant_name: &str,
     ) -> String {
         let Some(infer) = self.actual_inferred_type(scrutinee_expr) else {
-            eprintln!(
-                "DEBUG: emit_enum_tag_test - actual_inferred_type returned None for variant {}",
-                variant_name
-            );
             self.emit(format!(
                 "  ; CODEGEN ERROR: could not resolve type for tag test variant {}",
                 variant_name
@@ -2847,15 +3381,7 @@ impl<'a> IrBuilder<'a> {
             return "1".to_string();
         };
         let llvm_ty = self.lower_infer_type(&infer);
-        eprintln!(
-            "DEBUG: emit_enum_tag_test - variant={}, llvm_ty={}",
-            variant_name, llvm_ty
-        );
         let Some(layout) = self.reg.enum_layouts.get(&llvm_ty).cloned() else {
-            eprintln!(
-                "DEBUG: emit_enum_tag_test - layout not found for type={}",
-                llvm_ty
-            );
             self.emit(format!(
                 "  ; CODEGEN ERROR: could not resolve layout for tag test variant {} with type {}",
                 variant_name, llvm_ty
@@ -2863,11 +3389,6 @@ impl<'a> IrBuilder<'a> {
             return "1".to_string();
         };
         let Some(v) = layout.variants.get(variant_name) else {
-            eprintln!(
-                "DEBUG: emit_enum_tag_test - variant={} not in layout variants={:?}",
-                variant_name,
-                layout.variants.keys()
-            );
             self.emit(format!(
                 "  ; CODEGEN ERROR: could not find variant {} in layout for {}",
                 variant_name, llvm_ty
@@ -3077,6 +3598,39 @@ impl<'a> IrBuilder<'a> {
         let Some(infer) = types.get(&call_expr.id).cloned() else {
             return "0".to_string();
         };
+
+        // Guard: if the types map handed us the payload type rather than the
+        // wrapper (NodeId collision — happens when the call node's ID coincides
+        // with a node from a separately-compiled module whose inferred type is
+        // the inner Con rather than the outer App), synthesise the correct
+        // wrapper so downstream layout lookup doesn't panic.
+        let opt_name = self.option_enum_name();
+        let res_name = self.result_enum_name();
+        let infer = match (&infer, ctor) {
+            // Some(x) / None — expected type is Option<T>
+            (_, "Some" | "None") if !matches!(&infer, InferType::App(n, _) if n == &opt_name) => {
+                InferType::App(opt_name.clone(), vec![infer])
+            }
+            // Ok(x) / Err(x) — expected type is Result<T, E>.  We don't know
+            // the error type from context here, so only fix the Ok case where
+            // we have exactly one arg (payload = T, error defaults to Int32).
+            (_, "Ok") if !matches!(&infer, InferType::App(n, _) if n == &res_name) => {
+                InferType::App(
+                    res_name.clone(),
+                    vec![infer, InferType::Con("Int32".to_string())],
+                )
+            }
+            (_, "Err") if !matches!(&infer, InferType::App(n, _) if n == &res_name) => {
+                InferType::App(
+                    res_name.clone(),
+                    vec![InferType::Con("Int32".to_string()), infer],
+                )
+            }
+            _ => infer,
+        };
+
+        // Ensure the layout is registered before we try to look it up.
+        self.ensure_enum_layout_for_infer(&infer);
         let ty = self.lower_infer_type(&infer);
 
         let layout = self
@@ -3114,8 +3668,96 @@ impl<'a> IrBuilder<'a> {
 
     // ── Type lowering ─────────────────────────────────────────────────────────
 
-    fn lower_type(ty: &Type, option_name: &str, result_name: &str) -> String {
-        // mirrors lower_type but without &self
+    /// Best-effort x86-64 size/alignment for a Typhoon AST type, used only
+    /// to decide whether an extern C function's aggregate return value must
+    /// cross the ABI boundary via an out-pointer instead of a bare
+    /// by-value return.
+    ///
+    /// This deliberately does NOT need to be exact for every possible type —
+    /// it only needs to be correct for the flat scalar/pointer types that
+    /// can appear as Result<T, E> / Option<T> payload fields, since those
+    /// are the only generic containers this codebase monomorphizes into C
+    /// structs crossing the runtime boundary.
+    fn scalar_type_size_align(ty: &Type) -> (usize, usize) {
+        match ty.node.name.as_str() {
+            "Int8" | "Bool" => (1, 1),
+            "Int16" => (2, 2),
+            "Int32" | "Float32" => (4, 4),
+            "Int64" | "Float64" => (8, 8),
+            // Everything else (Str, Ref<T>, Chan<T>, Array<T>, Buf, Network,
+            // Listener, Socket, and any user struct/enum name) is a flat
+            // 8-byte runtime pointer in this codebase's ABI.
+            _ => (8, 8),
+        }
+    }
+
+    /// If `ty` is a monomorphized Result<T, E> or Option<T> (i.e. has
+    /// generic args), compute its total C-struct byte size: a leading i32
+    /// tag followed by one field per generic arg, each field padded to its
+    /// own alignment, the whole struct padded to its max field alignment.
+    /// Returns None for types this isn't meaningful for (no generic args).
+    fn result_like_struct_size(ty: &Type) -> Option<usize> {
+        if ty.node.generic_args.is_empty() {
+            return None;
+        }
+        let mut offset = 4usize; // tag: i32
+        let mut max_align = 4usize;
+        for arg in &ty.node.generic_args {
+            let (sz, al) = Self::scalar_type_size_align(arg);
+            offset = (offset + al - 1) / al * al;
+            offset += sz;
+            max_align = max_align.max(al);
+        }
+        Some((offset + max_align - 1) / max_align * max_align)
+    }
+
+    /// Any C ABI on x86-64 requires an aggregate return value larger than
+    /// this to cross via a hidden out-pointer rather than registers.
+    /// Windows x64 actually requires it past 8 bytes (no register-pair
+    /// packing at all, unlike SysV's 16-byte allowance) — using the
+    /// stricter Windows threshold here keeps the same generated IR correct
+    /// on every target this project builds for, at the cost of using the
+    /// out-pointer convention for a few structs SysV could have
+    /// register-packed. Correctness over micro-optimization.
+    const MAX_REGISTER_RETURN_BYTES: usize = 8;
+
+    fn needs_out_result_abi(return_type: &Option<Type>) -> bool {
+        return_type
+            .as_ref()
+            .and_then(Self::result_like_struct_size)
+            .map(|sz| sz > Self::MAX_REGISTER_RETURN_BYTES)
+            .unwrap_or(false)
+    }
+
+    fn lower_type(ty: &Type) -> String {
+        let ty_name = ty.node.name.as_str();
+
+        // Built-in generic types that lower to a fixed runtime representation
+        // rather than being monomorphized into their own struct. These must
+        // be checked BEFORE the generic-args early-return below, or e.g.
+        // `Array<Int32>` falls through to mangle_app_struct_name and produces
+        // an undefined `%struct.Array__i32` (never given a body anywhere),
+        // which LLVM rejects with "Cannot allocate unsized type" the moment
+        // it's used as a struct field. lower_infer_type already gets this
+        // ordering right; this mirrors it.
+        match ty_name {
+            "Array" => return "%struct.TyArray*".to_string(),
+            "Chan" => return "i8*".to_string(),
+            "Ref" => return "i8*".to_string(),
+            _ => {}
+        }
+
+        // Universal Generic Handling: If it has generic args, it's an App type.
+        if !ty.node.generic_args.is_empty() {
+            let args: Vec<_> = ty
+                .node
+                .generic_args
+                .iter()
+                .map(|a| Self::lower_type(a))
+                .collect();
+            return TypeRegistry::mangle_app_struct_name(ty_name, &args);
+        }
+
         match ty.node.name.as_str() {
             "Unit" => "void".to_string(),
             "Int8" | "Char" | "Byte" => "i8".to_string(),
@@ -3130,26 +3772,11 @@ impl<'a> IrBuilder<'a> {
             // We currently lower Ref as an opaque runtime pointer.
             "Str" | "ref" | "Ref" => "i8*".to_string(),
             "Buf" => "%struct.Buf*".to_string(),
-            "Array" => "%struct.TyArray*".to_string(),
-            "Chan" => "i8*".to_string(),
-            "Option" => {
-                let args: Vec<_> = ty
-                    .node
-                    .generic_args
-                    .iter()
-                    .map(|a| Self::lower_type(a, option_name, result_name))
-                    .collect();
-                TypeRegistry::mangle_app_struct_name(option_name, &args)
-            }
-            "Result" => {
-                let args: Vec<_> = ty
-                    .node
-                    .generic_args
-                    .iter()
-                    .map(|a| Self::lower_type(a, option_name, result_name))
-                    .collect();
-                TypeRegistry::mangle_app_struct_name(result_name, &args)
-            }
+            "Network" => "%struct.Network*".to_string(),
+            "Listener" => "%struct.Listener*".to_string(),
+            "Socket" => "%struct.Socket*".to_string(),
+            "Stdout" => "%struct.Stdout*".to_string(),
+            "Stdin" => "%struct.Stdin*".to_string(),
             name => format!("%struct.{}", name),
         }
     }
@@ -3165,24 +3792,30 @@ impl<'a> IrBuilder<'a> {
                 "Bool" => "i1".to_string(),
                 "Str" => "i8*".to_string(),
                 "Buf" => "%struct.Buf*".to_string(),
-                "Chan" => "i8*".to_string(),
+                "Chan" | "chan" => "i8*".to_string(),
+                "Network" => "%struct.Network*".to_string(),
+                "Listener" => "%struct.Listener*".to_string(),
+                "Socket" => "%struct.Socket*".to_string(),
+                "Stdout" => "%struct.Stdout*".to_string(),
+                "Stdin" => "%struct.Stdin*".to_string(),
                 n if n.starts_with("%") => n.to_string(), // already an LLVM type, pass through
                 n => format!("%struct.{}", n),
             },
             InferType::App(name, args) if name == "Ref" && args.len() == 1 => "i8*".to_string(),
-            InferType::App(name, args) if name == "Option" && args.len() == 1 => {
-                let inner = self.lower_infer_type(&args[0]);
-                self.ensure_enum_layout_for_infer(ty);
-                TypeRegistry::mangle_app_struct_name(&self.option_enum_name(), &[inner])
-            }
-            InferType::App(name, args) if name == "Result" && args.len() == 2 => {
-                let ok = self.lower_infer_type(&args[0]);
-                let err = self.lower_infer_type(&args[1]);
-                self.ensure_enum_layout_for_infer(ty);
-                TypeRegistry::mangle_app_struct_name(&self.result_enum_name(), &[ok, err])
-            }
             InferType::App(name, _) if name == "Array" => "%struct.TyArray*".to_string(),
             InferType::App(name, _) if name == "Chan" => "i8*".to_string(),
+            // Universal Generic Handling for ALL enums
+            InferType::App(name, args) => {
+                // Dynamic enum layouts
+                let llvm_args: Vec<String> =
+                    args.iter().map(|a| self.lower_infer_type(a)).collect();
+
+                // This now dynamically generates the struct { tag, fields... }
+                // for ANY enum based on its EnumDef!
+                self.ensure_enum_layout_for_infer(ty);
+
+                TypeRegistry::mangle_app_struct_name(name, &llvm_args)
+            }
             InferType::FixedArray(elem, n) => format!("[{} x {}]", n, self.lower_infer_type(elem)),
             _ => "i32".to_string(),
         }
@@ -3223,7 +3856,34 @@ impl<'a> IrBuilder<'a> {
             }
             _ => {}
         }
-        // Type checker inference (can have NodeId collisions — only use for non-literals)
+        // For Call expressions, always prefer func_sigs lookup BEFORE falling back
+        // to the type checker map. The type checker's types HashMap is keyed by NodeId,
+        // but parsed .ty files all start NodeId from 1, so expressions from different
+        // files can have the same NodeId. This causes actual_inferred_type to return
+        // the wrong type when two expressions share an ID and one was type-checked first.
+        // func_sigs is populated from the .ll stdlib declarations and is safe from this.
+        if let ExpressionKind::Call { func, .. } = &expr.node {
+            if let ExpressionKind::Identifier(id) = &func.node {
+                if id.name == "chan" {
+                    return "i8*".to_string();
+                }
+                if let Some((ret_ty, c_param_types)) = self.reg.func_sigs.get(&id.name).cloned() {
+                    if self.reg.out_result_funcs.contains(&id.name) {
+                        if let Some(last) = c_param_types.last() {
+                            return last.trim_end_matches('*').to_string();
+                        }
+                    }
+                    return ret_ty;
+                }
+            }
+        }
+        // Cast: always return the target type, ignoring any inference
+        // (type checker may store the inner type causing wrong width here).
+        if let ExpressionKind::Cast { target_type, .. } = &expr.node {
+            return Self::lower_type(target_type);
+        }
+        // Type checker inference (can have NodeId collisions — only use for non-literals
+        // and non-function-calls, which have their types resolved from func_sigs above).
         if let Some(ty) = self.actual_inferred_type(expr) {
             return self.lower_infer_type(&ty);
         }
@@ -3256,12 +3916,21 @@ impl<'a> IrBuilder<'a> {
                     if id.name == "chan" {
                         return "i8*".to_string();
                     }
-                    return self
-                        .reg
-                        .func_sigs
-                        .get(&id.name)
-                        .map(|(r, _)| r.clone())
-                        .unwrap_or_else(|| "i32".to_string());
+                    if let Some((_, c_param_types)) = self.reg.func_sigs.get(&id.name).cloned() {
+                        if self.reg.out_result_funcs.contains(&id.name) {
+                            // C ABI holds the Result via trailing pointer.
+                            // Return the pointed-to struct type so the value
+                            // loaded out of the alloca has the right LLVM type.
+                            if let Some(last) = c_param_types.last() {
+                                return last.trim_end_matches('*').to_string();
+                            }
+                        }
+                        if let Some((r, _)) = self.reg.func_sigs.get(&id.name) {
+                            return r.clone();
+                        }
+                        return "i32".to_string();
+                    }
+                    return "i32".to_string();
                 }
                 "i32".to_string()
             }
@@ -3276,24 +3945,33 @@ impl<'a> IrBuilder<'a> {
     }
 
     fn actual_inferred_type(&mut self, expr: &Expression) -> Option<InferType> {
-        if let Some(t) = self.inferred_expr_type(expr) {
-            return Some(t.clone());
-        }
-
+        // For Call expressions, check func_sigs FIRST (before inferred_expr_type).
+        // NodeId collisions in the types map can cause wrong types to be returned.
         if let ExpressionKind::Call { func, .. } = &expr.node {
-            // Handle method calls: base.method(...)
             if let ExpressionKind::FieldAccess { base, field, .. } = &func.node {
                 let base_ty = self.expr_llvm_type(base);
-                let method_sym = self.method_symbol_for_call(&base_ty, &field.name);
-                eprintln!("DEBUG: actual_inferred_type - Checking field access: base_ty={}, field={}, sym={:?}", base_ty, field.name, method_sym);
-
-                if let Some(method_sym) = method_sym {
+                if let Some(method_sym) = self.method_symbol_for_call(&base_ty, &field.name) {
                     if let Some((ret_ty_str, _)) = self.reg.func_sigs.get(&method_sym).cloned() {
+                        // Reconstruct enum InferType from func_sigs return type
                         if self.reg.enum_layouts.contains_key(&ret_ty_str) {
-                            // The return type is a known enum layout. Reconstruct InferType args
-                            // from the layout's variants, converting LLVM types back to source names.
                             let layout = self.reg.enum_layouts.get(&ret_ty_str).cloned().unwrap();
-                            // Find Ok (tag 0) and Err (tag 1) payload types from the layout.
+                            // Try Ok/Err naming first
+                            let ok_payload =
+                                layout.variants.get("Ok").and_then(|v| v.payload_ty.clone());
+                            let err_payload = layout
+                                .variants
+                                .get("Err")
+                                .and_then(|v| v.payload_ty.clone());
+                            if let (Some(ok_ty), Some(err_ty)) = (ok_payload, err_payload) {
+                                let args: Vec<InferType> = vec![
+                                    InferType::Con(Self::llvm_ty_to_infer_name(&ok_ty)),
+                                    InferType::Con(Self::llvm_ty_to_infer_name(&err_ty)),
+                                ];
+                                let res = InferType::App(self.reg.result_enum_name(), args);
+                                self.ensure_enum_layout_for_infer(&res);
+                                return Some(res);
+                            }
+                            // Fallback: tag-ordered
                             let mut sorted: Vec<_> = layout.variants.values().collect();
                             sorted.sort_by_key(|v| v.tag_value);
                             let args: Vec<InferType> = sorted
@@ -3302,6 +3980,11 @@ impl<'a> IrBuilder<'a> {
                                 .map(|llvm_ty| InferType::Con(Self::llvm_ty_to_infer_name(llvm_ty)))
                                 .collect();
                             if !args.is_empty() {
+                                if ret_ty_str.starts_with("%struct.Option") {
+                                    let res = InferType::App(self.reg.option_enum_name(), args);
+                                    self.ensure_enum_layout_for_infer(&res);
+                                    return Some(res);
+                                }
                                 let res = InferType::App(self.reg.result_enum_name(), args);
                                 self.ensure_enum_layout_for_infer(&res);
                                 return Some(res);
@@ -3309,6 +3992,7 @@ impl<'a> IrBuilder<'a> {
                         }
                     }
                 }
+                // Fallback for recv/try_recv — check chan_elem_tys
                 if matches!(field.name.as_str(), "recv" | "try_recv") {
                     if let ExpressionKind::Identifier(id) = &base.node {
                         if let Some(elem_ty) = self.chan_elem_tys.get(&id.name) {
@@ -3316,9 +4000,29 @@ impl<'a> IrBuilder<'a> {
                             return Some(InferType::App(self.reg.option_enum_name(), vec![inner]));
                         }
                     }
+                    // Also handle nested FieldAccess base (e.g., self.ch.recv())
+                    if let ExpressionKind::FieldAccess {
+                        base: inner_base, ..
+                    } = &base.node
+                    {
+                        if let ExpressionKind::Identifier(id) = &inner_base.node {
+                            if let Some(elem_ty) = self.chan_elem_tys.get(&id.name) {
+                                let inner = InferType::Con(elem_ty.clone());
+                                return Some(InferType::App(
+                                    self.reg.option_enum_name(),
+                                    vec![inner],
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        if let Some(t) = self.inferred_expr_type(expr) {
+            return Some(t.clone());
+        }
+
         None
     }
 
@@ -3363,12 +4067,12 @@ impl<'a> IrBuilder<'a> {
         }
 
         let llvm_args: Vec<String> = args.iter().map(|a| self.lower_infer_type(a)).collect();
-        let option_name = self.reg.option_enum_name();
-        let result_name = self.reg.result_enum_name();
+
         let mut lower_payload =
             |payload: &EnumVariantPayloadKind, subst: &HashMap<String, String>| -> Option<String> {
-                Self::lower_enum_payload(payload, subst, &option_name, &result_name)
+                Self::lower_enum_payload(payload, subst) // Removed option/result params
             };
+
         self.reg
             .ensure_enum_layout(&def, &llvm_args, &|_, _| String::new(), &mut lower_payload);
     }
@@ -3385,13 +4089,11 @@ impl<'a> IrBuilder<'a> {
             .node
             .generic_args
             .iter()
-            .map(|a| Self::lower_type(a, &self.option_enum_name(), &self.result_enum_name()))
+            .map(|a| Self::lower_type(a))
             .collect();
-        let option_name = self.reg.option_enum_name();
-        let result_name = self.reg.result_enum_name();
         let mut lower_payload =
             |payload: &EnumVariantPayloadKind, subst: &HashMap<String, String>| -> Option<String> {
-                Self::lower_enum_payload(payload, subst, &option_name, &result_name)
+                Self::lower_enum_payload(payload, subst)
             };
         self.reg
             .ensure_enum_layout(&def, &llvm_args, &|_, _| String::new(), &mut lower_payload);
@@ -3400,33 +4102,21 @@ impl<'a> IrBuilder<'a> {
     fn lower_enum_payload(
         payload: &EnumVariantPayloadKind,
         subst: &HashMap<String, String>,
-        option_name: &str,
-        result_name: &str,
     ) -> Option<String> {
         // For now, support the subset Typhoon uses for Option/Result-like enums:
         // - unit payload `Some(T)` encoded as `Unit(T)`
         // - 1-tuple payload `Some(T)` encoded as `Tuple([T])`
         // Anything more complex should be lowered via a dedicated struct type later.
         match payload {
-            EnumVariantPayloadKind::Unit(t) => Some(Self::lower_type_with_subst(
-                t,
-                subst,
-                option_name,
-                result_name,
-            )),
-            EnumVariantPayloadKind::Tuple(ts) if ts.len() == 1 => Some(
-                Self::lower_type_with_subst(&ts[0], subst, option_name, result_name),
-            ),
+            EnumVariantPayloadKind::Unit(t) => Some(Self::lower_type_with_subst(t, subst)),
+            EnumVariantPayloadKind::Tuple(ts) if ts.len() == 1 => {
+                Some(Self::lower_type_with_subst(&ts[0], subst))
+            }
             _ => None,
         }
     }
 
-    fn lower_type_with_subst(
-        ty: &Type,
-        subst: &HashMap<String, String>,
-        option_name: &str,
-        result_name: &str,
-    ) -> String {
+    fn lower_type_with_subst(ty: &Type, subst: &HashMap<String, String>) -> String {
         // If the type refers directly to a generic parameter, substitute the concrete LLVM type.
         if ty.node.generic_args.is_empty() {
             if let Some(v) = subst.get(&ty.node.name) {
@@ -3434,7 +4124,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
         // Otherwise lower normally; nested generic args in enum payloads aren't supported yet.
-        Self::lower_type(ty, option_name, result_name)
+        Self::lower_type(ty)
     }
 
     fn scan_decl_for_adts(&mut self, decl: &Declaration) {
@@ -3530,6 +4220,14 @@ impl<'a> IrBuilder<'a> {
         if actual_ty == expected_ty {
             return val.to_string();
         }
+        // LLVM pointer-typed arguments must use `null`, not integer `0`.
+        // Some fallback expression paths produce an integer zero literal;
+        // coerce that case when the callee expects a pointer.
+        if expected_ty.ends_with('*') && matches!(actual_ty, "i1" | "i8" | "i16" | "i32" | "i64") {
+            if val == "0" {
+                return "null".to_string();
+            }
+        }
         let int_rank = |t: &str| -> Option<u8> {
             match t {
                 "i8" => Some(0),
@@ -3580,6 +4278,28 @@ impl<'a> IrBuilder<'a> {
         } else {
             "zeroinitializer".to_string()
         }
+    }
+
+    fn value_llvm_type(&self, value: &str) -> Option<String> {
+        if !value.starts_with('%') {
+            return None;
+        }
+        for line in self.lines.iter().rev() {
+            let t = line.trim_start();
+            if !t.starts_with(&format!("{} = ", value)) {
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = call ", value)) {
+                return rest.split_whitespace().next().map(|s| s.to_string());
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = load ", value)) {
+                return rest.split(',').next().map(|s| s.trim().to_string());
+            }
+            if let Some(rest) = t.strip_prefix(&format!("{} = extractvalue ", value)) {
+                return rest.split_whitespace().next().map(|s| s.to_string());
+            }
+        }
+        None
     }
 
     fn fixed_array_len(&self, array_ty: &str) -> Option<usize> {
@@ -3674,6 +4394,16 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
+        // Remove global function names — they are called directly by symbol, not captured.
+        // This covers both stdlib functions (printf, println, …) registered in func_sigs
+        // and user-defined functions from the same module. Without this filter, any bare
+        // function call inside a conc{} block would appear as a missing capture and emit
+        // a BUG comment even though the generated IR is correct.
+        captured.retain(|name| {
+            !self.reg.func_sigs.contains_key(name.as_str())
+                && !self.reg.extern_fns.contains(name.as_str())
+        });
+
         captured
     }
 
@@ -3691,6 +4421,8 @@ impl<'a> IrBuilder<'a> {
                     if let Some(g) = &arm.node.guard {
                         self.visit_expr_identifiers(g, f);
                     }
+                    // Add match-arm pattern bindings to scope so the body sees them as local
+                    self.visit_pattern_identifiers(&arm.node.pattern, f);
                     self.visit_expr_identifiers(&arm.node.body, f);
                 }
             }
@@ -3703,11 +4435,17 @@ impl<'a> IrBuilder<'a> {
                 for s in &then_branch.statements {
                     self.visit_stmt_identifiers(s, f);
                 }
+                if let Some(t) = &then_branch.trailing_expression {
+                    self.visit_expr_identifiers(t, f);
+                }
                 if let Some(eb) = else_branch {
                     match &eb.node {
                         ElseBranchKind::Block(b) => {
                             for s in &b.statements {
                                 self.visit_stmt_identifiers(s, f);
+                            }
+                            if let Some(t) = &b.trailing_expression {
+                                self.visit_expr_identifiers(t, f);
                             }
                         }
                         ElseBranchKind::If(stmt) => self.visit_stmt_identifiers(stmt, f),
@@ -3717,6 +4455,9 @@ impl<'a> IrBuilder<'a> {
             StatementKind::Loop { body, .. } | StatementKind::Conc { body } => {
                 for s in &body.statements {
                     self.visit_stmt_identifiers(s, f);
+                }
+                if let Some(t) = &body.trailing_expression {
+                    self.visit_expr_identifiers(t, f);
                 }
             }
             _ => {}
@@ -3754,6 +4495,7 @@ impl<'a> IrBuilder<'a> {
             f(&id.name);
         }
         match &expr.node {
+            ExpressionKind::Cast { expr: inner, .. } => self.visit_expr_identifiers(inner, f),
             ExpressionKind::BinaryOp { left, right, .. } => {
                 self.visit_expr_identifiers(left, f);
                 self.visit_expr_identifiers(right, f);
@@ -3784,6 +4526,10 @@ impl<'a> IrBuilder<'a> {
                 for (_, e) in fields {
                     self.visit_expr_identifiers(e, f);
                 }
+            }
+            ExpressionKind::Pipe { left, right } => {
+                self.visit_expr_identifiers(left, f);
+                self.visit_expr_identifiers(right, f);
             }
             ExpressionKind::Match { expr, arms } => {
                 self.visit_expr_identifiers(expr, f);
@@ -3846,8 +4592,15 @@ impl Codegen {
         types: &HashMap<NodeId, InferType>,
         specializations: &HashMap<(String, Vec<InferType>), String>,
         drop_map: &HashMap<NodeId, Vec<DropInfo>>,
+        original_ns_by_symbol: &HashMap<String, String>,
     ) -> IrModule {
-        IrBuilder::lower_module(module, types, specializations, drop_map)
+        IrBuilder::lower_module(
+            module,
+            types,
+            specializations,
+            drop_map,
+            original_ns_by_symbol,
+        )
     }
 }
 
@@ -3890,7 +4643,15 @@ fn array_elem_type_from_str(array_ty: &str) -> String {
 fn is_no_task_intrinsic(name: &str) -> bool {
     matches!(
         name,
-        "ty_array_get_ptr" | "ty_yield" | "ty_chan_new" | "ty_chan_close" | "slab_arena_new"
+        "ty_array_get_ptr"
+            | "ty_yield"
+            | "ty_chan_new"
+            | "ty_chan_close"
+            | "slab_arena_new"
+            | "ty_sys_write"
+            | "ty_sys_read"
+            | "ty_str_len"
+            | "ty_str_byte"
     )
 }
 
@@ -3905,25 +4666,103 @@ fn runtime_intrinsic_name(name: &str) -> Option<String> {
         "yield" => Some("ty_yield".to_string()),
         "await" => Some("ty_await".to_string()),
 
-        // stdio
-        "print" => Some("ty_print".to_string()),
-        "println" => Some("ty_println".to_string()),
-        "printf" => Some("ty_printf".to_string()),
-        "fprint" => Some("ty_fprint".to_string()),
-        "fprintln" => Some("ty_fprintln".to_string()),
-        "fprintf" => Some("ty_fprintf".to_string()),
-        "sprint" => Some("ty_sprint".to_string()),
-        "sprintln" => Some("ty_sprintln".to_string()),
-        "sprintf" => Some("ty_sprintf".to_string()),
-        "scan" => Some("ty_scan".to_string()),
-        "scanf" => Some("ty_scanf".to_string()),
-        "fscan" => Some("ty_fscan".to_string()),
-        "fscanf" => Some("ty_fscanf".to_string()),
-        "sscan" => Some("ty_sscan".to_string()),
-        "sscanf" => Some("ty_sscanf".to_string()),
-
         _ => None,
     }
+}
+
+// ── IR annotation helpers ─────────────────────────────────────────────────────
+//
+// These produce the comment lines that appear above every `define` in the
+// emitted .ll, mirroring the @ty_ns / @ty_sig convention from typhoon-stdlib.ll.
+// A consumer (another compiler pass, or a future `tyc --import-ir` flag) can
+// reconstruct the full ABI from the annotated IR without any hardcoded tables.
+
+/// Reconstruct a Typhoon-level type name from an AST Type node.
+/// Used to build the @ty_sig string.
+fn ty_type_name(ty: &Type) -> String {
+    let base = ty.node.name.as_str();
+    if ty.node.generic_args.is_empty() {
+        base.to_string()
+    } else {
+        let args: Vec<String> = ty.node.generic_args.iter().map(ty_type_name).collect();
+        format!("{}<{}>", base, args.join(", "))
+    }
+}
+
+/// Build the `; @ty_sig: fn name(p: T, ...) -> R` string for a function.
+fn ty_sig_line(fn_name: &str, params: &[Parameter], return_type: Option<&Type>) -> String {
+    let param_strs: Vec<String> = params
+        .iter()
+        .map(|p| format!("{}: {}", p.name.name, ty_type_name(&p.type_annotation)))
+        .collect();
+    let ret_part = return_type
+        .map(|ty| format!(" -> {}", ty_type_name(ty)))
+        .unwrap_or_default();
+    format!(
+        "; @ty_sig: fn {}({}){}",
+        fn_name,
+        param_strs.join(", "),
+        ret_part
+    )
+}
+
+fn annotation_ns_for_decl<'a>(
+    module_ns: &'a str,
+    decl: &Declaration,
+    original_ns_by_symbol: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    match &decl.node {
+        DeclarationKind::Struct { name, .. }
+        | DeclarationKind::Enum { name, .. }
+        | DeclarationKind::Newtype { name, .. }
+        | DeclarationKind::Function { name, .. } => {
+            annotation_ns_for_symbol(module_ns, &name.name, original_ns_by_symbol)
+        }
+        DeclarationKind::UnsafeOrExtern(Spanned {
+            node: UnsafeOrExternKind::Extern { declarations, .. },
+            ..
+        }) => declarations.first().and_then(|sig| {
+            annotation_ns_for_symbol(module_ns, &sig.node.name.name, original_ns_by_symbol)
+        }),
+        _ => {
+            if module_ns.is_empty() {
+                None
+            } else {
+                Some(module_ns)
+            }
+        }
+    }
+}
+
+fn annotation_ns_for_symbol<'a>(
+    module_ns: &'a str,
+    symbol: &str,
+    original_ns_by_symbol: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    original_ns_by_symbol
+        .get(symbol)
+        .map(String::as_str)
+        .or_else(|| (!module_ns.is_empty()).then_some(module_ns))
+}
+
+/// Build the annotation vec for a user-defined function.
+/// Emits `; @ty_ns: <ns>` (when the declaration has one) followed by `; @ty_sig: ...`.
+fn build_fn_annotations(
+    decl_ns: Option<&str>,
+    fn_name: &str,
+    params: &[Parameter],
+    return_type: Option<&Type>,
+    _option_name: &str,
+    _result_name: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(ns) = decl_ns {
+        if !ns.is_empty() {
+            out.push(format!("; @ty_ns: {}", ns));
+        }
+    }
+    out.push(ty_sig_line(fn_name, params, return_type));
+    out
 }
 
 fn link_symbol_name(name: &str) -> String {
@@ -3989,7 +4828,9 @@ mod tests {
             .parse_module()
             .unwrap();
         let mut checker = crate::type_inference::TypeChecker::new();
-        checker.check_module(&module).unwrap();
+        checker
+            .check_module(&module, &std::collections::HashMap::new())
+            .unwrap();
         let mut liveness = crate::liveness::LiveAnalyzer::new();
         let drop_map = liveness
             .analyze_module(&module)
@@ -4000,6 +4841,7 @@ mod tests {
             checker.types(),
             &checker.specializations,
             &drop_map,
+            &std::collections::HashMap::new(),
         )
         .to_llvm_ir()
     }
@@ -4020,7 +4862,10 @@ mod tests {
     #[test]
     fn lowers_let_bindings() {
         let text = compile("fn main() -> Int32 { let x: Int32 = 3; return x; }");
-        assert!(text.contains("call i8* @slab_alloc"));
+        assert!(
+            text.contains("alloca i32"),
+            "expected alloca for immutable scalar let"
+        );
         assert!(text.contains("store i32 3"));
         assert!(text.contains("load i32"));
     }
@@ -4077,12 +4922,141 @@ mod tests {
     }
 
     #[test]
+    fn push_type_decl_upgrades_annotated_opaque_stub_instead_of_duplicating() {
+        // Reproduces the exact shape driver.rs produces: an opaque stub
+        // carrying a glued-on `@ty_ns` comment (one Vec entry, embedded \n),
+        // followed later by ensure_enum_layout's concrete definition for the
+        // same mangled symbol. Before the fix this silently duplicated the
+        // type line and clang/llvm rejected the .ll with "redefinition of
+        // type" — see main_ll_linked.ll:26 vs :39.
+        let mut reg = TypeRegistry::new();
+        let name = "Result__struct_Listenerptr__i32";
+        let opaque_annotated = format!(
+            "; @ty_ns: std::result\n%struct.{} = type opaque",
+            name
+        );
+        assert!(reg.push_type_decl(name, opaque_annotated));
+
+        let concrete = format!(
+            "%struct.{} = type {{ i32, %struct.Listener*, i32 }}",
+            name
+        );
+        assert!(reg.push_type_decl(&format!("%struct.{}", name), concrete.clone()));
+
+        let matching: Vec<_> = reg
+            .type_decls
+            .iter()
+            .filter(|d| d.contains(name) && d.contains("= type"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one type_decls entry for {}, found {:?}",
+            name,
+            matching
+        );
+        assert!(matching[0].ends_with(&concrete));
+    }
+
+    #[test]
+    fn lowers_struct_field_of_generic_array_type_to_tyarray_pointer() {
+        // Reproduces main_ll_linked.ll:505 "Cannot allocate unsized type
+        // %struct.main__Popcount" — a struct with an `Array<Int32>` field
+        // must lower that field to the concrete %struct.TyArray* runtime
+        // pointer, not fall through to mangle_app_struct_name and produce
+        // an undefined %struct.Array__i32 with no body anywhere in the IR.
+        let text = compile(
+            "struct Popcount { counts: Array<Int32> } fn main() -> Int32 { return 0; }",
+        );
+        assert!(
+            text.contains("%struct.main__Popcount = type { %struct.TyArray* }")
+                || text.contains("%struct.Popcount = type { %struct.TyArray* }"),
+            "expected Popcount's Array<Int32> field lowered to %struct.TyArray*, got:\n{}",
+            text
+        );
+        assert!(
+            !text.contains("%struct.Array__i32"),
+            "must not emit the undefined monomorphized Array__i32 struct name"
+        );
+    }
+
+    #[test]
     fn lowers_result_constructors_to_aggregate_values() {
         let text = compile(
             "enum Result<T, E> { Ok(T) Err(E) } fn main() -> Result<Int32, Str> { return Ok(1); }",
         );
         assert!(text.contains("%struct.Result__"));
         assert!(text.contains("insertvalue %struct.Result__"));
+    }
+
+    #[test]
+    fn needs_out_result_abi_flags_large_result_but_not_small_one() {
+        // Result<Listener, Int32>-shaped types (a pointer + tag + small int,
+        // 24 bytes) must be forced onto the out-pointer ABI convention on
+        // every target — a bare by-value return of this size crosses the
+        // register-return limit on both SysV (>16) and Windows x64 (>8),
+        // and disagreeing with the real C ABI is exactly what caused
+        // Network::listen's `addr` argument to arrive as NULL on Windows:
+        // the caller and the separately-compiled C runtime function
+        // disagreed about whether a hidden return pointer occupied the
+        // first argument register, shifting every subsequent argument by
+        // one slot.
+        let big = Spanned::new_dummy(
+            TypeKind {
+                name: "Result".to_string(),
+                generic_args: vec![
+                    Spanned::new_dummy(
+                        TypeKind {
+                            name: "Listener".to_string(),
+                            generic_args: vec![],
+                        },
+                        Span::default(),
+                    ),
+                    Spanned::new_dummy(
+                        TypeKind {
+                            name: "Int32".to_string(),
+                            generic_args: vec![],
+                        },
+                        Span::default(),
+                    ),
+                ],
+            },
+            Span::default(),
+        );
+        assert!(TypeRegistry::needs_out_result_abi(&Some(big)));
+
+        // Two Int32 fields (tag=4 + pad0 + i32=4 = 8 bytes) fits in a single
+        // register-return slot on every target — must NOT be forced.
+        let small = Spanned::new_dummy(
+            TypeKind {
+                name: "Option".to_string(),
+                generic_args: vec![Spanned::new_dummy(
+                    TypeKind {
+                        name: "Int32".to_string(),
+                        generic_args: vec![],
+                    },
+                    Span::default(),
+                )],
+            },
+            Span::default(),
+        );
+        assert!(!TypeRegistry::needs_out_result_abi(&Some(small)));
+
+        // Non-generic / no return type: never forced.
+        assert!(!TypeRegistry::needs_out_result_abi(&None));
+    }
+
+    #[test]
+    fn lowers_bare_colon_variant_payload_same_as_single_tuple() {
+        // `Code: Int32` (new bare-type payload) must produce the exact same
+        // struct layout as `Code(Int32)` would — same field count, same
+        // payload type, same tag rules. Confirms EnumVariantPayloadKind::Unit
+        // is not a second-class citizen next to Tuple/Struct.
+        let text = compile(
+            "enum Reading { Temperature: Float32, Offline } fn main() -> Reading { return Temperature(1.5); }",
+        );
+        assert!(text.contains("%struct.Reading = type"));
+        assert!(text.contains("insertvalue %struct.Reading"));
     }
 
     #[test]

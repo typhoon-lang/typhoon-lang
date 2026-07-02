@@ -151,6 +151,34 @@ impl Parser {
                     self.consume(TokenType::LParen, "Expected '('")?;
                     let mut params = Vec::new();
                     while self.peek_token().token_type != TokenType::RParen {
+                        // Handle variadic spread token '...'
+                        if self.peek_token().token_type == TokenType::Spread {
+                            let tok = self.advance_token();
+                            let span = tok.span;
+                            let p_name = Identifier {
+                                name: "...".to_string(),
+                                span,
+                            };
+                            let p_type = Spanned::new(
+                                TypeKind {
+                                    name: "...".to_string(),
+                                    generic_args: Vec::new(),
+                                },
+                                span,
+                                self.alloc_id(),
+                            );
+                            params.push(Parameter {
+                                name: p_name,
+                                type_annotation: p_type,
+                                span,
+                            });
+                            // accept optional trailing comma then break
+                            if !self.match_token(TokenType::Comma) {
+                                break;
+                            }
+                            continue;
+                        }
+
                         let p_name = self.identifier_with_span()?;
                         self.consume(TokenType::Colon, "Expected ':'")?;
                         let p_type = self.parse_type()?;
@@ -175,6 +203,7 @@ impl Parser {
                             generics: method_generics,
                             params,
                             return_type,
+                            out_result: false,
                         },
                         span,
                         self.alloc_id(),
@@ -299,7 +328,15 @@ impl Parser {
         let mut variants = Vec::new();
         while self.peek_token().token_type != TokenType::RBrace {
             let v_name = self.identifier_with_span()?;
-            let payload = if self.match_token(TokenType::LParen) {
+            let payload = if self.match_token(TokenType::Colon) {
+                // Bare single-type payload — works for primitives and structs.
+                // e.g. `Code: Int32`, `Wrapped: IoError`
+                let ty = self.parse_type()?;
+                Some(self.make_spanned_with_span(
+                    EnumVariantPayloadKind::Unit(ty),
+                    self.last_token_span(),
+                ))
+            } else if self.match_token(TokenType::LParen) {
                 let mut types = Vec::new();
                 while self.peek_token().token_type != TokenType::RParen {
                     types.push(self.parse_type()?);
@@ -904,6 +941,7 @@ impl Parser {
                     generics: method_generics,
                     params,
                     return_type,
+                    out_result: false,
                 },
                 span,
                 self.alloc_id(),
@@ -1030,6 +1068,19 @@ impl Parser {
                 );
                 continue;
             }
+            if self.match_token(TokenType::As) {
+                let target_type = self.parse_type()?;
+                let span = expr.span.join(self.last_token_span());
+                expr = Spanned::new(
+                    ExpressionKind::Cast {
+                        expr: Box::new(expr),
+                        target_type,
+                    },
+                    span,
+                    self.alloc_id(),
+                );
+                continue;
+            }
             break;
         }
         Ok(expr)
@@ -1086,7 +1137,7 @@ impl Parser {
             }));
         }
 
-        let mut name = self.identifier_with_span()?.name;
+        let name = self.identifier_with_span()?.name;
         let mut generic_args = Vec::new();
         if self.match_token(TokenType::LessThan) {
             loop {

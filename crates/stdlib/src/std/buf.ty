@@ -1,0 +1,9 @@
+namespace std::buf
+
+struct Buf {}
+extern "C" {
+    fn ty_buf_new() -> Buf
+    fn ty_buf_push_byte(b: Buf, c: Int8) -> Unit
+    fn ty_buf_push_str(b: Buf, s: Str) -> Unit
+    fn ty_buf_into_str(b: Buf) -> Str
+}

@@ -8,13 +8,13 @@
  *
  * Threading model
  * ───────────────
- *   - One OS thread per logical CPU core (worker threads).
- *   - Each worker runs a work-stealing loop over its own deque and
- *     randomly steals from peers when idle.
- *   - Each coroutine owns one SlabArena (task-local); cross-thread
- *     allocation never occurs.
- *   - Cooperative yield at I/O / channel blocks.
- *   - Preemptive yield via SIGPROF delivered to all workers.
+ * - One OS thread per logical CPU core (worker threads).
+ * - Each worker runs a work-stealing loop over its own deque and
+ *   randomly steals from peers when idle.
+ * - Each coroutine owns one SlabArena (task-local); cross-thread
+ *   allocation never occurs.
+ * - Cooperative yield at I/O / channel blocks.
+ * - Preemptive yield via SIGPROF delivered to all workers.
  */
 
 #include "platform.h"
@@ -31,88 +31,120 @@ extern "C" {
 /* ── opaque handle types ────────────────────────────────────────────────── */
 
 /* ══════════════════════════════════════════════════════════════════════════
- *  Coroutine
+ * Coroutine
  * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef enum {
-    CORO_RUNNABLE = 0,
-    CORO_RUNNING,
-    CORO_BLOCKED,
-    CORO_DONE
+	CORO_RUNNABLE = 0,
+	CORO_RUNNING,
+	CORO_BLOCKED,
+	CORO_DONE
 } CoroState;
 
 typedef struct TyCoro {
-    TyCtx ctx;
-    void (*fn)(void*, void*);
-    void* arg;
-    char* stack_base;
-    size_t stack_total;
-    SlabArena* arena;
-    _Atomic(CoroState) state;
-    _Atomic(int) ref;
-    _Atomic(struct TyCoro*) waiters;
-    _Atomic(int) waiters_lock;
-    struct TyCoro* waiter_next;
-    struct TyCoro* sched_next;
-    _Atomic(int64_t) io_result;
+	TyCtx ctx;
+	void (*fn)(void*, void*);
+	void* arg;
+	char* stack_base;
+	size_t stack_total;
+	SlabArena* arena;
+	_Atomic(CoroState) state;
+	_Atomic(int) ref;
+	_Atomic(struct TyCoro*) waiters;
+	_Atomic(int) waiters_lock;
+	struct TyCoro* waiter_next;
+	struct TyCoro* sched_next;
+	_Atomic(int64_t) io_result;
 } TyCoro;
 
 /* ══════════════════════════════════════════════════════════════════════════
- *  Chase-Lev Work-Stealing Deque
+ * Chase-Lev Work-Stealing Deque
  * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    _Atomic(size_t) cap;
-    _Atomic(void**) buf;
+	_Atomic(size_t) cap;
+	_Atomic(void**) buf;
 } DequeArray;
 
 typedef struct WSDeque {
-    _Atomic(long) top;
-    _Atomic(long) bottom;
-    _Atomic(DequeArray*) array;
+	_Atomic(long) top;
+	_Atomic(long) bottom;
+	_Atomic(DequeArray*) array;
 } WSDeque;
 
 /* ══════════════════════════════════════════════════════════════════════════
- *  Worker
+ * Per-worker fd set — tracks open sockets/listeners for clean shutdown.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define TY_FDSET_INIT_CAP 256
+
+typedef struct TyFdSet {
+	ty_fd_t* fds;
+	size_t len;
+	size_t cap;
+	TyMutex lock;
+} TyFdSet;
+
+/* Add fd to the set. Thread-safe (uses lock). */
+void ty_fdset_add(TyFdSet* set, ty_fd_t fd);
+
+/* Remove fd from the set. Returns 1 if found, 0 if not. Thread-safe. */
+int ty_fdset_remove(TyFdSet* set, ty_fd_t fd);
+
+/* Close all fds in the set. Used at worker shutdown. */
+void ty_fdset_close_all(TyFdSet* set);
+
+/* Initialize an fd set. */
+void ty_fdset_init(TyFdSet* set);
+
+/* Destroy fd set resources. */
+void ty_fdset_destroy(TyFdSet* set);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Worker
  * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct Worker {
-    TyThread thread;
-    int id;
-    WSDeque deque;
-    TyCoro* current;
-    TyCtx sched_ctx; /* scheduler's saved context                */
-    _Atomic(int) preempt_flag;
-    _Atomic(int) running;
-    _Atomic(int) last_phase; /* debug-only observability */
-    _Atomic(int) in_coro; /* debug-only observability */
-    _Atomic(long) local_deque_size_snapshot; /* debug-only observability */
+	TyThread thread;
+	int id;
+	WSDeque deque;
+	TyCoro* current;
+	TyCtx sched_ctx; /* scheduler's saved context */
+	_Atomic(int) preempt_flag;
+	_Atomic(int) running;
+	_Atomic(int) last_phase; /* debug-only observability */
+	_Atomic(int) in_coro; /* debug-only observability */
+	_Atomic(long) local_deque_size_snapshot; /* debug-only observability */
+	/* Per-worker IO backend pointer. */
+	struct TyIoBackend* io_backend;
+	/* Per-worker fd tracking for shutdown. */
+	TyFdSet fd_set;
 } Worker;
 
 /* ══════════════════════════════════════════════════════════════════════════
- *  Channel
+ * Channel
  * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct WaitNode {
-    TyCoro* coro;
-    void* elem;
-    struct WaitNode* next;
+	TyCoro* coro;
+	void* elem;
+	struct WaitNode* next;
 } WaitNode;
 
 struct TyChan {
-    TyMutex lock;
-    size_t elem_size;
-    size_t cap;
-    size_t len;
-    size_t head;
-    size_t tail;
-    char* buf;
-    WaitNode* send_q;
-    WaitNode* recv_q;
-    int closed;
-    /* Global registry so scheduler shutdown can close all channels and wake
-     * parked coroutines (avoid shutdown drain hang on chan recv/send). */
-    struct TyChan* all_next;
+	TyMutex lock;
+	size_t elem_size;
+	size_t cap;
+	size_t len;
+	size_t head;
+	size_t tail;
+	char* buf;
+	WaitNode* send_q;
+	WaitNode* recv_q;
+	int closed;
+	/* Global registry so scheduler shutdown can close all channels and wake
+	 * parked coroutines (avoid shutdown drain hang on chan recv/send). */
+	struct TyChan* all_next;
 };
 
 /* ── scheduler lifecycle ─────────────────────────────────────────────────── */
@@ -129,11 +161,18 @@ void ty_sched_run(void);
 /* Call at end of main() to drain all coroutines and shut down workers. */
 void ty_sched_shutdown(void);
 
+/* Return the Worker struct for the calling thread, or NULL if not a worker. */
+Worker* ty_sched_current_worker(void);
+
 /* ── coroutine API ───────────────────────────────────────────────────────── */
 
 /* Spawn a new coroutine running fn(task, arg). Returns immediately.
  * The new coroutine is pushed onto the current worker's deque. */
 TyCoro* ty_spawn(SlabArena* arena, void (*fn)(void* task, void* arg), void* arg);
+
+TyCoro* ty_spawn_closure(SlabArena* arena,
+		void (*fn)(void*, void*),
+		void* closure, size_t closure_size);
 
 /* Yield the current coroutine voluntarily.
  * The scheduler may resume another runnable coroutine. */
@@ -146,6 +185,8 @@ void ty_safepoint(void);
 /* Suspend current coroutine until `coro` has finished.
  * Behaves like cooperative await — the caller is re-queued when `coro` exits. */
 void ty_await(SlabArena* arena, TyCoro* coro);
+
+void ty_coro_set_blocked(void);
 
 /* Exit the current coroutine. Called automatically at function return. */
 void ty_coro_exit(void);

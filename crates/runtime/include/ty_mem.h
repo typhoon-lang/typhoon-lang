@@ -24,6 +24,9 @@ typedef struct SlabArena SlabArena;
 SlabArena* slab_arena_new(void);
 void       slab_arena_free(SlabArena* arena);
 
+/* Helper: map allocation size to runtime size class (exported for scheduler) */
+int32_t    size_to_class(size_t size);
+
 /* ── Slab allocation (called from emitted LLVM IR) ──────────────────────────── */
 
 void* slab_alloc(SlabArena* arena, int32_t size_class);
@@ -39,7 +42,11 @@ typedef struct Buf {
 
 Buf*  ty_buf_new(SlabArena* arena);
 void  ty_buf_push_str(SlabArena* arena, Buf* b, char* s);
+void  ty_buf_push_byte(SlabArena* arena, Buf* b, char c);
 char* ty_buf_into_str(SlabArena* arena, Buf* b);
+
+int64_t ty_str_len(char* s);
+char    ty_str_byte(char* s, int64_t idx);
 
 /* ── TyArray (dynamic array) ────────────────────────────────────────────────── */
 

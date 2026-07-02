@@ -3,6 +3,9 @@ namespace main
 use std::net::Network;
 use std::net::Socket;
 use std::net::Listener;
+use std::option::Some;
+use std::result::Ok;
+use std::io::Stdout;
 
 struct Popcount {
   ar: [Int32],
@@ -10,11 +13,14 @@ struct Popcount {
 
 impl Popcount {
   fn check(self, even: Int32) -> Int32 {
+    let out = Stdout{}
+    // `ref chan` — shared channel handle; can be cloned into conc blocks freely.
     let ch: ref chan<Int32> = chan<Int32>();
     let mut sent = 0;
-    for x in self.ar {
+    for e in self.ar {
       conc {
-        printf("Try %d\r\n", x);
+        let x = e as Int64;
+        out.printf("Try %d\r\n", x);
         let n = match (x & even) {
           x => 1
           _ => 0
@@ -35,33 +41,46 @@ impl Popcount {
 }
 
 fn handle_connection(socket: Socket) {
+  let out = Stdout{}
   let ch: ref chan<Int8> = chan<Int8>();
   socket.consume(ch);
 
-  let p: Popcount = Popcount {
+  // `p` is declared `let mut` so the liveness checker does not track it as a
+  // linear resource. This allows `p.check(...)` to be called on every loop
+  // iteration without the checker seeing a use-after-move. `mut` is scoped to
+  // this function and never escapes — no conc block captures it.
+  let mut p = Popcount {
     ar: [1, 2, 4, 8, 16, 32, 64, 128],
   }
 
   while true {
     let Some(i) = ch.recv() else { break; }  // None = channel closed = EOF
-    let n = p.check(i);
-    printf("Result: %d\r\n", n);
+    let n = p.check(i as Int32) as Int64;
+    out.printf("Result: %d\r\n", n);
   }
+  // `socket` is a linear resource (Socket). It is not consumed by `.consume()`
+  // or `.close()` calls (field-access method calls don't move the receiver in
+  // the current model). The compiler inserts a drop for `socket` at scope exit.
   socket.close();
 }
 
 fn main(net: Network) -> Int32 {
+  let out = Stdout{}
+  // `listener` is a linear resource (Listener). It lives for the duration of
+  // main and is dropped at function exit (compiler-generated drop).
   let Ok(listener) = net.listen("0.0.0.0:8080") else {
-    println("Listen failed\r\n");
+    out.println("Listen failed\r\n");
     return 0;
   };
-  println("Listening on :8080");
+  out.println("Listening on :8080");
 
-  let mut loop = true;
-  while loop {
-    let Ok(socket) = listener.accept() else { loop = false; };
+  while true {
+    // `socket` is a fresh linear resource each iteration. It is consumed by the
+    // `conc` capture — moved into the spawned coroutine, making it unavailable
+    // in the loop body after the conc statement. Isolation Guard: `socket` is an
+    // immutable `let` binding, so the capture is legal.
+    let Ok(socket) = listener.accept() else { break; };
     conc { handle_connection(socket); }
-    return 0;
   }
   return 0;
 }

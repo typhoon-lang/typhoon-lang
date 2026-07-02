@@ -55,7 +55,7 @@ static inline uint8_t* align_up(uint8_t* ptr, size_t align) {
     return (uint8_t*)((p + a - 1) & ~(a - 1));
 }
 
-static inline int32_t size_to_class(size_t size) {
+int32_t size_to_class(size_t size) {
     for (int32_t i = 0; i < NUM_SIZE_CLASSES; i++)
         if (size <= (size_t)SIZE_CLASS_BYTES[i]) return i;
     return NUM_SIZE_CLASSES; /* oversized */
@@ -338,6 +338,14 @@ void ty_buf_push_str(SlabArena* arena, Buf* b, char* s) {
     b->data[b->len] = '\0';
 }
 
+void ty_buf_push_byte(SlabArena* arena, Buf* b, char c) {
+    if (!b) return;
+    ty_buf_grow(arena, b, 1);
+    b->data[b->len] = c;
+    b->len += 1;
+    b->data[b->len] = '\0';
+}
+
 /*
  * ty_buf_into_str — transfers data pointer to the caller.
  * The Buf header slot is recycled; the data lives until slab_arena_free.
@@ -349,7 +357,17 @@ char* ty_buf_into_str(SlabArena* arena, Buf* b) {
     return out;
 }
 
-/* ── TyArray
+int64_t ty_str_len(char* s) {
+    if (!s) return 0;
+    return (int64_t)strlen(s);
+}
+
+char ty_str_byte(char* s, int64_t idx) {
+    if (!s || idx < 0) return 0;
+    return s[(size_t)idx];
+}
+
+/* ── String helpers
  * ─────────────────────────────────────────────────────────────────── */
 
 TyArray* ty_array_from_fixed(SlabArena* arena, void* data, int64_t len,

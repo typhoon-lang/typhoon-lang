@@ -28,40 +28,40 @@ This document outlines the step-by-step implementation of the Typhoon language a
     - [x] Handle shadowing and duplicate declaration errors
     - [x] Resolve `use` paths and populate namespace imports
     - [x] Resolve `struct`/`enum`/`newtype` type names in type annotations
-    - [ ] Resolve member names for field access and enum variants (compiler currently types some field access without resolver-member linking)
-    - [ ] Emit source-span-aware errors (unknown name, ambiguous path, private access)
+    - [x] Resolve member names for field access and enum variants (compiler currently types some field access without resolver-member linking)
+    - [x] Emit source-span-aware errors (unknown name, ambiguous path, private access)
     - [x] Tests: scope shadowing, unresolved names, `use` glob, path segments
 - [ ] Type Inference
     - [x] Implement bidirectional HM inference
     - [x] Handle generics and interface bounds
     - [x] `Result`/`Option` desugaring
-    - [ ] Type representation: `TyVar`, `TyCon`, `TyApp`, `TyFn`, `TyTuple`, `TyArray`
+    - [x] Type representation: `TyVar`, `TyCon`, `TyApp`, `TyFn`, `TyTuple`, `TyArray`
     - [x] Unification with occurs check and union-find
     - [x] Generalization at `let` bindings
     - [x] Instantiation at identifier use sites
     - [x] Expected-type propagation (bidirectional) for literals and blocks
     - [x] Numeric literal defaulting rules (Int32, Float32) with explicit `as`
-    - [ ] Constraint solving for interface bounds (trait-like)
-    - [ ] Structural typing rules for `struct` initialization and `enum` variants
+    - [x] Constraint solving for interface bounds (trait-like)
+    - [x] Structural typing rules for `struct` initialization and `enum` variants
     - [x] Type checking for `if`, `match`, `return`, and block trailing expression
     - [x] Struct field access typing (`x.field`) from declared struct field types
     - [x] Array indexing typing `a[i] -> Option<T>` for both fixed arrays and `Array<T>`
     - [x] Method-call typing `x.method(args...)` via mangled function symbols (`__ty_method__Type__method`)
     - [x] Built-in `Array<T>.push(val) -> Unit` typing (in-place)
-    - [ ] Channel typing: `chan<T>()` constructor and methods
+    - [x] Channel typing: `chan<T>()` constructor and methods
       - [x] `send`
-      - [ ] `recv`
-      - [ ] `try_send`
+      - [x] `recv`
+      - [x] `try_send`
       - [x] `try_recv`
     - [x] Tests: inferred let types, function calls, polymorphic `Option`/`Result`
 - [ ] Desugaring
     - [x] Desugar `?` operator (verify compatible return type)
     - [x] Eliminate `|>` by rewriting to direct calls before IR lowering
-    - [ ] Desugar `match` arms into core pattern forms (for later liveness)
+    - [x] Desugar `match` arms into core pattern forms (for later liveness)
     - [x] Desugar string interpolation into `Buf` builder calls
     - [x] Track desugared spans for error mapping
     - [x] Declaration renaming/desugaring supports `interface` / `impl` / `extend` blocks (methods desugar like functions)
-- [ ] **Milestone:** All example programs type-check. Invalid programs produce clear type errors.
+- [x] **Milestone:** All example programs type-check. Invalid programs produce clear type errors.
 
 ### Phase 2 Status
 - Resolver: Scope tree + `DeclId`/`ScopeId` interners and per-scope symbol tables are implemented in `src/resolver.rs`, covering functions/params/`let`/`use` plus generic type params and annotation type names.

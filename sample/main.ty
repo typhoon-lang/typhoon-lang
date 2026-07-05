@@ -3,21 +3,33 @@ namespace main
 use std::net::Network;
 use std::net::Socket;
 use std::net::Listener;
+use std::net::ReadSocket;
+use std::net::WriteSocket;
+use std::net::SocketHalves;
 use std::option::Some;
 use std::result::Ok;
 use std::io::Stdout;
+use std::buf::Buf;
+// method calls (chunk.toStr(), data.length(), data.at(i)) — need
+// Buf.toStr/Str.length/Str.at impls in buf.ty/str.ty (not held here).
 
 struct Popcount {
   ar: [Int32],
 }
 
 impl Popcount {
+  // Takes `self` by value (consuming). The caller must ensure it is not reused
+  // after this call. Use `let mut p` if the checker should ignore liveness for p,
+  // or restructure into a standalone function if p must survive multiple calls.
   fn check(self, even: Int32) -> Int32 {
     let out = Stdout{}
     // `ref chan` — shared channel handle; can be cloned into conc blocks freely.
     let ch: ref chan<Int32> = chan<Int32>();
     let mut sent = 0;
     for e in self.ar {
+      // `e` is copy (Int32 element), `out` is ptr-exempt (Stdout), `ch` is ref-shared.
+      // `even` is copy (Int32). No `mut` binding crosses this boundary — Isolation
+      // Guard satisfied.
       conc {
         let x = e as Int64;
         out.printf("Try %d\r\n", x);
@@ -42,8 +54,15 @@ impl Popcount {
 
 fn handle_connection(socket: Socket) {
   let out = Stdout{}
-  let ch: ref chan<Int8> = chan<Int8>();
-  socket.consume(ch);
+  // socket.consume(ch) no longer exists — Socket__consume was deleted
+  // (Phase 2, Task 2.1): it sent one channel op per BYTE, the opposite
+  // of the chunk-based backpressure model (D4). split()/into_chan()
+  // replaces it: the reader coroutine sends one Buf per CHUNK.
+  // Confirmed against the real net.ty (SocketHalves { read, write }).
+  let halves = socket.split();
+  let read_sock = halves.read;
+  let write_sock = halves.write;
+  let ch: ref chan<Buf> = read_sock.into_chan(4096, 16);
 
   // `p` is declared `let mut` so the liveness checker does not track it as a
   // linear resource. This allows `p.check(...)` to be called on every loop
@@ -54,14 +73,23 @@ fn handle_connection(socket: Socket) {
   }
 
   while true {
-    let Some(i) = ch.recv() else { break; }  // None = channel closed = EOF
-    let n = p.check(i as Int32) as Int64;
-    out.printf("Result: %d\r\n", n);
+    let Some(chunk) = ch.recv() else { break; }  // None = channel closed = EOF
+    // Buf.toStr() consumes chunk, returns Str. Str.length()/Str.at() walk it.
+    let data = chunk.toStr();
+    let clen = data.length()
+    let mut idx = 0 as Int64
+    while idx < clen {
+      let byte = data.at(idx)
+      let n = p.check(byte as Int32) as Int64;
+      out.printf("Result: %d\r\n", n);
+      idx = idx + 1
+    }
   }
-  // `socket` is a linear resource (Socket). It is not consumed by `.consume()`
-  // or `.close()` calls (field-access method calls don't move the receiver in
-  // the current model). The compiler inserts a drop for `socket` at scope exit.
-  socket.close();
+  // Both halves are separate linear resources now (Task 2.5) — each needs
+  // its own close, same "compiler inserts a drop at scope exit if not
+  // explicitly closed" behavior as the original single Socket had.
+  read_sock.close();
+  write_sock.close();
 }
 
 fn main(net: Network) -> Int32 {

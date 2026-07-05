@@ -19,9 +19,25 @@
 #include "platform.h"
 #include "io_driver.h"
 #include "ty_io_backend.h"
+#include "ty_mem.h"
+#include "atomic.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * TyStr itself is NOT redeclared here anymore — ty_net.h includes
+ * ty_mem.h and uses TyStr* directly in its own declarations (e.g.
+ * Network__listen, WriteSocket__write), so the real one must already be
+ * available through that include chain. A second, separate `typedef
+ * struct { ... } TyStr;` here was a real bug: two anonymous-struct
+ * typedefs to the same name are never compatible in C even with
+ * identical member layout, which is exactly what caused the "conflicting
+ * types for '__ty_rt__ReadSocket__into_chan'" build error — the
+ * redefinition corrupted type identity for everything downstream in this
+ * file, not just code that directly touches TyStr. */
 
 #if defined(_WIN32)
 # define WIN32_LEAN_AND_MEAN
@@ -81,7 +97,71 @@ static const char* ty_net_errstr_errno(int32_t code, char* buf, size_t buf_len) 
 
 struct TyNetwork { uint32_t _tag; };
 struct TyListener { ty_sock_t sock; };
-struct TySocket { ty_sock_t sock; int closed; };
+struct TySocket {
+    ty_sock_t sock;
+    int closed;
+    /* Number of live halves sharing this socket's fd. 1 for a plain,
+     * never-split Socket (Socket__close always fully closes — same as
+     * before). set to 2 by split(); the fd is only actually closed once
+     * both ReadSocket__close and WriteSocket__close have run. */
+    _Atomic(int) half_count;
+};
+struct TyReadSocket  { TySocket* sock; int closed; };
+struct TyWriteSocket { TySocket* sock; int closed; };
+
+/* ── Fixed-slot lock-free pool for cross-coroutine resources ────────────────
+ *
+ * Socket/Listener/consume-closure structs must have independent lifetime,
+ * not task-arena lifetime (see D5 exemption in typhoon_io_redesign.md) —
+ * they're routinely handed from an accepting/owning coroutine to a
+ * different spawned coroutine.  malloc/free is correct but not fast here:
+ * with the M:N work-stealing scheduler, allocation happens on the
+ * accepting worker thread and free happens on whatever thread later runs
+ * Socket__close — very likely a different OS thread. That's glibc
+ * malloc's slow path (cross-thread free forces arena migration/locking).
+ *
+ * A fixed-slot pool sidesteps this: alloc/free are a single CAS on a
+ * per-slot flag, O(1) regardless of which thread performs them, no lock.
+ * Same technique as ty_io_kqueue.c's KqPending pool, with an added
+ * rotating search hint so allocation stays ~O(1) instead of O(n) under
+ * high occupancy. Falls back to malloc/free if the pool is exhausted —
+ * degrades gracefully rather than failing the accept.
+ */
+
+#define TY_NET_POOL_CAP 8192 /* must be a power of 2 */
+
+#define TY_NET_DEFINE_POOL(NAME, TYPE)                                       \
+    static TYPE NAME##_slots[TY_NET_POOL_CAP];                               \
+    static _Atomic(int) NAME##_in_use[TY_NET_POOL_CAP];                      \
+    static _Atomic(int) NAME##_hint;                                         \
+    static TYPE* NAME##_alloc(void) {                                        \
+        int start = atomic_fetch_add_explicit(&NAME##_hint, 1,               \
+            memory_order_relaxed) & (TY_NET_POOL_CAP - 1);                   \
+        for (int i = 0; i < TY_NET_POOL_CAP; i++) {                          \
+            int idx = (start + i) & (TY_NET_POOL_CAP - 1);                   \
+            int exp = 0;                                                     \
+            if (atomic_compare_exchange_strong_explicit(                     \
+                    &NAME##_in_use[idx], &exp, 1,                            \
+                    memory_order_acquire, memory_order_relaxed))             \
+                return &NAME##_slots[idx];                                   \
+        }                                                                    \
+        return (TYPE*)malloc(sizeof(TYPE)); /* pool exhausted — fallback */  \
+    }                                                                        \
+    static void NAME##_free(TYPE* p) {                                      \
+        if (!p) return;                                                      \
+        uintptr_t base = (uintptr_t)NAME##_slots;                            \
+        uintptr_t addr = (uintptr_t)p;                                       \
+        if (addr < base || addr >= base + sizeof(NAME##_slots)) {            \
+            free(p); return; /* came from the malloc fallback path */        \
+        }                                                                    \
+        size_t idx = (addr - base) / sizeof(TYPE);                           \
+        atomic_store_explicit(&NAME##_in_use[idx], 0, memory_order_release); \
+    }
+
+TY_NET_DEFINE_POOL(g_socket_pool, TySocket)
+TY_NET_DEFINE_POOL(g_listener_pool, TyListener)
+TY_NET_DEFINE_POOL(g_read_pool, TyReadSocket)
+TY_NET_DEFINE_POOL(g_write_pool, TyWriteSocket)
 
 static TyNetwork g_net = { 0x4E45544Eu }; /* 'NETN' */
 static int g_initialized = 0;
@@ -113,21 +193,42 @@ TyNetwork* ty_net_global(void) {
     return &g_net;
 }
 
-static int split_host_port(const char* addr, char** host_out, char** port_out) {
-    if (!addr) return 0;
-    const char* last_colon = strrchr(addr, ':');
-    if (!last_colon) return 0;
-    size_t host_len = (size_t)(last_colon - addr);
-    const char* port = last_colon + 1;
-    if (*port == '\0') return 0;
+static int split_host_port(TyStr* addr, char** host_out, char** port_out) {
+    if (!addr || !addr->ptr || addr->len <= 0) return 0;
 
-    char* host = (char*)malloc(host_len + 1);
+    /* Find the last ':' within [0, addr->len) explicitly — NOT strrchr,
+     * which scans for a null terminator Str no longer guarantees in
+     * general (it's a fat pointer with an explicit length now, not a
+     * null-terminated C string). This was the actual bug behind
+     * "listen invalid addr=<garbage>": this function still took a raw
+     * char* and was handed the address of a %struct.Str instead of the
+     * string's bytes. */
+    int32_t colon = -1;
+    for (int32_t i = addr->len - 1; i >= 0; i--) {
+        if (addr->ptr[i] == ':') { colon = i; break; }
+    }
+    if (colon < 0) return 0;
+
+    int32_t host_len = colon;
+    int32_t port_len = addr->len - colon - 1;
+    if (port_len <= 0) return 0;
+
+    char* host = (char*)malloc((size_t)host_len + 1);
     if (!host) return 0;
-    memcpy(host, addr, host_len);
+    memcpy(host, addr->ptr, (size_t)host_len);
     host[host_len] = '\0';
 
+    /* port_out points directly into addr->ptr, not a separate copy —
+     * matches the original (pre-fat-pointer) behavior and its existing
+     * free() pairing (port is never freed by any caller). Relies on the
+     * same trailing-'\0' invariant used in ty_io.c's fs::open: every
+     * current Str-producing path (codegen.rs's emit_string for literals,
+     * ty_buf_into_str) keeps one byte past len as '\0', so the substring
+     * starting after the colon is still validly null-terminated. Breaks
+     * silently if Str slicing is ever added and can produce a view that
+     * doesn't end at the original buffer's terminator. */
     *host_out = host;
-    *port_out = (char*)port;
+    *port_out = addr->ptr + colon + 1;
     return 1;
 }
 
@@ -145,7 +246,7 @@ static void ty_sock_set_nonblock(ty_sock_t s) {
 #endif
 }
 
-void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* out) {
+void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult_Listener_i32* out) {
     (void)task;
     (void)self;
 
@@ -160,8 +261,13 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
     char* port = NULL;
     if (!split_host_port(addr, &host, &port)) {
         result.err = -2;
-        TY_DEBUG("[net] listen invalid addr=\"%s\" (expected host:port)\n",
-            addr ? addr : "(null)");
+        /* %.*s with an explicit length, not %s — addr->ptr has no
+         * null-termination guarantee to stop at in general (see
+         * split_host_port's comment). Printing it as if it were a plain
+         * C string is exactly what produced garbled/binary output
+         * before this function took TyStr* instead of raw char*. */
+        TY_DEBUG("[net] listen invalid addr=\"%.*s\" (expected host:port)\n",
+            addr ? addr->len : 0, addr ? addr->ptr : "(null)");
         *out = result;
         return;
     }
@@ -284,7 +390,7 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_
     }
 #endif
 
-    TyListener* listener = (TyListener*)malloc(sizeof(TyListener));
+    TyListener* listener = g_listener_pool_alloc();
     if (!listener) {
         ty_sock_close(s);
         result.err = -3;
@@ -349,7 +455,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
 #ifdef __APPLE__
                 ty_sock_set_nonblock(c);
 #endif
-                TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
+                TySocket* sock = g_socket_pool_alloc();
                 if (!sock) {
                     ty_sock_close(c);
                     result.err = -3;
@@ -358,6 +464,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
                 }
                 sock->sock = c;
                 sock->closed = 0;
+                sock->half_count = 1;
 
                 Worker* w = ty_sched_current_worker();
                 if (w) {
@@ -430,7 +537,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
             ty_sock_t accepted = (ty_sock_t)io_result;
             /* Set accepted socket non-blocking for async read/write. */
             ty_sock_set_nonblock(accepted);
-            TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
+            TySocket* sock = g_socket_pool_alloc();
             if (!sock) {
                 ty_sock_close(accepted);
                 result.err = -3;
@@ -439,6 +546,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
             }
             sock->sock = accepted;
             sock->closed = 0;
+            sock->half_count = 1;
 
             Worker* w = ty_sched_current_worker();
             if (w) {
@@ -473,7 +581,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     /* Accepted socket needs non-blocking for async IO. */
     ty_sock_set_nonblock(c);
 
-    TySocket* sock = (TySocket*)malloc(sizeof(TySocket));
+    TySocket* sock = g_socket_pool_alloc();
     if (!sock) {
         ty_sock_close(c);
         result.err = -3;
@@ -482,6 +590,7 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     }
     sock->sock = c;
     sock->closed = 0;
+    sock->half_count = 1;
 
     /* Phase 4: register fd in per-worker TyFdSet */
     Worker* w = ty_sched_current_worker();
@@ -496,90 +605,213 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
     return;
 }
 
-/* ── Socket__consume ─────────────────────────────────────────────────────────
+/* ── Socket.split() / ReadSocket.into_chan() ─────────────────────────────────
  *
- * Spawns a background coroutine that reads chunks from self->sock and sends
- * each byte into `ch`, then closes `ch` on EOF or error.
+ * Task 2.1/2.5, OQ3 resolved design:
+ *   Socket.split() -> (ReadSocket, WriteSocket)
+ *   ReadSocket.into_chan(chunk_size, cap) -> chan<Buf>   — owns read direction
+ *   WriteSocket is the only write-capable handle
+ *   fd is shared internally; ownership is directionally encoded in the
+ *   type system (TySocket.half_count tracks when both halves have closed).
  *
- * Phase 4: reads 4096-byte chunks via ty_io_read (async when driver present),
- * falls back to blocking recv() otherwise. Backpressure via channel send.
+ * Replaces Socket__consume, which sent one channel op per BYTE (chan<int8>
+ * under the hood) — the opposite of D4's backpressure model, and the
+ * function whose 4096-byte slab_alloc(size_to_class(...)) call was the
+ * live heap overflow fixed earlier. into_chan sends one channel op per
+ * CHUNK (chan<Buf>), matching D4, and reads directly into a correctly
+ * sized Buf via slab_alloc_sized/ty_buf_new_sized rather than a
+ * class-rounded raw buffer.
  */
 
 typedef struct {
-    TySocket* socket;
+    TyReadSocket* rs;
     struct TyChan* chan;
-} TyConsumeCtx;
+    int64_t chunk_size;
+} TyIntoChanCtx;
 
-static void ty_socket_reader_coro(void* task, void* arg) {
-    TyConsumeCtx* ctx = (TyConsumeCtx*)arg;
-    TySocket* self = ctx->socket;
+/* Same cross-thread alloc/free pattern as Socket/Listener: ctx is built on
+ * the calling coroutine's worker, unpacked and freed on the newly spawned
+ * reader coroutine's worker — likely a different thread. Pool it too. */
+TY_NET_DEFINE_POOL(g_intochan_ctx_pool, TyIntoChanCtx)
+
+static void ty_read_into_chan_coro(void* task, void* arg) {
+    TyIntoChanCtx* ctx = (TyIntoChanCtx*)arg;
+    TyReadSocket* rs = ctx->rs;
     struct TyChan* ch = ctx->chan;
-    free(ctx); /* closure is no longer needed once unpacked */
+    int64_t chunk_size = ctx->chunk_size;
+    g_intochan_ctx_pool_free(ctx);
 
-    const size_t CHUNK = 4096;
+    SlabArena* arena = (SlabArena*)task;
+
     for (;;) {
-        /* Phase 4: read self->sock directly — closed flag provides safety,
-         * no global lock needed. Each socket is owned by one coroutine. */
-        ty_sock_t fd = self ? self->sock : TY_SOCK_INVALID;
+        TySocket* sock = rs ? rs->sock : NULL;
+        ty_sock_t fd = sock ? sock->sock : TY_SOCK_INVALID;
 
         if (fd == TY_SOCK_INVALID)
             break; /* socket was closed externally */
 
-        /* Allocate slab buffer from task arena. */
-        SlabArena* arena = (SlabArena*)task;
-        int32_t cls = size_to_class(CHUNK);
-        char* buf = (char*)slab_alloc(arena, cls);
-        if (!buf) break; /* OOM on slab (rare) */
+        /* Read straight into a Buf sized exactly to chunk_size — one
+         * allocation, one copy (kernel into buffer). No intermediate
+         * raw buffer, no size-class rounding. */
+        Buf* chunk = ty_buf_new_sized(arena, chunk_size);
+        if (!chunk) break; /* OOM on slab (rare) */
 
         int64_t got = 0;
         void* drv = ty_io_global_driver();
         void* coro = ty_current_coro_raw();
         if (drv && coro) {
             /* async path: submit via driver and park until completion */
-            ty_io_read(drv, arena, coro, fd, (uint8_t*)buf, CHUNK);
+            ty_io_read(drv, arena, coro, fd, (uint8_t*)chunk->data, (size_t)chunk_size);
             got = ty_io_take_result(coro);
         } else {
 #if defined(_WIN32)
-            int n = recv((SOCKET)fd, buf, (int)CHUNK, 0);
+            int n = recv((SOCKET)fd, chunk->data, (int)chunk_size, 0);
             got = (int64_t)n;
 #else
             ssize_t n;
-            do { n = recv(fd, buf, CHUNK, 0); } while (n < 0 && errno == EINTR);
+            do { n = recv(fd, chunk->data, (size_t)chunk_size, 0); } while (n < 0 && errno == EINTR);
             got = (int64_t)n;
 #endif
         }
 
         if (got <= 0) break; /* EOF or error */
 
-        /* Send each byte into channel; backpressure applies at ty_chan_send */
-        for (int64_t i = 0; i < got; i++) {
-            int8_t b = (int8_t)buf[i];
-            ty_chan_send(arena, ch, &b);
-        }
-        /* slab buffer reclaimed when arena freed; no free needed */
+        chunk->len = got;
+        chunk->data[got] = '\0';
+
+        /* One channel op per CHUNK, not one per byte — D4's backpressure
+         * model: chan<Buf> capacity bounds chunks in flight. */
+        ty_chan_send(arena, ch, &chunk);
     }
     ty_chan_close(ch);
 }
 
-void __ty_rt__Socket__consume(void* task, TySocket* self, void* ch) {
-    if (!self || !ch) {
-        if (ch) ty_chan_close((struct TyChan*)ch);
-        return;
+/*
+ * Socket__split — consumes a whole Socket, returns two directional
+ * handles sharing the underlying fd. Cannot fail (no Result out param) —
+ * both halves are just pool-allocated wrapper structs.
+ *
+ * ABI: returned BY VALUE, not via out-pointer. My first attempt guessed
+ * the out-pointer convention by analogy with Result<T,E>, but the actual
+ * compiler output (confirmed from the linked IR) declares this as
+ * `%struct.SocketHalves @__ty_rt__Socket__split(i8*, %struct.Socket*)` —
+ * a plain two-pointer struct is small enough (16 bytes) that codegen
+ * returns it directly rather than through sret/out-pointer the way it
+ * does for Result<T,E>'s bigger tag+value+err layout.
+ *
+ * TySplitResult itself is NOT redeclared here — ty_net.h already defines
+ * it (same anonymous-struct-redefinition bug as TyStr above; ty_net.c
+ * includes ty_net.h, so a second local typedef of the same name is a
+ * conflicting, not redundant, declaration).
+ */
+TySplitResult __ty_rt__Socket__split(void* task, TySocket* self) {
+    (void)task;
+    atomic_store_explicit(&self->half_count, 2, memory_order_relaxed);
+
+    TyReadSocket* r = g_read_pool_alloc();
+    TyWriteSocket* w = g_write_pool_alloc();
+    r->sock = self;
+    r->closed = 0;
+    w->sock = self;
+    w->closed = 0;
+
+    TySplitResult result;
+    result.read = r;
+    result.write = w;
+    return result;
+}
+
+/*
+ * ReadSocket__into_chan — spawns the reader coroutine above and returns
+ * the channel immediately; the caller doesn't wait for it to finish.
+ *
+ * ABI: returns struct TyChan* BY VALUE, not via out-pointer. Same class
+ * of mistake as Socket__split originally was: chan<T> lowers to a bare
+ * i8* (see codegen.rs: "Chan" => "i8*", same slot as Ref), not an
+ * aggregate like Result<T,E> that needs sret/out-pointer treatment.
+ * net.ty's own declaration (`-> ref chan<Buf>`) is what the compiler
+ * actually builds its expected C signature from, and it expects a
+ * direct 4-param/return-value shape, not the 5-param/void/out-pointer
+ * shape I originally wrote here.
+ */
+struct TyChan* __ty_rt__ReadSocket__into_chan(void* task, TyReadSocket* self,
+    int64_t chunk_size, int64_t cap) {
+    if (chunk_size <= 0) chunk_size = 4096;
+
+    struct TyChan* ch = ty_chan_new(sizeof(Buf*), (size_t)cap);
+
+    if (!self) {
+        ty_chan_close(ch);
+        return ch;
     }
 
-    TyConsumeCtx* ctx = (TyConsumeCtx*)malloc(sizeof(TyConsumeCtx));
+    TyIntoChanCtx* ctx = g_intochan_ctx_pool_alloc();
     if (!ctx) {
         /* OOM: close the channel immediately so the receiver sees EOF. */
-        ty_chan_close((struct TyChan*)ch);
+        ty_chan_close(ch);
+        return ch;
+    }
+    ctx->rs = self;
+    ctx->chan = ch;
+    ctx->chunk_size = chunk_size;
+
+    ty_spawn((SlabArena*)task, ty_read_into_chan_coro, (void*)ctx);
+    return ch;
+}
+
+/* ReadSocket__close / WriteSocket__close — release this half. The
+ * underlying fd is only actually closed once both halves have closed
+ * (half_count reaches 0); until then the other half keeps using it. */
+void __ty_rt__ReadSocket__close(void* task, TyReadSocket* self) {
+    (void)task;
+    if (!self) return;
+    TY_ASSERT(!self->closed, "ReadSocket__close called twice — liveness checker bug");
+    self->closed = 1;
+
+    TySocket* sock = self->sock;
+    self->sock = NULL;
+    if (sock && atomic_fetch_sub_explicit(&sock->half_count, 1, memory_order_acq_rel) == 1) {
+        __ty_rt__Socket__close(task, sock);
+    }
+    g_read_pool_free(self);
+}
+
+void __ty_rt__WriteSocket__close(void* task, TyWriteSocket* self) {
+    (void)task;
+    if (!self) return;
+    TY_ASSERT(!self->closed, "WriteSocket__close called twice — liveness checker bug");
+    self->closed = 1;
+
+    TySocket* sock = self->sock;
+    self->sock = NULL;
+    if (sock && atomic_fetch_sub_explicit(&sock->half_count, 1, memory_order_acq_rel) == 1) {
+        __ty_rt__Socket__close(task, sock);
+    }
+    g_write_pool_free(self);
+}
+
+/* WriteSocket__write — thin delegate onto Socket__write; WriteSocket is
+ * just a directional wrapper around the same underlying TySocket.
+ *
+ * buf is Str at the Typhoon level (net.ty: fn write(self, buf: Str, len:
+ * Int32)), which is now a fat pointer { ptr, len }, not raw char* — see
+ * codegen.rs's "%struct.Str" and ty_mem.c's matching TyStr. The `len`
+ * parameter net.ty still passes is redundant now that buf carries its
+ * own length; ignored here in favor of buf->len, which can't be wrong
+ * the way a separately-passed len could (caller mismatch). Worth
+ * dropping `len` from net.ty's signature entirely as a follow-up. */
+void __ty_rt__WriteSocket__write(void* task, TyWriteSocket* self, TyStr* buf,
+    int32_t len, TyResult_i32_i32* out) {
+    (void)len;
+    if (!self || !buf) {
+        TyResult_i32_i32 result;
+        result.tag = 1;
+        result.value = 0;
+        result.err = -1;
+        *out = result;
         return;
     }
-    ctx->socket = self;
-    ctx->chan = (struct TyChan*)ch;
-
-    /* ty_spawn(arena, fn_ptr, arg_ptr) → new coroutine.
-     * Passing the caller's task as the arena shares the same slab pool,
-     * matching how connection handler coros are spawned elsewhere. */
-    ty_spawn((SlabArena*)task, ty_socket_reader_coro, (void*)ctx);
+    __ty_rt__Socket__write(task, self->sock, buf->ptr, buf->len, out);
 }
 
 /*
@@ -774,7 +1006,7 @@ void __ty_rt__Listener__close(void* task, TyListener* self) {
         ty_sock_force_shutdown(fd_to_close);
         ty_sock_close(fd_to_close);
     }
-    free(self);
+    g_listener_pool_free(self);
 }
 
 void __ty_rt__Socket__close(void* task, TySocket* self) {
@@ -804,5 +1036,5 @@ void __ty_rt__Socket__close(void* task, TySocket* self) {
         }
         ty_sock_close(fd_to_close);
     }
-    free(self);
+    g_socket_pool_free(self);
 }

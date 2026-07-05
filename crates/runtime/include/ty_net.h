@@ -6,6 +6,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "ty_mem.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,6 +15,8 @@ extern "C" {
 typedef struct TyNetwork TyNetwork;
 typedef struct TyListener TyListener;
 typedef struct TySocket TySocket;
+typedef struct TyReadSocket TyReadSocket;
+typedef struct TyWriteSocket TyWriteSocket;
 
 // Field layout mirrors what the compiler derives from `enum Result<T, E> { Ok(T), Err(E) }`
 // in result.ty: tag is field 0, then one payload slot per variant in
@@ -60,11 +63,17 @@ void ty_net_init(void);
 void ty_net_shutdown(void);
 TyNetwork* ty_net_global(void);
 
+typedef struct {
+    TyReadSocket*  read;
+    TyWriteSocket* write;
+} TySplitResult;
+
 /* LLVM-emitted method symbols */
-void __ty_rt__Network__listen(void* task, TyNetwork* self, char* addr, TyResult_Listener_i32* out);
+void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult_Listener_i32* out);
 void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32* out);
 void __ty_rt__Listener__close(void* task, TyListener* self);
 void __ty_rt__Socket__close(void* task, TySocket* self);
+TySplitResult __ty_rt__Socket__split(void* task, TySocket* self);
 
 /* Phase 4: canonical async read/write via TyIoOp.
  * Read returns (Socket, Buf, Result<Int32, IoError>).
@@ -76,6 +85,16 @@ typedef struct TyResult_i32_i32 {
 } TyResult_i32_i32;
 void __ty_rt__Socket__read(void* task, TySocket* self, char* buf, int32_t cap, TyResult_i32_i32* out);
 void __ty_rt__Socket__write(void* task, TySocket* self, char* buf, int32_t len, TyResult_i32_i32* out);
+/* chan<T> lowers to a bare i8*\/struct TyChan* (same slot as Ref in
+ * codegen.rs), not an out-pointer-requiring aggregate like Result<T,E> —
+ * returned by value, 4 params. This was previously a 5-param/void/
+ * out-pointer signature that didn't match what net.ty's own declaration
+ * (`-> ref chan<Buf>`) causes the compiler to actually expect, which is
+ * what caused the "conflicting types" build error. */
+struct TyChan* __ty_rt__ReadSocket__into_chan(void* task, TyReadSocket* self, int64_t chunk_size, int64_t cap);
+void __ty_rt__ReadSocket__close(void* task, TyReadSocket* self);
+void __ty_rt__WriteSocket__close(void* task, TyWriteSocket* self);
+void __ty_rt__WriteSocket__write(void* task, TyWriteSocket* self, TyStr* buf, int32_t len, TyResult_i32_i32* out);
 
 /* Blocking / non-blocking byte receive over a channel populated by
  * Socket__consume's background reader coroutine. Same TyResult_i32_i32

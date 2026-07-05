@@ -305,6 +305,29 @@ void slab_free(SlabArena* arena, void* ptr, int32_t size_class) {
     arena->free_lists[size_class] = node;
 }
 
+/*
+ * slab_alloc_sized — like slab_alloc, but takes a real byte size instead
+ * of a size_class index.
+ *
+ * slab_alloc(arena, size_class) is lossy above 1024 bytes: size_to_class()
+ * collapses every size >1024 into a single sentinel class (8), and
+ * slab_alloc has no way to recover the real size from that — it silently
+ * allocates a fixed 2048 bytes regardless of what was actually needed.
+ * Any caller requesting >2048 bytes via slab_alloc(arena,
+ * size_to_class(n)) under-allocates and the caller's subsequent write
+ * overflows the slot. This bit ty_net.c's 4096-byte socket read buffer
+ * (2048 allocated, 4096-byte recv() told to fill it) and is a latent bug
+ * anywhere else that pattern is used for a dynamic or >2048-byte size.
+ *
+ * Use this instead whenever the requested size isn't a small
+ * compile-time-known constant guaranteed to fit a size class.
+ */
+void* slab_alloc_sized(SlabArena* arena, int64_t size) {
+    if (!arena) ty_abort();
+    if (size <= 0) size = 1;
+    return arena_alloc(arena, (size_t)size, 8);
+}
+
 /* ── Buf
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -329,12 +352,33 @@ Buf* ty_buf_new(SlabArena* arena) {
     return b;
 }
 
-void ty_buf_push_str(SlabArena* arena, Buf* b, char* s) {
+/*
+ * ty_buf_new_sized — like ty_buf_new, but pre-allocates `cap` bytes
+ * instead of the fixed 64-byte default and growing from there.
+ *
+ * Added for socket read-into-chan: reading a chunk_size chunk via
+ * ty_buf_new + repeated pushes means doubling through 64→128→...→4096+
+ * (several reallocs + copies) for a single read. This lets the caller
+ * size the buffer once and read the syscall result directly into
+ * b->data — one allocation, one copy (kernel into buffer), nothing else.
+ * Caller is responsible for setting b->len (and the trailing '\0', at
+ * b->data[b->len]) after filling b->data directly.
+ */
+Buf* ty_buf_new_sized(SlabArena* arena, int64_t cap) {
+    if (cap < 0) cap = 0;
+    Buf* b = (Buf*)arena_alloc(arena, sizeof(Buf), 8);
+    b->len = 0;
+    b->cap = cap;
+    b->data = (char*)arena_alloc(arena, (size_t)cap + 1, 1);
+    b->data[0] = '\0';
+    return b;
+}
+
+void ty_buf_push_str(SlabArena* arena, Buf* b, TyStr* s) {
     if (!b || !s) return;
-    size_t n = strlen(s);
-    ty_buf_grow(arena, b, (int64_t)n);
-    memcpy(b->data + b->len, s, n);
-    b->len += (int64_t)n;
+    ty_buf_grow(arena, b, (int64_t)s->len);
+    memcpy(b->data + b->len, s->ptr, (size_t)s->len);
+    b->len += (int64_t)s->len;
     b->data[b->len] = '\0';
 }
 
@@ -347,24 +391,30 @@ void ty_buf_push_byte(SlabArena* arena, Buf* b, char c) {
 }
 
 /*
- * ty_buf_into_str — transfers data pointer to the caller.
- * The Buf header slot is recycled; the data lives until slab_arena_free.
+ * ty_buf_into_str — wraps the Buf's data in a TyStr fat pointer instead
+ * of handing back a bare char*. Data pointer transfers as before (no
+ * copy); the Buf header slot is recycled. Class 1 (16 bytes) for the
+ * TyStr wrapper itself, matching codegen's own literal-Str allocation
+ * (see emit_string in codegen.rs) so both sides agree on layout AND
+ * allocation size class.
  */
-char* ty_buf_into_str(SlabArena* arena, Buf* b) {
+TyStr* ty_buf_into_str(SlabArena* arena, Buf* b) {
     if (!b) return NULL;
-    char* out = b->data;
+    TyStr* s = (TyStr*)slab_alloc(arena, 1);
+    s->ptr = b->data;
+    s->len = (int32_t)b->len;
     arena_free_slot(arena, b, sizeof(Buf));
-    return out;
+    return s;
 }
 
-int64_t ty_str_len(char* s) {
+int64_t ty_str_len(TyStr* s) {
     if (!s) return 0;
-    return (int64_t)strlen(s);
+    return (int64_t)s->len;
 }
 
-char ty_str_byte(char* s, int64_t idx) {
-    if (!s || idx < 0) return 0;
-    return s[(size_t)idx];
+char ty_str_byte(TyStr* s, int64_t idx) {
+    if (!s || idx < 0 || idx >= (int64_t)s->len) return 0;
+    return s->ptr[(size_t)idx];
 }
 
 /* ── String helpers

@@ -24,9 +24,10 @@ fn is_net_method_wrapper(define_line: &str) -> bool {
 
 fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::io::Result<()> {
     let user_ir = std::fs::read_to_string(ir_file)?;
-    let (user_ir_filtered, user_struct_types) = {
+    let (user_ir_filtered, user_struct_types, user_define_names) = {
         let lines: Vec<&str> = user_ir.lines().collect();
         let mut struct_types = std::collections::HashSet::new();
+        let mut define_names = std::collections::HashSet::new();
         for &line in &lines {
             let trimmed = line.trim_start();
             // Collect struct type names defined in user IR
@@ -36,6 +37,13 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
             {
                 if let Some(name) = trimmed.split_whitespace().next() {
                     struct_types.insert(name.to_string());
+                }
+            }
+            if trimmed.starts_with("define ") {
+                if let Some((_, after_at)) = trimmed.split_once('@') {
+                    if let Some(name) = after_at.split('(').next().map(str::trim) {
+                        define_names.insert(name.to_string());
+                    }
                 }
             }
         }
@@ -75,7 +83,7 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
             filtered.push(lines[i]);
             i += 1;
         }
-        (filtered.join("\n"), struct_types)
+        (filtered.join("\n"), struct_types, define_names)
     };
     let stdlib_ir = std::fs::read_to_string(stdlib_ll)?;
     let stdlib_lines: Vec<&str> = stdlib_ir.lines().collect();
@@ -88,6 +96,29 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
         if line.starts_with("declare ") {
             i += 1;
             continue;
+        }
+        if line.starts_with("define ") {
+            if let Some((_, after_at)) = line.split_once('@') {
+                if let Some(name) = after_at.split('(').next().map(str::trim) {
+                    if user_define_names.contains(name) && !is_net_method_wrapper(line) {
+                        let mut depth = 0i32;
+                        let mut entered = false;
+                        while i < stdlib_lines.len() {
+                            let l = stdlib_lines[i];
+                            depth += l.matches('{').count() as i32;
+                            depth -= l.matches('}').count() as i32;
+                            i += 1;
+                            if depth > 0 {
+                                entered = true;
+                            }
+                            if entered && depth <= 0 {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
         }
         // Drop struct/enum/newtype type definitions that the user IR already defines.
         if line.contains(" = type ")

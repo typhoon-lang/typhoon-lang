@@ -1037,9 +1037,15 @@ TyCoro* ty_spawn_closure(SlabArena* parent_arena,
     /* Copy the closure into the child's own arena before it runs.
      * The child's arena is freshly allocated in coro_new and will
      * only be freed when the child itself exits, so this is safe
-     * regardless of when the parent dies. */
-    int32_t cls = size_to_class(closure_size);
-    void* child_copy = slab_alloc(co->arena, cls);
+     * regardless of when the parent dies.
+     *
+     * slab_alloc_sized, not slab_alloc(arena, size_to_class(...)):
+     * size_to_class collapses everything above 1024 bytes into one
+     * sentinel class, and slab_alloc always services that with a fixed
+     * 2048-byte allocation regardless of the real closure_size — any
+     * closure over ~2048 bytes would silently overflow here. Same bug
+     * class as the ty_net.c socket-read buffer overflow. */
+    void* child_copy = slab_alloc_sized(co->arena, (int64_t)closure_size);
     memcpy(child_copy, closure, closure_size);
     co->arg = child_copy;
 
@@ -1484,7 +1490,16 @@ void sched_enqueue_from_external(void* co) {
     TyCoro* coro = (TyCoro*)co;
     // if (!coro_state_cas(coro, CORO_BLOCKED, CORO_RUNNABLE, "external_enqueue"))
     //     return;
-    deque_push(&workers[0].deque, coro);
+    /* IO completions are woken synchronously inside the polling worker's
+     * own poll() call (per-worker IOCP/kqueue/io_uring backends), so
+     * tl_worker is valid here and identifies the worker that owns this
+     * completion. Pushing onto that worker's own deque avoids piling
+     * every completion onto workers[0], which caused a thundering-herd
+     * wake pattern under high-concurrency IO bursts. Fall back to
+     * workers[0] only if called with no current worker (e.g. a true
+     * external thread, not expected once Phase 4 backends are in use). */
+    Worker* w = current_worker();
+    deque_push(&(w ? w : &workers[0])->deque, coro);
 }
 
 void* ty_current_coro_raw(void) {

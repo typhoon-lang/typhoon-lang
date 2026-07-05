@@ -23,6 +23,7 @@ extern "C" {
 
 typedef struct SlabArena SlabArena;
 typedef struct Buf       Buf;
+typedef struct TyFile    TyFile;
 
 /* ── Per-instance I/O handles ────────────────────────────────────────────── */
 

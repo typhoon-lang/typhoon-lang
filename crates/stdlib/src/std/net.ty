@@ -2,6 +2,7 @@ namespace std::net
 
 use std::option::Option;
 use std::result::Result;
+use std::buf::Buf;
 
 struct Network {}
 
@@ -24,9 +25,27 @@ impl Listener {
 
 struct Socket {}
 
+// ReadSocket/WriteSocket/SocketHalves — Task 2.5. Socket.consume() (below)
+// sent one channel op per BYTE (chan<Int8>), the opposite of D4's
+// chunk-based backpressure model, and its C implementation
+// (__ty_rt__Socket__consume) has been deleted from ty_net.c — this
+// extern declaration is now dead and calling it will fail to link.
+// split()/into_chan() is the replacement.
+struct ReadSocket {}
+struct WriteSocket {}
+
+// Named struct instead of an anonymous tuple return for Socket.split():
+// field access (self.ar-style) is confirmed syntax in this codebase;
+// tuple destructuring isn't confirmed anywhere I've seen, so this is the
+// lower-risk choice. Field names match TySplitResult in ty_net.c exactly.
+struct SocketHalves {
+  read: ReadSocket,
+  write: WriteSocket,
+}
+
 impl Socket {
-  fn consume(self: Socket, chan: ref chan<Int8>) {
-    __ty_rt__Socket__consume(self, chan);
+  fn split(self: Socket) -> SocketHalves {
+    return __ty_rt__Socket__split(self);
   }
 
   fn close(self: Socket) {
@@ -34,10 +53,46 @@ impl Socket {
   }
 }
 
+impl ReadSocket {
+  // Spawns the reader coroutine in ty_net.c and returns the channel
+  // immediately (fire-and-forget) — chunk_size bytes per read, cap
+  // chunks of backpressure buffering in the channel.
+  fn into_chan(self: ReadSocket, chunk_size: Int64, cap: Int64) -> ref chan<Buf> {
+    return __ty_rt__ReadSocket__into_chan(self, chunk_size, cap);
+  }
+
+  fn close(self: ReadSocket) {
+    __ty_rt__ReadSocket__close(self);
+  }
+}
+
+impl WriteSocket {
+  // LOWER CONFIDENCE than the rest of this file: __ty_rt__WriteSocket__write
+  // exists in ty_net.c and delegates straight to Socket__write's logic, but
+  // Socket.read/Socket.write themselves were never in this file to begin
+  // with (only consume/close were) — so I have no existing Typhoon-level
+  // precedent in net.ty for how a buffer parameter or a plain (non-Result
+  // wrapping a resource type) Result<Int32, Int32> should look here. This
+  // is my best-effort match to the established Result<T, Int32> pattern
+  // used elsewhere in this file, not a confirmed convention for this
+  // specific shape.
+  fn write(self: WriteSocket, buf: Str, len: Int32) -> Result<Int32, Int32> {
+    return __ty_rt__WriteSocket__write(self, buf, len);
+  }
+
+  fn close(self: WriteSocket) {
+    __ty_rt__WriteSocket__close(self);
+  }
+}
+
 extern "C" {
     fn __ty_rt__Network__listen(self: Network, addr: Str) -> Result<Listener, Int32>
     fn __ty_rt__Listener__accept(self: Listener) -> Result<Socket, Int32>
     fn __ty_rt__Listener__close(self: Listener)
-    fn __ty_rt__Socket__consume(self: Socket, chan: ref chan<Int8>)
     fn __ty_rt__Socket__close(self: Socket)
+    fn __ty_rt__Socket__split(self: Socket) -> SocketHalves
+    fn __ty_rt__ReadSocket__into_chan(self: ReadSocket, chunk_size: Int64, cap: Int64) -> ref chan<Buf>
+    fn __ty_rt__ReadSocket__close(self: ReadSocket)
+    fn __ty_rt__WriteSocket__write(self: WriteSocket, buf: Str, len: Int32) -> Result<Int32, Int32>
+    fn __ty_rt__WriteSocket__close(self: WriteSocket)
 }

@@ -51,7 +51,7 @@ pub struct IrFunction {
     /// Annotation comment lines emitted directly above the `define` line,
     /// matching the typhoon-stdlib.ll convention:
     ///   "; @ty_ns: std::net"
-    ///   "; @ty_sig: fn listen(self, addr: Str) -> Result<Listener, Int32>"
+    ///   "; @ty_sig: fn open(self, addr: Str) -> Result<Handle, Int32>"
     pub annotations: Vec<String>,
 }
 
@@ -99,6 +99,8 @@ struct TypeRegistry {
     type_decls: Vec<String>,
     extra_preamble: Vec<String>,
     struct_fields: HashMap<String, Vec<(String, String)>>,
+    opaque_structs: HashSet<String>,
+    default_factories: HashMap<String, String>,
     func_sigs: HashMap<String, (String, Vec<String>)>,
     extern_fns: HashSet<String>,
     out_result_funcs: HashSet<String>,
@@ -117,6 +119,8 @@ impl TypeRegistry {
             type_decls: Vec::new(),
             extra_preamble: Vec::new(),
             struct_fields: HashMap::new(),
+            opaque_structs: HashSet::new(),
+            default_factories: HashMap::new(),
             func_sigs: HashMap::new(),
             extern_fns: HashSet::new(),
             out_result_funcs: HashSet::new(),
@@ -151,15 +155,15 @@ impl TypeRegistry {
             true
         } else {
             // Allow upgrading an opaque stub to a full definition.
-            // Opaque stubs come from empty struct declarations (e.g.
-            // `struct Listener {}`) or from enum-to-struct monomorphisation
+            // Opaque stubs come from empty struct declarations or from
+            // enum-to-struct monomorphisation
             // placeholder entries.  Later, ensure_enum_layout produces the
             // real concrete layout, which must replace the opaque line.
             let is_opaque = line.contains("= type opaque");
             if !is_opaque {
                 // Find and replace the old opaque entry.
                 let stripped = sym; // already stripped of %struct./%enum./%newtype.
-                // Reconstruct the prefix-pattern: e.g. "%struct.Result__struct_Listenerptr__i32 = type opaque"
+                                    // Reconstruct the prefix-pattern for the stored opaque type.
                 let prefix = if line.starts_with("%struct.") {
                     "%struct."
                 } else if line.starts_with("%enum.") {
@@ -506,13 +510,18 @@ impl<'a> IrBuilder<'a> {
         self.reg = TypeRegistry::new();
         self.adt_structs.clear();
 
-        self.reg
-            .push_type_decl("Buf", "%struct.Buf = type { i8*, i64, i64 }".to_string());
-
         self.reg.push_type_decl(
             "TyArray",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }".to_string(),
         );
+
+        // Str is a fat pointer: { ptr: i8*, len: i32 }. Not i8*/raw C string —
+        // no null-termination guarantee, length is an O(1) field read instead
+        // of an implicit strlen() scan, and .at() can be real bounds-checked
+        // indexing. Kept separate from Ref/Chan, which still lower to plain
+        // i8* (opaque runtime pointers with no length concept).
+        self.reg
+            .push_type_decl("Str", "%struct.Str = type { i8*, i32 }".to_string());
 
         self.collect_enum_defs(module);
         self.register_module_sigs(module);
@@ -555,47 +564,7 @@ impl<'a> IrBuilder<'a> {
                 );
             }
         }
-        // That's it. No hardcoded Option<Int8>. No hardcoded Result<Listener, Int32>.
-        // No manual variants dict insertions. Just pure AST harvesting.
-        //
-        //
-        // Previously:
-        //
-        // Pre-generate layouts for networking Result types used by runtime intrinsics.
-        //
-        // We cannot use ensure_enum_layout_for_infer here: Result/Option live in stdlib
-        // modules that are compiled separately, so enum_defs never contains "Result" when
-        // the user module is processed. That causes the lookup to return None and silently
-        // skip registration. Later, the type-checker inference walk may register the same
-        // mangled name with wrong i8 payload types (from an unresolved generic placeholder),
-        // producing extractvalue type mismatches in LLVM.
-        //
-        // Fix: insert the layouts directly, bypassing the enum-def lookup entirely.
-        // The runtime C ABI uses an `ok` byte, not source enum ordinal tags:
-        // ok=1 means Ok(payload), ok=0 means Err(err).
-        // ── Result<Listener, Int32> and Result<Socket, Int32> ────────────────
-        //
-        // ── Option<Int8> and Option<Int32> ───────────────────────────────────
-        //
-        // Option lives in the stdlib module and is never in enum_defs when the
-        // user module is compiled, so ensure_enum_layout_for_infer silently
-        // returns without registering anything.  The mangled type name is still
-        // emitted at use sites (alloca, load, extractvalue), so LLVM would see
-        // an undefined type.
-        //
-        // Worse: if the first use of any Option<T> triggers ensure_enum_layout
-        // via a path where lower_infer_type returns "i8" as a fallback (e.g.
-        // because the channel element type wasn't resolved yet), the layout is
-        // registered with an i8 payload and cached under the mangled name.
-        // A later correct resolution of the same name is a no-op (the cache hit
-        // guard at the top of ensure_enum_layout returns early), so the wrong
-        // layout persists for the entire compilation and every Option<Int32>
-        // alloca is only 2 bytes wide — causing a 4-byte ty_chan_recv to
-        // overflow it on every popcount drain.
-        //
-        // Fix: pre-register the correct layouts here, before any use site can
-        // race to register the wrong ones.  Extend this list as new element
-        // types become common (Int64, Bool, Str, …).
+        // Layouts come only from harvested AST definitions.
     }
 
     fn register_runtime_decls(&mut self) {
@@ -628,7 +597,6 @@ impl<'a> IrBuilder<'a> {
             // ── networking ───────────────────────────────────────────────────────
             "declare void @ty_net_init              ()",
             "declare void @ty_net_shutdown          ()",
-            "declare %struct.Network* @ty_net_global()",
             // ── IO syscalls (thin wrappers, no task) ─────────────────────────────
             "declare i64  @ty_sys_write (i32 %fd, i8* %buf, i64 %len)",
             "declare i64  @ty_sys_read  (i32 %fd, i8* %buf, i64 %len)",
@@ -676,6 +644,19 @@ impl<'a> IrBuilder<'a> {
 
     fn register_module_sigs(&mut self, module: &Module) {
         let module_ns = module.name.as_deref().unwrap_or("");
+        self.reg
+            .opaque_structs
+            .extend(
+                module
+                    .declarations
+                    .iter()
+                    .filter_map(|decl| match &decl.node {
+                        DeclarationKind::Struct { name, fields, .. } if fields.is_empty() => {
+                            Some(name.name.clone())
+                        }
+                        _ => None,
+                    }),
+            );
         for decl in &module.declarations {
             let ns_comment = annotation_ns_for_decl(module_ns, decl, self.original_ns_by_symbol)
                 .map(|ns| format!("; @ty_ns: {}", ns));
@@ -684,7 +665,7 @@ impl<'a> IrBuilder<'a> {
                     let mut field_types = Vec::new();
                     let mut field_map = Vec::new();
                     for (id, ty) in fields {
-                        let lt = Self::lower_type(ty);
+                        let lt = self.lower_type(ty);
                         field_types.push(lt.clone());
                         field_map.push((id.name.clone(), lt));
                     }
@@ -698,9 +679,7 @@ impl<'a> IrBuilder<'a> {
                         }
                     );
                     // Only emit the type line if this struct hasn't already been
-                    // declared (e.g. Buf / TyArray are pre-declared as concrete
-                    // layout types in collect_types and must not be overwritten
-                    // with an opaque stub from the source-level `struct Buf {}`).
+                    // declared with a concrete compiler-owned layout.
                     let annotated_line = if let Some(ref ns) = ns_comment {
                         format!(
                             "{}
@@ -730,7 +709,7 @@ impl<'a> IrBuilder<'a> {
                     let line = format!(
                         "%newtype.{} = type {}",
                         name.name,
-                        Self::lower_type(type_alias,)
+                        self.lower_type(type_alias,)
                     );
                     let annotated = if let Some(ref ns) = ns_comment {
                         format!(
@@ -751,11 +730,11 @@ impl<'a> IrBuilder<'a> {
                 } => {
                     let ret_ty = return_type
                         .as_ref()
-                        .map(|ty| Self::lower_type(ty))
+                        .map(|ty| self.lower_type(ty))
                         .unwrap_or_else(|| "void".to_string());
                     let mut param_types: Vec<String> = params
                         .iter()
-                        .map(|p| Self::lower_type(&p.type_annotation))
+                        .map(|p| self.lower_type(&p.type_annotation))
                         .collect();
                     // Every function (including main, now __ty_main_body) takes task.
                     param_types.insert(0, "i8*".to_string());
@@ -773,28 +752,29 @@ impl<'a> IrBuilder<'a> {
                                 out_result,
                                 ..
                             } = node;
-                            // A bare by-value struct return is only safe when
-                            // it's small enough to register-pack on every
-                            // target this project builds for. Force the
-                            // out-pointer convention whenever the computed
-                            // size crosses that line, even if the .ty source
-                            // didn't explicitly mark out_result — this is
-                            // what makes Network::listen / Socket::accept /
-                            // Socket::read / Socket::write ABI-correct on
-                            // Windows without requiring every extern decl
-                            // author to reason about struct-return ABI rules
-                            // by hand.
+                            // Aggregate returns larger than the direct-return
+                            // ABI limit always use the out-pointer convention,
+                            // even without an explicit source annotation.
                             let out_result = *out_result || Self::needs_out_result_abi(return_type);
                             let out_result = &out_result;
                             let ty_sig_ret = return_type
                                 .as_ref()
-                                .map(|ty| Self::lower_type(ty))
+                                .map(|ty| self.lower_type(ty))
                                 .unwrap_or_else(|| "void".to_string());
                             let mut param_types: Vec<String> = params
                                 .iter()
-                                .map(|p| Self::lower_type(&p.type_annotation))
+                                .map(|p| self.lower_type(&p.type_annotation))
                                 .collect();
                             let is_method_stub = name.name.starts_with("__ty_method__");
+                            if params.is_empty()
+                                && ty_sig_ret.starts_with("%struct.")
+                                && ty_sig_ret.ends_with('*')
+                            {
+                                self.reg
+                                    .default_factories
+                                    .entry(ty_sig_ret.clone())
+                                    .or_insert_with(|| name.name.clone());
+                            }
 
                             // Build annotation prefix lines that mirror typhoon-stdlib.ll.
                             // These are prepended to the `declare` line so that a consumer
@@ -934,7 +914,7 @@ impl<'a> IrBuilder<'a> {
 
                 let ret_ty = return_type
                     .as_ref()
-                    .map(|ty| Self::lower_type(ty))
+                    .map(|ty| b.lower_type(ty))
                     .unwrap_or_else(|| "void".to_string());
 
                 if is_main(&name.name) {
@@ -960,7 +940,7 @@ impl<'a> IrBuilder<'a> {
                     let body_ir = b.emit_function(name, params, &ret_ty, body);
                     let mut param_list: Vec<(String, String)> = params
                         .iter()
-                        .map(|p| (p.name.name.clone(), Self::lower_type(&p.type_annotation)))
+                        .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation)))
                         .collect();
                     param_list.insert(0, ("task".to_string(), "i8*".to_string()));
                     let annotations = build_fn_annotations(
@@ -993,11 +973,11 @@ impl<'a> IrBuilder<'a> {
             }) {
                 if let DeclarationKind::Function { name, params, body, return_type, .. } = &decl.node {
                     let ret_ty = return_type.as_ref()
-                        .map(|ty| Self::lower_type(ty,))
+                        .map(|ty| b.lower_type(ty,))
                         .unwrap_or_else(|| "void".to_string());
                     let body_ir = b.emit_function(name, params, &ret_ty, body);
                     let mut param_list: Vec<(String, String)> = params.iter()
-                        .map(|p| (p.name.name.clone(), Self::lower_type(&p.type_annotation,)))
+                        .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation,)))
                         .collect();
                     param_list.insert(0, ("task".to_string(), "i8*".to_string()));
                     let annotations = build_fn_annotations(
@@ -1040,7 +1020,7 @@ impl<'a> IrBuilder<'a> {
         // All functions (including former-main, now __ty_main_body) get a task param.
         self.emit_function_param("task".to_string(), "i8*".to_string());
         for p in params {
-            let ty = Self::lower_type(&p.type_annotation);
+            let ty = self.lower_type(&p.type_annotation);
             self.emit_function_param(p.name.name.clone(), ty);
         }
 
@@ -1104,12 +1084,18 @@ impl<'a> IrBuilder<'a> {
 
         // User params (main normally has none, but handle them anyway).
         for param in params {
-            let ty = Self::lower_type(&param.type_annotation);
+            let ty = self.lower_type(&param.type_annotation);
             let slot = self.tmp();
             self.emit_alloca(&slot, &ty);
-            if ty == "%struct.Network*" {
+            if let Some(factory) = self.reg.default_factories.get(&ty).cloned() {
                 let v = self.tmp();
-                self.emit(format!("  {} = call %struct.Network* @ty_net_global()", v));
+                let args = self
+                    .reg
+                    .func_sigs
+                    .get(&factory)
+                    .filter(|(_, params)| params.is_empty())
+                    .map_or("i8* %task", |_| "");
+                self.emit(format!("  {} = call {} @{}({})", v, ty, factory, args));
                 self.emit(format!("  store {} {}, {}* {}", ty, v, ty, slot));
             } else {
                 let z = self.zero_value(&ty);
@@ -1672,7 +1658,7 @@ impl<'a> IrBuilder<'a> {
                     if id.name == "chan" {
                         let elem_ty = type_annotation
                             .and_then(Self::chan_elem_type_from_annotation)
-                            .map(|t| Self::lower_type(t))
+                            .map(|t| self.lower_type(t))
                             .unwrap_or_else(|| "i8".to_string());
                         let elem_size = self.llvm_const_sizeof(&elem_ty);
                         let chan_ptr = self.tmp();
@@ -1688,7 +1674,7 @@ impl<'a> IrBuilder<'a> {
                         ));
 
                         let ty = type_annotation
-                            .map(|t| Self::lower_type(t))
+                            .map(|t| self.lower_type(t))
                             .unwrap_or_else(|| "i8*".to_string());
                         let slot = self.tmp();
                         self.emit_alloca(&slot, &ty);
@@ -1732,7 +1718,7 @@ impl<'a> IrBuilder<'a> {
             }
         };
         let ty = type_annotation
-            .map(|t| Self::lower_type(t))
+            .map(|t| self.lower_type(t))
             .unwrap_or_else(|| init_ty.clone());
         let value = self.emit_widen(&value, &init_ty, &ty);
 
@@ -2050,22 +2036,23 @@ impl<'a> IrBuilder<'a> {
                 tmp
             }
             ExpressionKind::StructInit { name, fields } => {
-                // Per-instance IO handles: Stdout{}/Stdin{} call C constructors
-                if name.name == "Stdout" && fields.is_empty() {
-                    let tmp = self.tmp();
-                    self.emit(format!(
-                        "  {} = call %struct.Stdout* @ty_stdout_new(i8* %task)",
-                        tmp
-                    ));
-                    return tmp;
-                }
-                if name.name == "Stdin" && fields.is_empty() {
-                    let tmp = self.tmp();
-                    self.emit(format!(
-                        "  {} = call %struct.Stdin* @ty_stdin_new(i8* %task)",
-                        tmp
-                    ));
-                    return tmp;
+                if fields.is_empty() && self.reg.opaque_structs.contains(&name.name) {
+                    let struct_ty = format!("%struct.{}*", name.name);
+                    if let Some(factory) = self.reg.default_factories.get(&struct_ty).cloned() {
+                        let tmp = self.tmp();
+                        let args = self
+                            .reg
+                            .func_sigs
+                            .get(&factory)
+                            .filter(|(_, params)| params.is_empty())
+                            .map_or("i8* %task", |_| "");
+                        self.emit(format!(
+                            "  {} = call {} @{}({})",
+                            tmp, struct_ty, factory, args
+                        ));
+                        return tmp;
+                    }
+                    return "null".to_string();
                 }
                 let struct_ty = format!("%struct.{}", name.name);
                 let mut cur = "undef".to_string();
@@ -2135,7 +2122,7 @@ impl<'a> IrBuilder<'a> {
     fn emit_cast(&mut self, inner: &Expression, target_type: &Type) -> String {
         let src_val = self.emit_expr(inner);
         let src_ty = self.expr_llvm_type(inner);
-        let dst_ty = Self::lower_type(target_type);
+        let dst_ty = self.lower_type(target_type);
 
         // Recover the ACTUAL emitted type from the last emitted instruction.
         // expr_llvm_type can lie for method calls when the types map has the
@@ -2646,6 +2633,17 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
+        // Str methods — Str is %struct.Str* { i8*, i32 }, not i8*, so this
+        // no longer shares (and can't collide with) Chan/Ref's i8*
+        // representation the way the old hardcoded-on-i8* version did.
+        if base_ty == "%struct.Str*" {
+            match field.name.as_str() {
+                "length" => return self.emit_str_length(&base_val),
+                "at" => return self.emit_str_at(&base_val, args),
+                _ => {}
+            }
+        }
+
         // Array push
         if base_ty == "%struct.TyArray*" && field.name == "push" {
             return self.emit_array_push(&base_val, args);
@@ -2657,6 +2655,48 @@ impl<'a> IrBuilder<'a> {
         }
 
         "0".to_string()
+    }
+
+    fn emit_str_length(&mut self, str_val: &str) -> String {
+        // O(1) field read now — no strlen() scan, no C call. This is the
+        // actual point of the fat pointer: length travels with the value.
+        let len_field = self.tmp();
+        self.emit(format!(
+            "  {} = getelementptr inbounds %struct.Str, %struct.Str* {}, i32 0, i32 1",
+            len_field, str_val
+        ));
+        let result = self.tmp();
+        self.emit(format!("  {} = load i32, i32* {}", result, len_field));
+        result
+    }
+
+    fn emit_str_at(&mut self, str_val: &str, args: &[Expression]) -> String {
+        let idx_val = args
+            .first()
+            .map(|a| self.emit_expr(a))
+            .unwrap_or_else(|| "0".to_string());
+
+        // NOT bounds-checked against the len field yet — the fat pointer
+        // carries the length needed to do this properly (unlike the old
+        // ty_str_byte, which had no length at all and could read past the
+        // end silently — see issue #7 in io.ty's printf, same bug class).
+        // Left as a straight load for now; bounds-checking this is a
+        // follow-up, not done as part of just wiring up the field access.
+        let ptr_field = self.tmp();
+        self.emit(format!(
+            "  {} = getelementptr inbounds %struct.Str, %struct.Str* {}, i32 0, i32 0",
+            ptr_field, str_val
+        ));
+        let ptr = self.tmp();
+        self.emit(format!("  {} = load i8*, i8** {}", ptr, ptr_field));
+        let byte_ptr = self.tmp();
+        self.emit(format!(
+            "  {} = getelementptr inbounds i8, i8* {}, i64 {}",
+            byte_ptr, ptr, idx_val
+        ));
+        let result = self.tmp();
+        self.emit(format!("  {} = load i8, i8* {}", result, byte_ptr));
+        result
     }
 
     fn emit_chan_send(&mut self, chan_val: &str, args: &[Expression]) -> String {
@@ -3684,9 +3724,7 @@ impl<'a> IrBuilder<'a> {
             "Int16" => (2, 2),
             "Int32" | "Float32" => (4, 4),
             "Int64" | "Float64" => (8, 8),
-            // Everything else (Str, Ref<T>, Chan<T>, Array<T>, Buf, Network,
-            // Listener, Socket, and any user struct/enum name) is a flat
-            // 8-byte runtime pointer in this codebase's ABI.
+            // Everything else is a flat 8-byte runtime pointer in this ABI.
             _ => (8, 8),
         }
     }
@@ -3697,6 +3735,9 @@ impl<'a> IrBuilder<'a> {
     /// own alignment, the whole struct padded to its max field alignment.
     /// Returns None for types this isn't meaningful for (no generic args).
     fn result_like_struct_size(ty: &Type) -> Option<usize> {
+        if matches!(ty.node.name.as_str(), "Ref" | "ref" | "Chan" | "chan") {
+            return None;
+        }
         if ty.node.generic_args.is_empty() {
             return None;
         }
@@ -3729,7 +3770,11 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or(false)
     }
 
-    fn lower_type(ty: &Type) -> String {
+    fn lower_type(&self, ty: &Type) -> String {
+        Self::lower_type_with_opaque_structs(ty, &self.reg.opaque_structs)
+    }
+
+    fn lower_type_with_opaque_structs(ty: &Type, opaque_structs: &HashSet<String>) -> String {
         let ty_name = ty.node.name.as_str();
 
         // Built-in generic types that lower to a fixed runtime representation
@@ -3744,6 +3789,7 @@ impl<'a> IrBuilder<'a> {
             "Array" => return "%struct.TyArray*".to_string(),
             "Chan" => return "i8*".to_string(),
             "Ref" => return "i8*".to_string(),
+            "Str" => return "%struct.Str*".to_string(),
             _ => {}
         }
 
@@ -3753,7 +3799,7 @@ impl<'a> IrBuilder<'a> {
                 .node
                 .generic_args
                 .iter()
-                .map(|a| Self::lower_type(a))
+                .map(|a| Self::lower_type_with_opaque_structs(a, opaque_structs))
                 .collect();
             return TypeRegistry::mangle_app_struct_name(ty_name, &args);
         }
@@ -3770,13 +3816,11 @@ impl<'a> IrBuilder<'a> {
             "Bool" => "i1".to_string(),
             // `ref T` / `&T` parse to the canonical "Ref" type in the AST.
             // We currently lower Ref as an opaque runtime pointer.
-            "Str" | "ref" | "Ref" => "i8*".to_string(),
-            "Buf" => "%struct.Buf*".to_string(),
-            "Network" => "%struct.Network*".to_string(),
-            "Listener" => "%struct.Listener*".to_string(),
-            "Socket" => "%struct.Socket*".to_string(),
-            "Stdout" => "%struct.Stdout*".to_string(),
-            "Stdin" => "%struct.Stdin*".to_string(),
+            "ref" | "Ref" => "i8*".to_string(),
+            // Str is a fat pointer { i8*, i32 }, not a raw i8* — see the
+            // push_type_decl comment in collect_types for why.
+            "Str" => "%struct.Str*".to_string(),
+            name if opaque_structs.contains(name) => format!("%struct.{}*", name),
             name => format!("%struct.{}", name),
         }
     }
@@ -3790,14 +3834,9 @@ impl<'a> IrBuilder<'a> {
                 "Int32" => "i32".to_string(),
                 "Int64" => "i64".to_string(),
                 "Bool" => "i1".to_string(),
-                "Str" => "i8*".to_string(),
-                "Buf" => "%struct.Buf*".to_string(),
+                "Str" => "%struct.Str*".to_string(),
                 "Chan" | "chan" => "i8*".to_string(),
-                "Network" => "%struct.Network*".to_string(),
-                "Listener" => "%struct.Listener*".to_string(),
-                "Socket" => "%struct.Socket*".to_string(),
-                "Stdout" => "%struct.Stdout*".to_string(),
-                "Stdin" => "%struct.Stdin*".to_string(),
+                n if self.reg.opaque_structs.contains(n) => format!("%struct.{}*", n),
                 n if n.starts_with("%") => n.to_string(), // already an LLVM type, pass through
                 n => format!("%struct.{}", n),
             },
@@ -3834,7 +3873,7 @@ impl<'a> IrBuilder<'a> {
             ExpressionKind::Literal(Literal {
                 kind: LiteralKind::Str(_),
                 ..
-            }) => return "i8*".to_string(),
+            }) => return "%struct.Str*".to_string(),
             ExpressionKind::Literal(Literal {
                 kind: LiteralKind::Bool(_),
                 ..
@@ -3876,11 +3915,48 @@ impl<'a> IrBuilder<'a> {
                     return ret_ty;
                 }
             }
+            // Method calls (base.method()) have the exact same NodeId-collision
+            // hazard as the free-function case above, but never got the same
+            // func_sigs-first treatment — they fell straight through to
+            // actual_inferred_type below. This is what broke Socket.split():
+            // its real return type is SocketHalves, but a NodeId collision in
+            // the type checker's map returned some unrelated "i32" instead,
+            // which then corrupted the let-binding's alloca type and every
+            // subsequent .read/.write field access downstream. Same fix,
+            // same precedent: resolve via the mangled method symbol in
+            // func_sigs before ever consulting the NodeId-keyed map.
+            if let ExpressionKind::FieldAccess { base, field } = &func.node {
+                let base_ty = self.expr_llvm_type(base);
+                let struct_name = base_ty
+                    .trim_start_matches("%struct.")
+                    .trim_end_matches('*')
+                    .to_string();
+                let local_name = format!("__ty_method__{}__{}", struct_name, field.name);
+                let rt_name = format!("__ty_rt__{}__{}", struct_name, field.name);
+                if let Some((ret_ty, _)) = self
+                    .reg
+                    .func_sigs
+                    .get(&local_name)
+                    .cloned()
+                    .or_else(|| self.reg.func_sigs.get(&rt_name).cloned())
+                {
+                    if self.reg.out_result_funcs.contains(&local_name)
+                        || self.reg.out_result_funcs.contains(&rt_name)
+                    {
+                        // Out-pointer convention (e.g. Result<T,E>-returning
+                        // methods): the real Typhoon-visible type isn't the
+                        // declared C return type, same handling as the
+                        // free-function branch above would give it.
+                    } else {
+                        return ret_ty;
+                    }
+                }
+            }
         }
         // Cast: always return the target type, ignoring any inference
         // (type checker may store the inner type causing wrong width here).
         if let ExpressionKind::Cast { target_type, .. } = &expr.node {
-            return Self::lower_type(target_type);
+            return self.lower_type(target_type);
         }
         // Type checker inference (can have NodeId collisions — only use for non-literals
         // and non-function-calls, which have their types resolved from func_sigs above).
@@ -3888,6 +3964,11 @@ impl<'a> IrBuilder<'a> {
             return self.lower_infer_type(&ty);
         }
         match &expr.node {
+            ExpressionKind::StructInit { name, .. }
+                if self.reg.opaque_structs.contains(&name.name) =>
+            {
+                format!("%struct.{}*", name.name)
+            }
             ExpressionKind::StructInit { name, .. } => format!("%struct.{}", name.name),
             ExpressionKind::MergeExpression { base, .. } => base
                 .as_ref()
@@ -4068,9 +4149,10 @@ impl<'a> IrBuilder<'a> {
 
         let llvm_args: Vec<String> = args.iter().map(|a| self.lower_infer_type(a)).collect();
 
+        let opaque_structs = self.reg.opaque_structs.clone();
         let mut lower_payload =
             |payload: &EnumVariantPayloadKind, subst: &HashMap<String, String>| -> Option<String> {
-                Self::lower_enum_payload(payload, subst) // Removed option/result params
+                Self::lower_enum_payload(payload, subst, &opaque_structs)
             };
 
         self.reg
@@ -4089,11 +4171,12 @@ impl<'a> IrBuilder<'a> {
             .node
             .generic_args
             .iter()
-            .map(|a| Self::lower_type(a))
+            .map(|a| self.lower_type(a))
             .collect();
+        let opaque_structs = self.reg.opaque_structs.clone();
         let mut lower_payload =
             |payload: &EnumVariantPayloadKind, subst: &HashMap<String, String>| -> Option<String> {
-                Self::lower_enum_payload(payload, subst)
+                Self::lower_enum_payload(payload, subst, &opaque_structs)
             };
         self.reg
             .ensure_enum_layout(&def, &llvm_args, &|_, _| String::new(), &mut lower_payload);
@@ -4102,21 +4185,28 @@ impl<'a> IrBuilder<'a> {
     fn lower_enum_payload(
         payload: &EnumVariantPayloadKind,
         subst: &HashMap<String, String>,
+        opaque_structs: &HashSet<String>,
     ) -> Option<String> {
         // For now, support the subset Typhoon uses for Option/Result-like enums:
         // - unit payload `Some(T)` encoded as `Unit(T)`
         // - 1-tuple payload `Some(T)` encoded as `Tuple([T])`
         // Anything more complex should be lowered via a dedicated struct type later.
         match payload {
-            EnumVariantPayloadKind::Unit(t) => Some(Self::lower_type_with_subst(t, subst)),
+            EnumVariantPayloadKind::Unit(t) => {
+                Some(Self::lower_type_with_subst(t, subst, opaque_structs))
+            }
             EnumVariantPayloadKind::Tuple(ts) if ts.len() == 1 => {
-                Some(Self::lower_type_with_subst(&ts[0], subst))
+                Some(Self::lower_type_with_subst(&ts[0], subst, opaque_structs))
             }
             _ => None,
         }
     }
 
-    fn lower_type_with_subst(ty: &Type, subst: &HashMap<String, String>) -> String {
+    fn lower_type_with_subst(
+        ty: &Type,
+        subst: &HashMap<String, String>,
+        opaque_structs: &HashSet<String>,
+    ) -> String {
         // If the type refers directly to a generic parameter, substitute the concrete LLVM type.
         if ty.node.generic_args.is_empty() {
             if let Some(v) = subst.get(&ty.node.name) {
@@ -4124,7 +4214,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
         // Otherwise lower normally; nested generic args in enum payloads aren't supported yet.
-        Self::lower_type(ty)
+        Self::lower_type_with_opaque_structs(ty, opaque_structs)
     }
 
     fn scan_decl_for_adts(&mut self, decl: &Declaration) {
@@ -4201,9 +4291,13 @@ impl<'a> IrBuilder<'a> {
             "i32" => "Int32".to_string(),
             "i64" => "Int64".to_string(),
             "i1" => "Bool".to_string(),
-            "i8*" => "Str".to_string(),
+            // Str is %struct.Str now, not i8* — see push_type_decl in
+            // collect_types. Bare i8* is ambiguous (Ref/Chan both still use
+            // it), so it maps to the closest named concept, Ref, instead.
+            "i8*" => "Ref".to_string(),
+            "%struct.Str" => "Str".to_string(),
             _ => {
-                // "%struct.Listener" -> "Listener"
+                // "%struct.Handle" -> "Handle"
                 llvm_ty
                     .strip_prefix("%struct.")
                     .unwrap_or(llvm_ty)
@@ -4355,12 +4449,54 @@ impl<'a> IrBuilder<'a> {
             self.reg.string_pool.insert(s.to_string(), pair.clone());
             pair
         };
-        let tmp = self.tmp();
+        // n includes the trailing '\0' kept in the backing global for any
+        // C interop that still expects it; the fat pointer's own length
+        // field excludes it — this is the source's real length, not a
+        // strlen() scan result.
+        let len = n - 1;
+
+        let ptr_tmp = self.tmp();
         self.emit(format!(
             "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i32 0, i32 0",
-            tmp, n, n, global
+            ptr_tmp, n, n, global
         ));
-        tmp
+
+        // Wrap {ptr, len} in a %struct.Str, arena-allocated (not alloca) so
+        // the value stays valid if it escapes this function (returned,
+        // stored, passed on) — same reason every other multi-field type in
+        // this codegen (Buf, Socket, ...) is heap/arena-allocated rather
+        // than stack-allocated. Size class 1 (16 bytes) fits {i8*, i32}
+        // (12 bytes unpadded, rounds to 16 for 8-byte pointer alignment).
+        //
+        // NOTE: like Socket/File, if this wrapper is captured by a spawned
+        // closure and crosses into a different coroutine's arena lifetime,
+        // the same cross-coroutine caveat documented for those types
+        // applies here too — not addressed by this change.
+        let tv = self.emit_task_load();
+        let raw = self.tmp();
+        self.emit(format!(
+            "  {} = call i8* @slab_alloc(i8* {}, i32 1)",
+            raw, tv
+        ));
+        let str_val = self.tmp();
+        self.emit(format!(
+            "  {} = bitcast i8* {} to %struct.Str*",
+            str_val, raw
+        ));
+        let ptr_field = self.tmp();
+        self.emit(format!(
+            "  {} = getelementptr inbounds %struct.Str, %struct.Str* {}, i32 0, i32 0",
+            ptr_field, str_val
+        ));
+        self.emit(format!("  store i8* {}, i8** {}", ptr_tmp, ptr_field));
+        let len_field = self.tmp();
+        self.emit(format!(
+            "  {} = getelementptr inbounds %struct.Str, %struct.Str* {}, i32 0, i32 1",
+            len_field, str_val
+        ));
+        self.emit(format!("  store i32 {}, i32* {}", len, len_field));
+
+        str_val
     }
 
     // ── Captured variable analysis ────────────────────────────────────────────
@@ -4652,6 +4788,7 @@ fn is_no_task_intrinsic(name: &str) -> bool {
             | "ty_sys_read"
             | "ty_str_len"
             | "ty_str_byte"
+            | "ty_net_global"
     )
 }
 
@@ -4930,17 +5067,11 @@ mod tests {
         // type line and clang/llvm rejected the .ll with "redefinition of
         // type" — see main_ll_linked.ll:26 vs :39.
         let mut reg = TypeRegistry::new();
-        let name = "Result__struct_Listenerptr__i32";
-        let opaque_annotated = format!(
-            "; @ty_ns: std::result\n%struct.{} = type opaque",
-            name
-        );
+        let name = "Result__struct_Handleptr__i32";
+        let opaque_annotated = format!("; @ty_ns: std::result\n%struct.{} = type opaque", name);
         assert!(reg.push_type_decl(name, opaque_annotated));
 
-        let concrete = format!(
-            "%struct.{} = type {{ i32, %struct.Listener*, i32 }}",
-            name
-        );
+        let concrete = format!("%struct.{} = type {{ i32, %struct.Handle*, i32 }}", name);
         assert!(reg.push_type_decl(&format!("%struct.{}", name), concrete.clone()));
 
         let matching: Vec<_> = reg
@@ -4965,9 +5096,8 @@ mod tests {
         // must lower that field to the concrete %struct.TyArray* runtime
         // pointer, not fall through to mangle_app_struct_name and produce
         // an undefined %struct.Array__i32 with no body anywhere in the IR.
-        let text = compile(
-            "struct Popcount { counts: Array<Int32> } fn main() -> Int32 { return 0; }",
-        );
+        let text =
+            compile("struct Popcount { counts: Array<Int32> } fn main() -> Int32 { return 0; }");
         assert!(
             text.contains("%struct.main__Popcount = type { %struct.TyArray* }")
                 || text.contains("%struct.Popcount = type { %struct.TyArray* }"),
@@ -4977,6 +5107,18 @@ mod tests {
         assert!(
             !text.contains("%struct.Array__i32"),
             "must not emit the undefined monomorphized Array__i32 struct name"
+        );
+    }
+
+    #[test]
+    fn lowers_empty_struct_as_opaque_handle_without_name_allowlist() {
+        let text = compile(
+            "struct Handle {} fn identity(value: Handle) -> Handle { return value; } fn main() -> Int32 { return 0; }",
+        );
+        assert!(
+            text.contains("define %struct.Handle* @identity(i8* %task, %struct.Handle* %value)"),
+            "expected empty struct to lower as opaque handle pointer, got:\n{}",
+            text
         );
     }
 
@@ -4991,12 +5133,12 @@ mod tests {
 
     #[test]
     fn needs_out_result_abi_flags_large_result_but_not_small_one() {
-        // Result<Listener, Int32>-shaped types (a pointer + tag + small int,
+        // Result<Handle, Int32>-shaped types (a pointer + tag + small int,
         // 24 bytes) must be forced onto the out-pointer ABI convention on
         // every target — a bare by-value return of this size crosses the
         // register-return limit on both SysV (>16) and Windows x64 (>8),
         // and disagreeing with the real C ABI is exactly what caused
-        // Network::listen's `addr` argument to arrive as NULL on Windows:
+        // the first user argument to arrive as NULL on Windows:
         // the caller and the separately-compiled C runtime function
         // disagreed about whether a hidden return pointer occupied the
         // first argument register, shifting every subsequent argument by
@@ -5007,7 +5149,7 @@ mod tests {
                 generic_args: vec![
                     Spanned::new_dummy(
                         TypeKind {
-                            name: "Listener".to_string(),
+                            name: "Handle".to_string(),
                             generic_args: vec![],
                         },
                         Span::default(),
@@ -5023,7 +5165,7 @@ mod tests {
             },
             Span::default(),
         );
-        assert!(TypeRegistry::needs_out_result_abi(&Some(big)));
+        assert!(IrBuilder::needs_out_result_abi(&Some(big)));
 
         // Two Int32 fields (tag=4 + pad0 + i32=4 = 8 bytes) fits in a single
         // register-return slot on every target — must NOT be forced.
@@ -5040,10 +5182,27 @@ mod tests {
             },
             Span::default(),
         );
-        assert!(!TypeRegistry::needs_out_result_abi(&Some(small)));
+        assert!(!IrBuilder::needs_out_result_abi(&Some(small)));
+
+        // tag + padding + Int64 payload is 16 bytes and exceeds the portable
+        // 8-byte direct-return limit.
+        let boundary = Spanned::new_dummy(
+            TypeKind {
+                name: "Option".to_string(),
+                generic_args: vec![Spanned::new_dummy(
+                    TypeKind {
+                        name: "Int64".to_string(),
+                        generic_args: vec![],
+                    },
+                    Span::default(),
+                )],
+            },
+            Span::default(),
+        );
+        assert!(IrBuilder::needs_out_result_abi(&Some(boundary)));
 
         // Non-generic / no return type: never forced.
-        assert!(!TypeRegistry::needs_out_result_abi(&None));
+        assert!(!IrBuilder::needs_out_result_abi(&None));
     }
 
     #[test]
@@ -5056,7 +5215,11 @@ mod tests {
             "enum Reading { Temperature: Float32, Offline } fn main() -> Reading { return Temperature(1.5); }",
         );
         assert!(text.contains("%struct.Reading = type"));
-        assert!(text.contains("insertvalue %struct.Reading"));
+        assert!(
+            text.contains("insertvalue %struct.Reading"),
+            "expected Reading constructor insertion, got:\n{}",
+            text
+        );
     }
 
     #[test]

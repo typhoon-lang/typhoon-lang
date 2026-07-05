@@ -319,7 +319,6 @@ impl TypeChecker {
         self.current_return = None;
         self.types.clear();
         self.specializations.clear();
-        self.seed_builtins();
     }
 
     pub fn types(&self) -> &HashMap<NodeId, InferType> {
@@ -346,27 +345,15 @@ impl TypeChecker {
     }
 
     pub fn seed_builtins(&mut self) {
-        self.set_global(
-            "__ty_buf_new".into(),
-            Scheme::mono(InferType::Fn(
-                Vec::new(),
-                Box::new(InferType::Con("Buf".into())),
-            )),
-        );
-        self.set_global(
-            "__ty_buf_push_str".into(),
-            Scheme::mono(InferType::Fn(
-                vec![InferType::Con("Buf".into()), InferType::Con("Str".into())],
-                Box::new(InferType::Con("Unit".into())),
-            )),
-        );
-        self.set_global(
-            "__ty_buf_into_str".into(),
-            Scheme::mono(InferType::Fn(
-                vec![InferType::Con("Buf".into())],
-                Box::new(InferType::Con("Str".into())),
-            )),
-        );
+        for (alias, imported) in [
+            ("__ty_buf_new", "ty_buf_new"),
+            ("__ty_buf_push_str", "ty_buf_push_str"),
+            ("__ty_buf_into_str", "ty_buf_into_str"),
+        ] {
+            if let Some(scheme) = self.lookup(imported).cloned() {
+                self.set_global(alias.into(), scheme);
+            }
+        }
     }
 
     pub fn check_module(
@@ -378,6 +365,7 @@ impl TypeChecker {
         self.seed_from_imports(imports);
         self.collect_type_info(module)?;
         self.predeclare_functions(module)?;
+        self.seed_builtins();
         for decl in &module.declarations {
             if let DeclarationKind::Function { name, .. } = &decl.node {
                 self.check_function(name, decl)?;
@@ -629,7 +617,9 @@ impl TypeChecker {
                                     Some(self.lower_type(ty, &generic_vars)?)
                                 }
                                 EnumVariantPayloadKind::Tuple(_)
-                                | EnumVariantPayloadKind::Struct(_) => Some(self.solver.fresh_var()),
+                                | EnumVariantPayloadKind::Struct(_) => {
+                                    Some(self.solver.fresh_var())
+                                }
                             },
                         };
                         self.registry.enum_variants.insert(
@@ -1262,8 +1252,8 @@ impl TypeChecker {
                 let is_ptr_like = |t: &InferType| {
                     matches!(t,
                         InferType::Con(n) if matches!(n.as_str(),
-                            "Str" | "Buf" | "Chan" | "Network" | "Listener" | "Socket" | "Stdout" | "Stdin"
-                        )
+                            "Str" | "Chan"
+                        ) || self.registry.struct_fields.get(n).is_some_and(HashMap::is_empty)
                     )
                 };
                 // Reject struct/enum -> numeric (and vice-versa) early with a
@@ -1403,6 +1393,33 @@ impl TypeChecker {
                                     arg_tys,
                                     expr.span,
                                 )?
+                            }
+                        }
+                        InferType::Con(type_name) if type_name == "Str" => {
+                            // length/at are hardcoded in codegen.rs's emit_method_call
+                            // (Str is a fat pointer struct with no real impl block for
+                            // the generic __ty_method__Str__* lookup below to find —
+                            // same reason Chan's send/recv/try_recv are special-cased
+                            // above instead of going through infer_method_call).
+                            match field.name.as_str() {
+                                "length" => InferType::Con("Int64".into()),
+                                "at" => {
+                                    if let Some(first) = arg_tys.first().cloned() {
+                                        self.solver.unify(
+                                            &first,
+                                            &InferType::Con("Int64".into()),
+                                            Some(expr.span),
+                                        )?;
+                                    }
+                                    InferType::Con("Int8".into())
+                                }
+                                _ => self.infer_method_call(
+                                    &type_name,
+                                    &field.name,
+                                    base_ty,
+                                    arg_tys,
+                                    expr.span,
+                                )?,
                             }
                         }
                         InferType::Con(type_name) => self.infer_method_call(
@@ -1602,7 +1619,7 @@ impl TypeChecker {
             InferType::Fn(params, _) if params.len() > arg_tys.len() + 2 => {
                 // More params than user-supplied args + self + task.
                 // This happens for value-returning stdlib wrappers that carry an
-                // internal out-param in their LLVM func_sig (e.g. Network::listen
+                // internal out-param in their LLVM func_sig (e.g. a runtime method
                 // has task, self, addr, out* — but the call site only supplies addr).
                 // Prepend task (Str) and self, then pad the remainder with fresh vars
                 // so unification can still check the user-visible arguments.

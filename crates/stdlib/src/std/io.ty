@@ -10,6 +10,7 @@ extern "C" {
   fn ty_stdout_getbuf(self: Stdout) -> Buf
   fn ty_str_len(s: Str) -> Int64
   fn ty_str_byte(s: Str, idx: Int64) -> Int8
+  fn ty_stdin_read_line(self: Stdin) -> Str
 }
 
 
@@ -36,25 +37,36 @@ impl Stdout {
       let mut byte: Int8 = ty_str_byte(fmt, pos)
       if byte != 37 as Int8 {
         ty_buf_push_byte(b, byte)
+        pos = pos + 1
       } else {
         pos = pos + 1
-        let mut spec: Int8 = ty_str_byte(fmt, pos)
-        let mut val = a1m
-        if ai == 1 as Int64 { val = a2m }
-        if ai == 2 as Int64 { val = a3m }
-        if ai == 3 as Int64 { val = a4m }
-        ai = ai + 1 as Int64
-        if spec == 37 as Int8 {
+        if pos >= ty_str_len(fmt) {
+          /* Trailing bare '%' as the last byte of fmt — issue #7 fix.
+           * ty_str_byte has no upper-bound check (it just indexes the
+           * underlying C string), so reading a spec byte here without
+           * this check was an out-of-bounds read past the string's end.
+           * Emit the '%' literally and stop; there's no spec char to
+           * consume because the string ended. */
           ty_buf_push_byte(b, 37 as Int8)
-        }
-        if spec == 100 as Int8 {
-          __push_int(b, val)
-        }
-        if spec == 115 as Int8 {
-          ty_buf_push_str(b, val as Str)
+        } else {
+          let mut spec: Int8 = ty_str_byte(fmt, pos)
+          let mut val = a1m
+          if ai == 1 as Int64 { val = a2m }
+          if ai == 2 as Int64 { val = a3m }
+          if ai == 3 as Int64 { val = a4m }
+          ai = ai + 1 as Int64
+          if spec == 37 as Int8 {
+            ty_buf_push_byte(b, 37 as Int8)
+          }
+          if spec == 100 as Int8 {
+            __push_int(b, val)
+          }
+          if spec == 115 as Int8 {
+            ty_buf_push_str(b, val as Str)
+          }
+          pos = pos + 1
         }
       }
-      pos = pos + 1
     }
     ty_stdout_flush(self)
   }
@@ -91,3 +103,126 @@ fn __push_int(b: Buf, n: Int64) {
 }
 
 struct Stdin {}
+
+impl Stdin {
+  /* Reads the next line from stdin, without the trailing newline.
+   * KNOWN LIMITATION: returns "" both at end-of-stream and for a
+   * genuine blank line — see ty_stdin_read_line's comment in ty_io.c.
+   * Buffered underneath: safe to call repeatedly, handles a line split
+   * across reads or several lines arriving in one read correctly. */
+  fn read_line(self) -> Str {
+    return ty_stdin_read_line(self)
+  }
+}
+
+fn __is_space(c: Int8) -> Int8 {
+  let mut is_sp = 0 as Int8
+  if c == 32 as Int8 {
+    is_sp = 1 as Int8
+  }
+  if c == 9 as Int8 {
+    is_sp = 1 as Int8
+  }
+  return is_sp
+}
+
+fn __is_digit(c: Int8) -> Int8 {
+  let mut is_d = 0 as Int8
+  if c >= 48 as Int8 {
+    if c <= 57 as Int8 {
+      is_d = 1 as Int8
+    }
+  }
+  return is_d
+}
+
+/*
+ * parse_int — Task 3.4's ty_sscan/ty_vsscanf, scoped to the common case:
+ * parse a leading integer out of a string (skips leading whitespace,
+ * optional '-', then digits; stops at the first non-digit). Returns 0
+ * if no digits are found.
+ *
+ * Matches the "Str is never written to" principle: `s` is only ever
+ * read via ty_str_byte, never mutated. No intermediate token Buf is
+ * needed here since digits fold directly into the accumulator instead
+ * of being copied out as a substring first.
+ */
+fn parse_int(s: Str) -> Int64 {
+  let mut text = s
+  let mut i = 0 as Int64
+  while i < ty_str_len(text) {
+    if __is_space(ty_str_byte(text, i)) == 1 as Int8 {
+      i = i + 1
+    } else {
+      i = ty_str_len(text)
+    }
+  }
+  let mut neg = 0 as Int8
+  if i < ty_str_len(text) {
+    if ty_str_byte(text, i) == 45 as Int8 {
+      neg = 1 as Int8
+      i = i + 1
+    }
+  }
+  let mut n = 0 as Int64
+  let mut scanning = 1 as Int8
+  while i < ty_str_len(text) {
+    if scanning == 1 as Int8 {
+      if __is_digit(ty_str_byte(text, i)) == 1 as Int8 {
+        n = n * 10 as Int64 + (ty_str_byte(text, i) - 48 as Int8) as Int64
+        i = i + 1
+      } else {
+        scanning = 0 as Int8
+      }
+    } else {
+      i = ty_str_len(text)
+    }
+  }
+  if neg == 1 as Int8 {
+    return 0 as Int64 - n
+  }
+  return n
+}
+
+/*
+ * parse_word — returns the whitespace-delimited token starting at
+ * `start` as a freshly slab-copied Str (source `s` never mutated,
+ * matching Task 3.4's principle: the token is built up in a new Buf
+ * via ty_buf_push_byte, not sliced out of `s` in place).
+ *
+ * Single-token-per-call, not a cursor-returning tokenizer: I still
+ * don't have confirmed tuple syntax to return "(token, next_pos)" as
+ * one value the way Socket.split() would need to. A caller wanting the
+ * next token's start can recompute it via ty_str_len on what came back
+ * plus scanning forward from `start` again — not efficient for many
+ * tokens on one line, but correct and avoids guessing at syntax I
+ * can't verify. Worth revisiting once tuple/multi-return syntax shows
+ * up in a real file.
+ */
+fn parse_word(s: Str, start: Int64) -> Str {
+  let mut text = s
+  let mut i = start
+  while i < ty_str_len(text) {
+    if __is_space(ty_str_byte(text, i)) == 1 as Int8 {
+      i = i + 1
+    } else {
+      i = ty_str_len(text)
+    }
+  }
+  let mut tok = ty_buf_new()
+  let mut j = i
+  let mut scanning = 1 as Int8
+  while j < ty_str_len(text) {
+    if scanning == 1 as Int8 {
+      if __is_space(ty_str_byte(text, j)) == 1 as Int8 {
+        scanning = 0 as Int8
+      } else {
+        ty_buf_push_byte(tok, ty_str_byte(text, j))
+        j = j + 1
+      }
+    } else {
+      j = ty_str_len(text)
+    }
+  }
+  return ty_buf_into_str(tok)
+}

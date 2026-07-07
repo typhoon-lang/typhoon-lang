@@ -150,7 +150,9 @@ impl TypeRegistry {
             .or_else(|| sym.strip_prefix("%enum."))
             .or_else(|| sym.strip_prefix("%newtype."))
             .unwrap_or(sym);
-        if self.declared_syms.insert(sym.to_string()) {
+        let fresh = !self.declared_syms.contains(sym);
+        if fresh {
+            self.declared_syms.insert(sym.to_string());
             self.type_decls.push(line);
             true
         } else {
@@ -1721,6 +1723,18 @@ impl<'a> IrBuilder<'a> {
             .map(|t| self.lower_type(t))
             .unwrap_or_else(|| init_ty.clone());
         let value = self.emit_widen(&value, &init_ty, &ty);
+        let chan_elem_src = type_annotation
+            .and_then(Self::chan_elem_type_from_annotation)
+            .map(|t| t.node.name.clone())
+            .or_else(|| {
+                self.actual_inferred_type(initializer).and_then(|t| {
+                    let elem = Self::chan_elem_infer_type(&t)?;
+                    Some(match elem {
+                        InferType::Con(name) => name.clone(),
+                        _ => self.lower_infer_type(elem),
+                    })
+                })
+            });
 
         if !ty.ends_with('*')
             && ty != "void"
@@ -1745,14 +1759,17 @@ impl<'a> IrBuilder<'a> {
 
             self.emit(format!("  store {} {}, {}* {}", ty, value, ty, typed_ptr));
             self.locals.insert(name.name.clone(), typed_ptr);
-            self.locals_type.insert(name.name.clone(), ty);
+            self.locals_type.insert(name.name.clone(), ty.clone());
         } else {
             // Default stack allocation (alloca)
             let slot = self.tmp();
             self.emit_alloca(&slot, &ty);
             self.emit(format!("  store {} {}, {}* {}", ty, value, ty, slot));
             self.locals.insert(name.name.clone(), slot);
-            self.locals_type.insert(name.name.clone(), ty);
+            self.locals_type.insert(name.name.clone(), ty.clone());
+        }
+        if let Some(elem_src) = chan_elem_src {
+            self.chan_elem_tys.insert(name.name.clone(), elem_src);
         }
     }
 
@@ -3013,7 +3030,12 @@ impl<'a> IrBuilder<'a> {
         id: &Identifier,
         args: &[Expression],
     ) -> String {
-        if matches!(id.name.as_str(), "Ok" | "Err" | "Some" | "None") {
+        let is_variant = self
+            .reg
+            .enum_defs
+            .values()
+            .any(|def| def.variants.iter().any(|v| v.name == id.name));
+        if matches!(id.name.as_str(), "Ok" | "Err" | "Some" | "None") || is_variant {
             return self.emit_adt_constructor(&id.name, call_expr, args);
         }
         if id.name == "chan" {
@@ -3078,6 +3100,26 @@ impl<'a> IrBuilder<'a> {
                 .cloned()
                 .unwrap_or_else(|| "i8*".to_string());
             let result_ty = result_ptr_ty.trim_end_matches('*').to_string();
+            // Ensure the result enum layout IS concrete before we alloca it.
+            // Monomorphised enum variants defined only in the stdlib.ll are
+            // first registered as opaque struct stubs via driver.rs (make_struct_decl);
+            // ensure_enum_layout replaces [upgrades] that stub with the real
+            // { tag, payloads } body.  Without this guard any alloca of a
+            // struct was opaque → LLVM "Cannot allocate unsized type" (seen
+            // with Result<Listener,Int32> / Result<Socket,Int32> in main.ll.linked.ll).
+            {
+                // result_ty is the mangled name, e.g. %struct.Result__struct_Listenerptr__i32.
+                // Reconstruct the unmangled InferType from it.
+                let unmangled = result_ty.strip_prefix("%struct.").unwrap_or(&result_ty);
+                if let Some((enum_name, payload_llvm_types)) = parse_enum_from_mangled(unmangled) {
+                    let args: Vec<InferType> = payload_llvm_types
+                        .iter()
+                        .map(|t| InferType::Con(Self::llvm_ty_to_infer_name(t)))
+                        .collect();
+                    let result_infer = InferType::App(enum_name, args);
+                    self.ensure_enum_layout_for_infer(&result_infer);
+                }
+            }
             let result_slot = self.tmp();
             self.emit_alloca(&result_slot, &result_ty);
             arg_pairs.push(format!("{} {}", result_ptr_ty, result_slot));
@@ -3958,6 +4000,38 @@ impl<'a> IrBuilder<'a> {
         if let ExpressionKind::Cast { target_type, .. } = &expr.node {
             return self.lower_type(target_type);
         }
+        // BinaryOp: result type matches the left operand's type. We MUST
+        // resolve it here (rather than via the NodeId-keyed types map
+        // below) because NodeId collisions across merged modules can return
+        // a stray entry — observed as `nm % 10` in Buf.__push_int_inner
+        // coming back typed `%struct.Str*`, which then cascaded into
+        // `ptrtoint %struct.Str* ... to i8` and `store %struct.Str* ...,
+        // %struct.Str** ...` for every subsequent arithmetic slot.
+        if let ExpressionKind::BinaryOp { op, left, right } = &expr.node {
+            // Comparisons yield i1 regardless of operand widths.
+            let lhs_ty = self.expr_llvm_type(left);
+            let rhs_ty = self.expr_llvm_type(right);
+            let cmp = matches!(
+                *op,
+                Operator::Eq
+                    | Operator::Ne
+                    | Operator::Lt
+                    | Operator::Gt
+                    | Operator::Le
+                    | Operator::Ge
+                    | Operator::And
+                    | Operator::Or
+            ) && lhs_ty != "i1"
+                && rhs_ty != "i1";
+            if cmp {
+                return "i1".to_string();
+            }
+            // Widen bool operands (i8 on codegen, i1 from locals)
+            // to the other side's width for the comparison path
+            // (already handled by the early i1 return above when
+            // either side is i1).
+            return lhs_ty;
+        }
         // Type checker inference (can have NodeId collisions — only use for non-literals
         // and non-function-calls, which have their types resolved from func_sigs above).
         if let Some(ty) = self.actual_inferred_type(expr) {
@@ -4237,6 +4311,18 @@ impl<'a> IrBuilder<'a> {
                 }
             }
             DeclarationKind::Newtype { type_alias, .. } => self.ensure_adt_for_type(type_alias),
+            DeclarationKind::UnsafeOrExtern(uoe) => {
+                if let UnsafeOrExternKind::Extern { declarations, .. } = &uoe.node {
+                    for sig in declarations {
+                        for p in &sig.node.params {
+                            self.ensure_adt_for_type(&p.type_annotation);
+                        }
+                        if let Some(ret) = &sig.node.return_type {
+                            self.ensure_adt_for_type(ret);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4716,6 +4802,16 @@ impl<'a> IrBuilder<'a> {
             _ => None,
         }
     }
+
+    fn chan_elem_infer_type(ty: &InferType) -> Option<&InferType> {
+        match ty {
+            InferType::App(name, args) if name == "Ref" && args.len() == 1 => {
+                Self::chan_elem_infer_type(&args[0])
+            }
+            InferType::App(name, args) if name == "Chan" && args.len() == 1 => Some(&args[0]),
+            _ => None,
+        }
+    }
 }
 
 // ── Entry point (public API) ──────────────────────────────────────────────────
@@ -4943,6 +5039,56 @@ fn mangle_llvm_type_name(llvm_ty: &str) -> String {
         .replace(',', "_")
         .replace('<', "")
         .replace('>', "")
+}
+
+/// Inverse of mangle_llvm_type_name: given a mangled enum-variant name like
+/// `Result__struct_Listenerptr__i32` returns `("Result", ["%struct.Listener*", "i32"])`.
+/// Outer `%struct.` prefix is already stripped by the caller; the mangled form
+/// uses `__` as the enum-name/type-args separator and `_` as the intra-type separator.
+fn parse_enum_from_mangled(mangled: &str) -> Option<(String, Vec<String>)> {
+    // Find the last-split between enum name and type args: Result__LoadPath__something
+    // has two-level ambiguity (LoadPath itself is a type with underscores), so we
+    // anchor to traits: known enum names that end at the outermost `__`.
+    let known_prefixes = ["Result", "Option"];
+    for prefix in &known_prefixes {
+        if let Some(suffix) = mangled.strip_prefix(prefix) {
+            if suffix.is_empty() {
+                return Some((prefix.to_string(), vec![]));
+            }
+            // Rest like `__struct_Listenerptr__i32`. Split on `__` only once to get
+            // the payload part: first split gives `""`, then `struct_Listenerptr`, then `i32`.
+            // Actually it's `__struct_Listenerptr__i32 = "struct_Listenerptr__i32" with leading "__".
+            let payload_str = suffix.strip_prefix("__")?;
+            // Recover LLVM types: each payload is delimited by `--` (used in mangling as `_`
+            // to separate types). Split on `__` between payload args, then unmangle each.
+            let llvm_types: Vec<String> = payload_str
+                .split("__")
+                .map(|seg| unmangle_llvm_type_segment(seg))
+                .filter(|s| !s.is_empty())
+                .collect();
+            return Some((prefix.to_string(), llvm_types));
+        }
+    }
+    None
+}
+
+fn unmangle_llvm_type_segment(name: &str) -> String {
+    // Reverses mangle_llvm_type_name's transformations paragraph.
+    // e.g. "struct_Listenerptr" → "%struct.Listener*"
+    //      "i64" stays "i64" (no special chars were mangled)
+    let mut s = name.to_string();
+    if s.ends_with("ptr") {
+        s = format!("{}*", s.strip_suffix("ptr").unwrap());
+    }
+    // The `struct_` prefix was never applied to non-struct LLVM types
+    // (mangle_llvm_type_name takes whole "%struct.Name*" as input and
+    // replaces "%struct." -> "struct_"). So `struct_Listener` →
+    // "%struct.Listener".  Simple types like "i32" → pass through, fine
+    // for `llvm_ty_to_infer_name` downstream.
+    if let Some(inner) = s.strip_prefix("struct_") {
+        s = format!("%struct.{}", inner);
+    }
+    s
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

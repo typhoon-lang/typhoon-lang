@@ -62,7 +62,13 @@
 /* ── configuration ───────────────────────────────────────────────────────── */
 
 #define CORO_STACK_SIZE   (128 * 1024) /* 128 KB coroutine stack data          */
-#define GUARD_PAGE_SIZE   4096 /* one page, PROT_NONE / PAGE_NOACCESS */
+/* Real system page size (mmap/VirtualAlloc always align to this — NOT
+ * necessarily 4096; Apple Silicon macOS uses 16KB pages). Was a hardcoded
+ * `4096` here, which made coro_new's guard-page address non-page-aligned
+ * on 16KB-page systems, so mprotect failed with EINVAL and every
+ * coroutine silently ran with no guard page at all. ty_vm_page_size()
+ * caches the syscall result, so this is cheap to use as a macro. */
+#define GUARD_PAGE_SIZE   ty_vm_page_size()
 #define DEQUE_INITIAL_CAP 256 /* must be power of 2                  */
 #define MAX_WORKERS       64
 #define SIGPROF_HZ        100 /* preemption ticks per second         */
@@ -1130,7 +1136,15 @@ void ty_coro_exit(void) {
     /* NOTE: active_coros is decremented in coro_free(), not here.
      * Decrementing here caused premature shutdown when blocked coroutines
      * (CORO_BLOCKED on a channel recv) were still alive. */
-    coro_state_store(co, CORO_DONE, "coro_exit");
+    CoroState cur = atomic_load_explicit(&co->state, memory_order_acquire);
+    if (cur == CORO_RUNNING) {
+        coro_state_store(co, CORO_DONE, "coro_exit");
+    } else if (cur == CORO_RUNNABLE) {
+        TY_DEBUG("[sched] coro_exit race: coro=%p was RUNNABLE (already woken?), skipping state transition\n", (void*)co);
+    } else if (cur != CORO_DONE) {
+        coro_state_store(co, CORO_DONE, "coro_exit");
+    }
+    
     TY_DEBUG("[sched] coro_exit coro=%p active=%d (decrements at coro_free)\n",
         (void*)co, atomic_load_explicit(&active_coros, memory_order_relaxed));
 

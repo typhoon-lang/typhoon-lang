@@ -249,6 +249,10 @@ void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap,
 
     void* coro = ty_current_coro_raw();
     if (coro) {
+        /* Submit via TyIoOp — the canonical Phase 4 path.
+         *
+         * ty_io_submit parks the coroutine internally (both per-worker
+         * backend and global driver paths). */
         TyIoOp op;
         memset(&op, 0, sizeof(op));
         op.type = TY_IO_OP_READ;
@@ -295,6 +299,7 @@ void __ty_rt__File__write(void* task, TyFile* self, char* buf, int32_t len,
 
     void* coro = ty_current_coro_raw();
     if (coro) {
+        /* ty_io_submit parks the coroutine internally. */
         TyIoOp op;
         memset(&op, 0, sizeof(op));
         op.type = TY_IO_OP_WRITE;
@@ -522,7 +527,19 @@ int64_t ty_sys_write(int fd, const char* buf, size_t len) {
         int n = _write(fd, buf, (unsigned int)len);
         return (int64_t)n;
     }
-    HANDLE h = (HANDLE)(uintptr_t)(unsigned int)fd;
+    /* fd here is a CRT file descriptor from _open() (File I/O is the
+     * only non-console caller of this function on Windows — ty_net.c's
+     * sockets go through their own recv/send/IOCP path entirely, never
+     * through ty_sys_write/read). A CRT fd is a small integer indexing
+     * the C runtime's own fd table; it is NOT a Win32 HANDLE and can't
+     * be produced by just casting the integer. That cast is what was
+     * here before: `(HANDLE)(uintptr_t)(unsigned int)fd`, which handed
+     * WriteFile something like literal handle value 3 — an invalid
+     * handle — so every real-file write failed with ERROR_INVALID_HANDLE
+     * and _sys_write returned -1. _get_osfhandle() does the real
+     * fd-to-HANDLE lookup in the CRT's table. */
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
     DWORD written = 0;
     BOOL ok = WriteFile(h, buf, (DWORD)len, &written, NULL);
     return ok ? (int64_t)written : -1;
@@ -546,7 +563,10 @@ int64_t ty_sys_read(int fd, char* buf, size_t len) {
         int n = _read(fd, buf, (unsigned int)len);
         return (int64_t)n;
     }
-    HANDLE h = (HANDLE)(uintptr_t)(unsigned int)fd;
+    /* Same fix as ty_sys_write above — fd is a CRT fd from _open(),
+     * needs _get_osfhandle() before it's a valid HANDLE for ReadFile. */
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
     DWORD got = 0;
     BOOL ok = ReadFile(h, buf, (DWORD)len, &got, NULL);
     return ok ? (int64_t)got : -1;

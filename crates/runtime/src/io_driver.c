@@ -803,9 +803,30 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
                       : iocp_stdio_read((int)fd, buf, len);
   } else {
     if (iocp_fd_is_socket(fd)) {
-      int n = is_write ? send((SOCKET)fd, (const char*)buf, (int)len, 0)
-                       : recv((SOCKET)fd, (char*)buf, (int)len, 0);
+      int n;
+      /* When the driver is stubbed (ty_io_subsystem_init not called,
+       * or poll thread not running) and an accepted socket from
+       * Listener__accept is non-blocking, recv/send returns
+       * WSAEWOULDBLOCK immediately. Turn off non-blocking temporarily
+       * so this truly blocks until data arrives — the original
+       * intent of the "blocking fallback" label. Restore after. */
+      u_long prev_mode = 1; /* assume non-blocking */
+      (void)ioctlsocket((SOCKET)fd, FIONBIO, &prev_mode); /* read current */
+      int was_nonblock = (prev_mode != 0);
+      if (was_nonblock) {
+        u_long off = 0;
+        (void)ioctlsocket((SOCKET)fd, FIONBIO, &off); /* clear */
+      }
+      if (is_write) {
+        n = send((SOCKET)fd, (const char*)buf, (int)len, 0);
+      } else {
+        n = recv((SOCKET)fd, (char*)buf, (int)len, 0);
+      }
       result = (n >= 0) ? (int64_t)n : -(int64_t)WSAGetLastError();
+      if (was_nonblock) {
+        u_long on = 1;
+        (void)ioctlsocket((SOCKET)fd, FIONBIO, &on); /* restore */
+      }
     } else {
       HANDLE h = (HANDLE)(uintptr_t)fd;
       DWORD n = 0;
@@ -816,6 +837,15 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
   }
 #else
   {
+    /* When driver is stubbed and an accepted socket is O_NONBLOCK,
+     * read/write returns EAGAIN immediately. Clear non-blocking
+     * temporarily for the blocking syscall, restore after. */
+    int was_nonblock = 0;
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags >= 0 && (flags & O_NONBLOCK)) {
+      fcntl((int)fd, F_SETFL, flags & ~O_NONBLOCK);
+      was_nonblock = 1;
+    }
     ssize_t n;
     if (is_write) {
       do {
@@ -827,6 +857,8 @@ static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
       } while (n < 0 && errno == EINTR);
     }
     result = (int64_t)(n < 0 ? -errno : n);
+    if (was_nonblock)
+      fcntl((int)fd, F_SETFL, flags); /* restore O_NONBLOCK */
   }
 #endif
   /* Store result so ty_io_take_result() is always the retrieval point */

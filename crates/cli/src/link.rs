@@ -22,12 +22,40 @@ fn is_net_method_wrapper(define_line: &str) -> bool {
         || define_line.contains("@__ty_method__Socket__")
 }
 
+/// True if a `%struct.X = type ...` line has a real body rather than being
+/// an opaque forward-declaration placeholder.
+fn is_concrete_type_line(trimmed: &str) -> bool {
+    !trimmed.contains("= type opaque")
+}
+
 fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::io::Result<()> {
     let user_ir = std::fs::read_to_string(ir_file)?;
-    let (user_ir_filtered, user_struct_types, user_define_names) = {
+
+    // First pass over stdlib IR: just record which type names it defines
+    // concretely, so the user-IR filtering pass below can drop opaque user
+    // stubs in favor of a concrete stdlib definition of the same name.
+    let stdlib_ir_preview = std::fs::read_to_string(stdlib_ll)?;
+    let mut stdlib_concrete_types = std::collections::HashSet::new();
+    for line in stdlib_ir_preview.lines() {
+        let trimmed = line.trim_start();
+        if (trimmed.starts_with("%struct.")
+            || trimmed.starts_with("%enum.")
+            || trimmed.starts_with("%newtype."))
+            && trimmed.contains(" = type ")
+            && is_concrete_type_line(trimmed)
+        {
+            if let Some(name) = trimmed.split_whitespace().next() {
+                stdlib_concrete_types.insert(name.to_string());
+            }
+        }
+    }
+
+    let (user_ir_filtered, user_struct_types, user_concrete_types, user_define_names, user_declare_names) = {
         let lines: Vec<&str> = user_ir.lines().collect();
         let mut struct_types = std::collections::HashSet::new();
+        let mut concrete_types = std::collections::HashSet::new();
         let mut define_names = std::collections::HashSet::new();
+        let mut declare_names = std::collections::HashSet::new();
         for &line in &lines {
             let trimmed = line.trim_start();
             // Collect struct type names defined in user IR
@@ -37,12 +65,22 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
             {
                 if let Some(name) = trimmed.split_whitespace().next() {
                     struct_types.insert(name.to_string());
+                    if is_concrete_type_line(trimmed) {
+                        concrete_types.insert(name.to_string());
+                    }
                 }
             }
             if trimmed.starts_with("define ") {
                 if let Some((_, after_at)) = trimmed.split_once('@') {
                     if let Some(name) = after_at.split('(').next().map(str::trim) {
                         define_names.insert(name.to_string());
+                    }
+                }
+            }
+            if trimmed.starts_with("declare ") {
+                if let Some((_, after_at)) = trimmed.split_once('@') {
+                    if let Some(name) = after_at.split('(').next().map(str::trim) {
+                        declare_names.insert(name.to_string());
                     }
                 }
             }
@@ -60,6 +98,25 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
             if trimmed.starts_with("declare ") && trimmed.contains("@__ty_method__") {
                 i += 1;
                 continue;
+            }
+            // Drop user IR's own opaque struct/enum/newtype stub when the
+            // stdlib defines that same type concretely — the stdlib's
+            // definition wins and the opaque line would otherwise redefine
+            // the same struct name, or (as here) get emitted while the
+            // stdlib's concrete copy is dropped because "user IR already
+            // has a definition", leaving nothing concrete on either side.
+            if (trimmed.starts_with("%struct.")
+                || trimmed.starts_with("%enum.")
+                || trimmed.starts_with("%newtype."))
+                && trimmed.contains(" = type ")
+                && !is_concrete_type_line(trimmed)
+            {
+                if let Some(name) = trimmed.split_whitespace().next() {
+                    if stdlib_concrete_types.contains(name) {
+                        i += 1;
+                        continue;
+                    }
+                }
             }
             // Drop codegen-emitted define bodies for net method wrappers.
             if trimmed.starts_with("define ") && is_net_method_wrapper(trimmed) {
@@ -83,7 +140,7 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
             filtered.push(lines[i]);
             i += 1;
         }
-        (filtered.join("\n"), struct_types, define_names)
+        (filtered.join("\n"), struct_types, concrete_types, define_names, declare_names)
     };
     let stdlib_ir = std::fs::read_to_string(stdlib_ll)?;
     let stdlib_lines: Vec<&str> = stdlib_ir.lines().collect();
@@ -94,8 +151,25 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
         // Drop `declare` lines from stdlib — they are already present in user IR
         // (codegen emits them) and duplicates cause llvm errors.
         if line.starts_with("declare ") {
-            i += 1;
-            continue;
+            // Only drop if user IR already declares (or defines) this
+            // symbol itself. Previously every stdlib `declare` was dropped
+            // unconditionally on the assumption user IR always has it —
+            // false for runtime functions (e.g. __ty_rt__Listener__accept)
+            // that are only called from inside a kept net-wrapper body
+            // (__ty_method__Listener__accept) when user code never
+            // touches that type directly and so never declares the
+            // runtime function itself.
+            let name = line
+                .split_once('@')
+                .and_then(|(_, after)| after.split('(').next())
+                .map(str::trim);
+            let redundant = name
+                .map(|n| user_declare_names.contains(n) || user_define_names.contains(n))
+                .unwrap_or(false);
+            if redundant {
+                i += 1;
+                continue;
+            }
         }
         if line.starts_with("define ") {
             if let Some((_, after_at)) = line.split_once('@') {
@@ -127,14 +201,31 @@ fn merge_ir_text(ir_file: &str, stdlib_ll: &PathBuf, merged_path: &str) -> std::
                 || line.starts_with("%newtype."))
         {
             if let Some(name) = line.split_whitespace().next() {
-                // Always drop monomorphised Result/Option from stdlib —
-                // codegen unconditionally emits the concrete definitions.
-                if name.starts_with("%struct.Result__") || name.starts_with("%struct.Option__") {
-                    i += 1;
-                    continue;
-                }
-                // For everything else, only drop if user IR already defines it.
-                if user_struct_types.contains(name) {
+                // Drop stdlib's definition only if user IR already defines
+                // this type *concretely*. A merely-opaque user stub (e.g.
+                // for a Result<T,E> instantiation main.ty never touches,
+                // such as Result<Listener,Int32> when the program never
+                // uses Network) must not shadow a concrete stdlib
+                // definition — that previously left the type undefined on
+                // both sides after merge, which is an implicitly opaque
+                // struct as far as LLVM is concerned.
+                //
+                // But when the stdlib's own line is *also* just opaque
+                // (e.g. Buf, an intentionally-opaque handle type whose real
+                // definition lives in the C runtime, not LLVM IR), fall
+                // back to deduping against any user declaration at all —
+                // otherwise two identical `type opaque` lines for the same
+                // name both survive and clang reports "redefinition of
+                // type".
+                let stdlib_line_concrete = is_concrete_type_line(line);
+                let drop = if user_concrete_types.contains(name) {
+                    true
+                } else if !stdlib_line_concrete {
+                    user_struct_types.contains(name)
+                } else {
+                    false
+                };
+                if drop {
                     i += 1;
                     continue;
                 }

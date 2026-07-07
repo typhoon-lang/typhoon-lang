@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "platform.h"
@@ -349,6 +350,7 @@ Buf* ty_buf_new(SlabArena* arena) {
     b->cap = 64;
     b->data = (char*)arena_alloc(arena, 64, 1);
     b->data[0] = '\0';
+    b->heap_owned = 0;
     return b;
 }
 
@@ -363,6 +365,10 @@ Buf* ty_buf_new(SlabArena* arena) {
  * b->data — one allocation, one copy (kernel into buffer), nothing else.
  * Caller is responsible for setting b->len (and the trailing '\0', at
  * b->data[b->len]) after filling b->data directly.
+ *
+ * NOTE: arena-allocated, single-owner only — see ty_buf_new_heap below
+ * for the version safe to allocate on one coroutine and consume on
+ * another (e.g. across a channel).
  */
 Buf* ty_buf_new_sized(SlabArena* arena, int64_t cap) {
     if (cap < 0) cap = 0;
@@ -370,6 +376,34 @@ Buf* ty_buf_new_sized(SlabArena* arena, int64_t cap) {
     b->len = 0;
     b->cap = cap;
     b->data = (char*)arena_alloc(arena, (size_t)cap + 1, 1);
+    b->data[0] = '\0';
+    b->heap_owned = 0;
+    return b;
+}
+
+/*
+ * ty_buf_new_heap — same shape as ty_buf_new_sized, but backed by plain
+ * malloc instead of any SlabArena. SlabArena's bump/free-list allocator
+ * has no locking (by design — it's meant to be single-coroutine-owned,
+ * which is what makes it cheap), so it isn't safe for a Buf that's
+ * produced by one coroutine and consumed by a different one, since the
+ * M:N scheduler can genuinely run those two coroutines on different OS
+ * worker threads concurrently. malloc/free are thread-safe on every
+ * platform this runtime targets, at the cost of losing the arena's bump
+ * allocation speed — an acceptable trade specifically for data crossing
+ * a coroutine boundary (e.g. ReadSocket.into_chan's chan<Buf>), which
+ * doesn't benefit from arena locality anyway since the two ends don't
+ * share an arena.
+ */
+Buf* ty_buf_new_heap(int64_t cap) {
+    if (cap < 0) cap = 0;
+    Buf* b = (Buf*)malloc(sizeof(Buf));
+    if (!b) return NULL;
+    b->data = (char*)malloc((size_t)cap + 1);
+    if (!b->data) { free(b); return NULL; }
+    b->len = 0;
+    b->cap = cap;
+    b->heap_owned = 1;
     b->data[0] = '\0';
     return b;
 }
@@ -400,11 +434,36 @@ void ty_buf_push_byte(SlabArena* arena, Buf* b, char c) {
  */
 TyStr* ty_buf_into_str(SlabArena* arena, Buf* b) {
     if (!b) return NULL;
+
+    if (b->heap_owned) {
+        /* Cross-coroutine chunk (see ty_buf_new_heap) — not part of any
+         * SlabArena. Recycling it through arena_free_slot(arena, ...)
+         * here would push this malloc'd pointer onto the CALLING
+         * coroutine's own arena free-list, and a later arena_alloc of
+         * the same size class would hand it back out as if it were
+         * arena memory — corrupting that arena. Wrap and release with
+         * plain malloc/free instead; `arena` is unused on this path. */
+        TyStr* s = (TyStr*)malloc(sizeof(TyStr));
+        if (!s) return NULL;
+        s->ptr = b->data; /* ownership of the data buffer transfers to s */
+        s->len = (int32_t)b->len;
+        free(b); /* just the header — data lives on via s->ptr */
+        return s;
+    }
+
     TyStr* s = (TyStr*)slab_alloc(arena, 1);
     s->ptr = b->data;
     s->len = (int32_t)b->len;
     arena_free_slot(arena, b, sizeof(Buf));
     return s;
+}
+
+/* See ty_mem.h — only ever call this on a TyStr that came from
+ * ty_buf_into_str() on a heap_owned Buf. */
+void ty_str_free_heap(TyStr* s) {
+    if (!s) return;
+    free(s->ptr);
+    free(s);
 }
 
 int64_t ty_str_len(TyStr* s) {

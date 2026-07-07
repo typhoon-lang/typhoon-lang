@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 fn main() {
     let dst = Config::new(".")
-        .define("BUILD_TESTS", "OFF") // Enable the test option we added
+        .define("BUILD_TESTS", "ON") // Enable the test option we added
         .build();
 
     // 1. Define the "pretty" path: target/lib/

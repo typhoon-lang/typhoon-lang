@@ -42,9 +42,40 @@ jobs:
       - name: Install Rust
         uses: moonrepo/setup-rust@v1
 
+      - name: Check io_uring availability (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -f /proc/sys/kernel/io_uring_disabled ]; then
+            val=$(cat /proc/sys/kernel/io_uring_disabled)
+            echo "io_uring_disabled = $val"
+            case "$val" in
+              0) echo "io_uring: enabled for unprivileged processes" ;;
+              1) echo "io_uring: DISABLED for unprivileged processes (IORING_SETUP_SQPOLL/plain io_uring_setup will fail with EPERM for this job's user)" ;;
+              2) echo "io_uring: FULLY DISABLED (io_uring_setup will fail for everyone, including root)" ;;
+              *) echo "io_uring: unrecognized value $val" ;;
+            esac
+          else
+            echo "io_uring_disabled sysctl not present — kernel predates this knob, io_uring unrestricted by it"
+          fi
+          uname -r
+
       - name: Run tests
+        timeout-minutes: 10
+        shell: bash
         run: |
           cargo build -p typhoon-cli
+          cargo build -p typhoon-stdlib
+          set -o pipefail
+          cargo test -p typhoon-runtime -- --nocapture --test-threads=1 2>&1 | tee cargo-test-${{ matrix.os }}.log
+
+      - name: Upload cargo test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-test-log-${{ matrix.os }}
+          path: cargo-test-${{ matrix.os }}.log
+          if-no-files-found: ignore
 
       # ---- Locate the pre-built binary (path differs by OS) ----
 
@@ -95,7 +126,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          $TY_BIN run sample/main.ty >server.log 2>server-err.log &
+          python script/run_ty_server.py >server.log 2>server-err.log &
           echo "SERVER_PID=$!" >> $GITHUB_ENV
           echo "Server started (PID $!)"
 
@@ -104,33 +135,13 @@ jobs:
         shell: pwsh
         run: |
           $proc = Start-Process `
-            -FilePath "$env:TY_BIN" `
-            -ArgumentList "run", "sample/main.ty" `
+            -FilePath "python" `
+            -ArgumentList "script/run_ty_server.py" `
             -PassThru -NoNewWindow `
             -RedirectStandardOutput "server.log" `
             -RedirectStandardError "server-err.log"
           echo "SERVER_PID=$($proc.Id)" >> $env:GITHUB_ENV
           Write-Host "Server started (PID $($proc.Id))"
-
-      # ---- Wait for :8080 - pure Python, works on all platforms ----
-      #
-      # The Typhoon scheduler boots workers, spawns the main coro, goes
-      # through an IO park/wake cycle to print "Listening on :8080", THEN
-      # calls Listener::accept. The port is bound during that IO cycle, so
-      # a plain connect() can succeed a few ms before accept() is actually
-      # ready to receive data.
-      #
-      # Fix: after connecting, send a harmless probe byte (0x00, popcount=0)
-      # and wait for the socket to close or return data. That roundtrip
-      # confirms accept() has run and the handler coro is live.
-
-      - name: Wait for server to be ready
-        run: python script/ping.py
-
-      # ---- Run the test suite ----
-
-      - name: Run network tests
-        run: python script/test_network.py --host 127.0.0.1 --port 8080 --timeout 5
 
       # ---- Upload server log (always, for debugging) ----
 

@@ -46,7 +46,7 @@ Typhoon is a systems language built around four principles working together:
 
 ```
 let  mut  fn  struct  enum  interface  impl  extend  newtype
-match  if  else  for  while  return  in  where  conc  select  recv
+match  if  else  for  while  return  in  where  conc  select  join  recv
 unsafe  use  true  false  as
 ```
 
@@ -610,7 +610,7 @@ fn load(path: Str) -> Result<Config, AppError> {
 
 ### Join Expression
 
-Await multiple tasks concurrently. All tasks run simultaneously; the expression resolves when all complete.
+Submit multiple IO operations or tasks simultaneously. All arms start together; the expression resolves when all complete.
 
 ```typhoon
 let (user, orders) = join {
@@ -618,6 +618,13 @@ let (user, orders) = join {
   fetch_orders(id),
 }
 ```
+
+Semantics:
+- `join` is a language construct, not a macro or method.
+- All arms must consume the same set of external live bindings, same rule as `match` and `select`.
+- `join` returns all arm results; it does not implicitly cancel sibling arms.
+- `join?` is deferred.
+- For IO, the compiler can batch kernel submissions and resume once every arm completes.
 
 ### Field Access
 
@@ -711,6 +718,27 @@ fn find_user(id: UserId) -> Option<User> {
   db.users.get(id)
 }
 ```
+
+### IoError
+
+IO operations use a first-class error enum rather than raw integers:
+
+```typhoon
+enum IoError {
+  NotFound(Str),          // ENOENT / ERROR_FILE_NOT_FOUND
+  PermissionDenied,       // EACCES / ERROR_ACCESS_DENIED
+  ConnectionReset,         // ECONNRESET
+  ConnectionRefused,      // ECONNREFUSED
+  TimedOut,               // ETIMEDOUT
+  BrokenPipe,             // EPIPE / ERROR_BROKEN_PIPE
+  Eof,                    // recv() returned 0 / orderly close
+  Cancelled,              // operation cancelled via CancelToken
+  OutputTruncated,        // format output exceeded buffer (temporary)
+  Os(Int32),              // escape hatch for unmapped platform codes
+}
+```
+
+The runtime maps `errno` / platform error codes to `IoError` at the FFI boundary. No IO API returns a raw integer error.
 
 ### Monad Operations
 
@@ -1270,17 +1298,115 @@ Map::from(pairs: [(K, V)]) -> Map<K, V>
 .is_err() -> Bool
 ```
 
+**`IoError`**
+```typhoon
+enum IoError {
+  NotFound(Str),
+  PermissionDenied,
+  ConnectionReset,
+  ConnectionRefused,
+  TimedOut,
+  BrokenPipe,
+  Eof,
+  Cancelled,
+  OutputTruncated,
+  Os(Int32),
+}
+```
+
+**`Mode`**
+```typhoon
+enum Mode {
+  Read,
+  Write,
+  ReadWrite,
+  Append,
+  CreateWrite,
+  CreateAppend,
+}
+```
+
+**`SeekPos`**
+```typhoon
+enum SeekPos {
+  Start(Int64),
+  End(Int64),
+  Current(Int64),
+}
+```
+
+**`File`** (linear)
+```typhoon
+fn fs::open(path: Str, mode: Mode) -> Result<File, IoError>
+
+impl File {
+  fn read(self, buf: Buf) -> (File, Buf, Result<Int32, IoError>)
+  fn write(self, buf: Buf) -> (File, Buf, Result<Int32, IoError>)
+  fn read_vectored(self, bufs: [Buf]) -> (File, [Buf], Result<Int32, IoError>)
+  fn write_vectored(self, bufs: [Buf]) -> (File, [Buf], Result<Int32, IoError>)
+  fn seek(self, pos: SeekPos) -> (File, Result<Int64, IoError>)
+  fn close(self) -> ()
+}
+```
+
+**`Network` / `Listener` / `Socket`**
+```typhoon
+impl Network {
+  fn listen(self, addr: Str) -> Result<Listener, IoError>
+  fn connect(self, addr: Str) -> Result<Socket, IoError>
+  fn split(self) -> (Network, Network)
+}
+
+impl Listener {
+  fn accept(self) -> (Listener, Result<Socket, IoError>)
+  fn close(self) -> ()
+}
+
+impl Socket {
+  fn read(self, buf: Buf) -> (Socket, Buf, Result<Int32, IoError>)
+  fn write(self, buf: Buf) -> (Socket, Buf, Result<Int32, IoError>)
+  fn read_vectored(self, bufs: [Buf]) -> (Socket, [Buf], Result<Int32, IoError>)
+  fn write_vectored(self, bufs: [Buf]) -> (Socket, [Buf], Result<Int32, IoError>)
+  fn split(self) -> (ReadSocket, WriteSocket)
+  fn close(self) -> ()
+}
+
+impl ReadSocket {
+  fn read(self, buf: Buf) -> (ReadSocket, Buf, Result<Int32, IoError>)
+  fn read_vectored(self, bufs: [Buf]) -> (ReadSocket, [Buf], Result<Int32, IoError>)
+  fn into_chan(self, chunk_size: Int32, cap: Int32) -> chan<Buf>
+  fn close(self) -> ()
+}
+
+impl WriteSocket {
+  fn write(self, buf: Buf) -> (WriteSocket, Buf, Result<Int32, IoError>)
+  fn write_vectored(self, bufs: [Buf]) -> (WriteSocket, [Buf], Result<Int32, IoError>)
+  fn close(self) -> ()
+}
+```
+
+**`stdin` / `stdout` / `stderr`**
+```typhoon
+fn stdin::read_line() -> Result<Buf, IoError>
+fn stdin::read_bytes(n: Int32) -> Result<Buf, IoError>
+fn stdout::write(s: Str) -> Result<(), IoError>
+fn stderr::write(s: Str) -> Result<(), IoError>
+fn println(s: Str) -> ()
+fn eprintln(s: Str) -> ()
+```
+
 ### Tier 2 — Standard
 
 Available via `use std::*`.
 
 ```typhoon
-use std::io        // read_file, write_file, println, eprintln, scan
+use std::io        // stdin, stdout, stderr, println, eprintln
 use std::math      // abs, sqrt, pow, floor, ceil, round, min, max, PI, E
 use std::time      // Timestamp, Duration, now(), sleep()
 use std::fmt       // format!() macro for complex string building
 use std::process   // exit(), env(), args()
-use std::fs        // File, Dir, path operations
+use std::fs        // File, Mode, SeekPos, open, read, write, seek, close
+use std::net       // Network, Listener, Socket, ReadSocket, WriteSocket
 ```
 
 ### Tier 3 — Ecosystem
@@ -1335,7 +1461,7 @@ Coroutines — stackful, 64 KB initial stack, grows via guard page fault
 Each `conc {}` creates a coroutine entry in the run queue of the spawning thread. Work stealing balances load — idle threads steal from busy threads' queues.
 
 Scheduling is:
-- **Cooperative** at `await`, `chan.recv()` (blocked), `chan.send()` (full channel)
+- **Cooperative** at `chan.recv()` (blocked), `chan.send()` (full channel), and IO suspension points
 - **Preemptive** via POSIX signal (`SIGPROF`) for CPU-bound coroutines exceeding a time quantum (default 10ms)
 
 ### Per-Task Slab
@@ -1358,11 +1484,13 @@ conc(slab: 8mb) { ... }
 ### IO Driver
 
 A thin FFI bridge to:
-- **Linux**: `io_uring` — fully asynchronous, batched syscalls, zero kernel-crossing overhead for repeated operations
-- **macOS**: `kqueue` — event-based, efficient for moderate concurrency
+- **Linux**: `io_uring` — completion-based, batched syscalls
+- **macOS**: `kqueue` — readiness-based, event-driven
 - **Windows**: `IOCP` — completion port model
 
-The driver runs in a dedicated OS thread. It posts completed IO events to the coroutine scheduler's queue, waking the blocked coroutine.
+The scheduler owns IO. The scheduler polls the driver when no coroutine is runnable, receives a list of completed operations, and re-enqueues waiting coroutines. The driver knows nothing about coroutine stacks or run queues.
+
+IO backends are selected at compile time and expose a common `submit`/`poll`/`shutdown` shape behind a function pointer table initialized once at startup.
 
 ### LLVM Backend
 
@@ -1396,7 +1524,7 @@ Linear types provide LLVM with strong aliasing information. Every non-`ref` poin
 
 ### Capability Model
 
-Networking is not a global resource. The `main` function receives a `Network` capability token. All networking operations require a token to be passed explicitly.
+Networking uses `Network` capability and linear IO types from §14.
 
 ```typhoon
 fn main(net: Network) -> Result<(), AppError> {
@@ -1411,23 +1539,19 @@ A `Network` token cannot be created by user code — it can only be passed down 
 let (net_a, net_b) = net.split()    // fork into two restricted tokens
 ```
 
-This makes it impossible for library code to open network connections without explicit programmer consent.
-
-### Linear Socket
-
-`Socket` is a linear resource. Only one coroutine can hold it. Moving it into a `conc` block transfers ownership and revokes access from the sender.
+`Socket` is linear. Moving it into a `conc` block transfers ownership and revokes access from the sender.
 
 ```typhoon
-let socket = listener.accept()?   // Socket is linear
+let socket = listener.accept()?
 conc {
-  handle_connection(socket)       // socket moved here
+  handle_connection(socket)
 }
 // socket no longer accessible in this scope
 ```
 
 ### Zero-Copy HTTP Parsing
 
-The IO driver writes incoming bytes directly into the receiving coroutine's slab. The HTTP parser creates `StrView` values — pointers into the slab buffer — for method, path, and headers. No string copies occur during parsing.
+IO writes incoming bytes directly into the receiving coroutine's slab. The HTTP parser creates `Str` views into the slab buffer for method, path, and headers. No string copies occur during parsing.
 
 ```typhoon
 // Internal representation — not exposed directly to user code
@@ -1451,8 +1575,8 @@ Headers are stored in a small fixed-capacity array and searched via linear scan.
 ```
 1. Accept     listener.accept() → Socket
 2. Spawn      socket moved into conc block → new coroutine, new slab
-3. Read       io_uring reads bytes directly into coroutine slab
-4. Parse      resumable state machine creates StrViews into slab
+3. Read       IO backend reads bytes directly into coroutine slab
+4. Parse      resumable state machine creates Str views into slab
 5. Dispatch   user handler receives &Request (view into slab — no copy)
 6. Respond    Response built in slab, moved to IO driver
 7. Nuke       coroutine exits → slab reset in O(1)

@@ -29,6 +29,8 @@ typedef struct TyUringBackend {
     /* layout offsets */
     uint32_t sq_head_off, sq_tail_off, sq_array_off;
     uint32_t cq_head_off, cq_tail_off, cq_cqes_off;
+    TyMutex submit_lock;          /* NEW — serializes SQ ring access across workers */
+    _Atomic(int) poll_lock_flag;  /* NEW — try-lock flag for the CQ drain path */
 } TyUringBackend;
 
 /* Create an io_uring backend for the calling worker thread. */

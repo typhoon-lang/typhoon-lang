@@ -84,6 +84,19 @@ static inline void ty_vm_free(void* p, size_t size) { munmap(p, size); }
 static inline int ty_vm_guard(void* p, size_t size) {
 	return mprotect(p, size, PROT_NONE) == 0 ? 1 : 0;
 }
+/* Real system page size, queried once. mmap always returns memory aligned
+ * to this — NOT necessarily 4096. Apple Silicon macOS uses 16KB pages;
+ * assuming 4096 anywhere addresses/lengths get handed to mprotect (as
+ * scheduler.c's guard-page setup used to) fails with EINVAL there, since
+ * mprotect requires real-page-size alignment. */
+static inline size_t ty_vm_page_size(void) {
+	static size_t sz = 0;
+	if (sz == 0) {
+		long p = sysconf(_SC_PAGESIZE);
+		sz = (p > 0) ? (size_t)p : 4096;
+	}
+	return sz;
+}
 
 /* ── fd type & close ─────────────────────────────────────────────────────── */
 typedef int ty_fd_t;
@@ -264,6 +277,15 @@ static inline int ty_vm_guard(void* p, size_t size) {
 	DWORD old;
 	return VirtualProtect(p, size, PAGE_NOACCESS, &old) ? 1 : 0;
 }
+static inline size_t ty_vm_page_size(void) {
+	static size_t sz = 0;
+	if (sz == 0) {
+		SYSTEM_INFO si;
+		GetSystemInfo(&si);
+		sz = si.dwPageSize ? (size_t)si.dwPageSize : 4096;
+	}
+	return sz;
+}
 
 /* ── fd type & close ─────────────────────────────────────────────────────── */
 /* On Windows, socket handles are SOCKET (UINT_PTR). We store them as
@@ -359,9 +381,26 @@ static inline void ty_ctx_swap(TyCtx* from, TyCtx* to) {
  * Special: worker 0's sched_ctx.fiber must be initialised with
  * ConvertThreadToFiber before any SwitchToFiber is called.
  * Call ty_ctx_init_sched() on the scheduler context of each worker thread.
+ *
+ * ConvertThreadToFiber fails (returns NULL, GetLastError()==
+ * ERROR_ALREADY_FIBER) if the calling thread is already a fiber. That
+ * happens whenever ty_sched_init() runs a second time on the same OS
+ * thread within one process — e.g. two C tests, each doing a full
+ * init/run/shutdown cycle, in the same main(). Nothing converts the
+ * thread back with ConvertFiberToThread() at shutdown (Windows doesn't
+ * make repeated convert/unconvert cycles something you want to lean on
+ * anyway), so by the second ty_sched_init() the main thread is still a
+ * fiber from the first cycle. Without this check, ctx->fiber silently
+ * becomes NULL, and the eventual SwitchToFiber(NULL) in ty_ctx_swap
+ * crashes — not at this call site, but much later, at whatever's the
+ * next context swap back into worker 0's scheduler context.
  */
 static inline void ty_ctx_init_sched(TyCtx* ctx) {
-	ctx->fiber = ConvertThreadToFiber(NULL);
+	if (IsThreadAFiber()) {
+		ctx->fiber = GetCurrentFiber();
+	} else {
+		ctx->fiber = ConvertThreadToFiber(NULL);
+	}
 	ctx->started = 1;
 }
 

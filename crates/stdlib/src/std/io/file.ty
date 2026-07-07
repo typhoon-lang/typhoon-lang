@@ -1,0 +1,93 @@
+namespace std::io
+
+use std::buf::Buf;
+use std::result::Result;
+
+/*
+ * File / fs - Task 3 stdlib bindings for the C runtime's file I/O
+ * (__ty_rt__fs__open / __ty_rt__File__*, ty_io.c). This binding did not
+ * exist anywhere before this: io.ty had Stdout/Stdin but nothing for
+ * File, so there was no way to reach file I/O from actual Typhoon
+ * source, only by hand-declaring the runtime entry points yourself (as
+ * the c_test! files under crates/runtime/test do).
+ *
+ * Modeled directly on net.ty's established convention: extern "C" block
+ * declares each __ty_rt__* entry point with its real Result<T, E>
+ * return type spelled out (task/out-pointer are compiler-injected, not
+ * shown, matching every other extern decl in this codebase); thin impl
+ * methods just delegate.
+ */
+
+struct File {}
+
+/*
+ * mode is a raw Int32, not a Mode enum - deliberately, not an oversight.
+ * ty_io.c's own TyMode ordinals are flagged ASSUMED there (verify
+ * against codegen.rs's actual enum lowering before trusting this):
+ *   0 = Read           (O_RDONLY)
+ *   1 = Write          (O_WRONLY | O_CREAT | O_TRUNC)
+ *   2 = Append         (O_WRONLY | O_CREAT | O_APPEND)
+ *   3 = ReadWrite      (O_RDWR)
+ *   4 = Create         (O_RDWR | O_CREAT | O_TRUNC)
+ * Defining a Typhoon-level `enum Mode { Read, Write, Append, ReadWrite,
+ * Create }` here and assuming its bare-variant-to-int lowering lands on
+ * these same ordinals would be stacking a second unconfirmed guess on
+ * top of the first (I don't know how this compiler lowers payload-less
+ * enum variants - could be declaration order, could be something else
+ * entirely per the enum layout work in codegen.rs). Passing the raw
+ * Int32 punts that guess to the caller instead of hiding it here; once
+ * the real ordinals are confirmed, wrapping these in a proper Mode enum
+ * is a small, safe follow-up.
+ */
+fn open(path: Str, mode: Int32) -> Result<File, Int32> {
+  return __ty_rt__fs__open(path, mode);
+}
+
+impl File {
+  fn write(self: File, buf: Str, len: Int32) -> Result<Int64, Int32> {
+    return __ty_rt__File__write(self, buf, len);
+  }
+
+  /*
+   * whence is also a raw Int32, passed straight through to
+   * SetFilePointerEx's dwMoveMethod / lseek's whence with no
+   * translation on the C side (confirmed in ty_io.c - unlike mode,
+   * this one isn't a guess): 0 = beginning, 1 = current position,
+   * 2 = end. Same values on both platforms since Windows's
+   * FILE_BEGIN/FILE_CURRENT/FILE_END happen to match POSIX's
+   * SEEK_SET/SEEK_CUR/SEEK_END numerically.
+   */
+  fn seek(self: File, offset: Int64, whence: Int32) -> Result<Int64, Int32> {
+    return __ty_rt__File__seek(self, offset, whence);
+  }
+
+  fn close(self: File) {
+    __ty_rt__File__close(self);
+  }
+
+  /*
+   * read is NOT included here - see the note below extern "C". The C
+   * signature (__ty_rt__File__read(self, buf: char*, cap: int32) -> ...)
+   * wants a pre-allocated raw buffer to fill in place. Every buffer-like
+   * type Typhoon actually exposes (Buf, via buf.ty) only supports
+   * sequential append (push_byte/push_str) - there's no "reserve N
+   * bytes and hand me a fillable region" operation, and no raw
+   * pointer/MutBuf type shows up anywhere in io.ty, buf.ty, or net.ty to
+   * model one on. Bridging this needs either a new Buf-reserving C
+   * entry point or a different Typhoon-side shape entirely, and I'd
+   * rather flag that as an open design question than invent an ABI
+   * nobody's confirmed.
+   */
+}
+
+extern "C" {
+  fn __ty_rt__fs__open(path: Str, mode: Int32) -> Result<File, Int32>
+  fn __ty_rt__File__write(self: File, buf: Str, len: Int32) -> Result<Int64, Int32>
+  fn __ty_rt__File__seek(self: File, offset: Int64, whence: Int32) -> Result<Int64, Int32>
+  fn __ty_rt__File__close(self: File)
+  // __ty_rt__File__read intentionally not declared here - see the note
+  // in `impl File` above. Its real C signature is:
+  //   void __ty_rt__File__read(void* task, TyFile* self, char* buf,
+  //       int32_t cap, TyResult_i64_i32* out)
+  // which has no corresponding Typhoon-level buffer type to bind to yet.
+}

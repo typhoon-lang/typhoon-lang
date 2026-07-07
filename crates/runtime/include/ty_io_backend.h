@@ -2,6 +2,7 @@
 #include "platform.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,7 +28,8 @@ typedef struct TyIoBackend {
 enum {
   TY_IO_OP_READ = 1,
   TY_IO_OP_WRITE = 2,
-  TY_IO_OP_ACCEPT = 3
+  TY_IO_OP_ACCEPT = 3,
+  TY_IO_OP_CONNECT = 4
 };
 
 int ty_io_submit(const TyIoOp* op);

@@ -1,0 +1,74 @@
+namespace std::io
+
+use std::buf::Buf;
+
+struct Stdout {}
+extern "C" {
+  fn ty_stdout_new() -> Stdout
+  fn ty_stdout_flush(self: Stdout) -> Unit
+  fn ty_stdout_getbuf(self: Stdout) -> Buf
+  fn ty_str_len(s: Str) -> Int64
+  fn ty_str_byte(s: Str, idx: Int64) -> Int8
+}
+
+impl Stdout {
+  fn print(self, s: Str) {
+    let mut b = ty_stdout_getbuf(self)
+    ty_buf_push_str(b, s)
+  }
+  fn println(self, s: Str) {
+    let mut b = ty_stdout_getbuf(self)
+    ty_buf_push_str(b, s)
+    ty_buf_push_byte(b, 10 as Int8)
+    ty_stdout_flush(self)
+  }
+  fn printf(self, fmt: Str, a1: Int64, a2: Int64, a3: Int64, a4: Int64) {
+    let mut b = ty_stdout_getbuf(self)
+    let mut ai = 0 as Int64
+    let mut a1m = a1
+    let mut a2m = a2
+    let mut a3m = a3
+    let mut a4m = a4
+    let mut pos = 0 as Int64
+    while pos < ty_str_len(fmt) {
+      let mut byte: Int8 = ty_str_byte(fmt, pos)
+      if byte != 37 as Int8 {
+        ty_buf_push_byte(b, byte)
+        pos = pos + 1
+      } else {
+        pos = pos + 1
+        if pos >= ty_str_len(fmt) {
+          /* Trailing bare '%' as the last byte of fmt — issue #7 fix.
+           * ty_str_byte has no upper-bound check (it just indexes the
+           * underlying C string), so reading a spec byte here without
+           * this check was an out-of-bounds read past the string's end.
+           * Emit the '%' literally and stop; there's no spec char to
+           * consume because the string ended. */
+          ty_buf_push_byte(b, 37 as Int8)
+        } else {
+          let mut spec: Int8 = ty_str_byte(fmt, pos)
+          let mut val = a1m
+          if ai == 1 as Int64 { val = a2m }
+          if ai == 2 as Int64 { val = a3m }
+          if ai == 3 as Int64 { val = a4m }
+          ai = ai + 1 as Int64
+          if spec == 37 as Int8 {
+            ty_buf_push_byte(b, 37 as Int8)
+          }
+          if spec == 100 as Int8 {
+            b.push_int(val)
+          }
+          if spec == 115 as Int8 {
+            ty_buf_push_str(b, val as Str)
+          }
+          pos = pos + 1
+        }
+      }
+    }
+    ty_stdout_flush(self)
+  }
+  fn flush(self) {
+    ty_stdout_flush(self)
+  }
+}
+

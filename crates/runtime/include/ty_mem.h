@@ -51,13 +51,38 @@ typedef struct Buf {
     char*   data;
     int64_t len;
     int64_t cap;
+    int32_t heap_owned; /* 0 = normal arena-allocated Buf (the default —
+                            every existing call site). 1 = allocated via
+                            ty_buf_new_heap: plain malloc-backed, NOT tied
+                            to any coroutine's SlabArena. Needed for Bufs
+                            that cross a coroutine boundary through a
+                            channel (e.g. ReadSocket.into_chan's chan<Buf>)
+                            — SlabArena has no locking (by design, for
+                            single-owner speed), so a Buf produced by one
+                            coroutine and consumed by another on a
+                            different OS worker thread cannot safely be
+                            allocated from (or recycled back into) either
+                            side's arena. ty_buf_into_str checks this flag
+                            and dispatches to the malloc/free path instead
+                            of arena_alloc/arena_free_slot when set. */
 } Buf;
 
 Buf*  ty_buf_new(SlabArena* arena);
 Buf*  ty_buf_new_sized(SlabArena* arena, int64_t cap);
+/* Thread-safe alternative to ty_buf_new_sized: no SlabArena involved,
+ * safe to allocate on one coroutine/thread and free on another. Use for
+ * any Buf that will cross a channel to a different coroutine. Pair with
+ * ty_str_free_heap once the resulting TyStr (from ty_buf_into_str) is no
+ * longer needed. */
+Buf*  ty_buf_new_heap(int64_t cap);
 void  ty_buf_push_str(SlabArena* arena, Buf* b, TyStr* s);
 void  ty_buf_push_byte(SlabArena* arena, Buf* b, char c);
 TyStr* ty_buf_into_str(SlabArena* arena, Buf* b);
+/* Frees a TyStr produced by ty_buf_into_str() from a heap_owned Buf
+ * (ty_buf_new_heap). Do NOT call this on a TyStr from an arena-owned
+ * Buf — that memory belongs to the arena's bump pages, not malloc, and
+ * freeing it here will corrupt the heap. */
+void  ty_str_free_heap(TyStr* s);
 
 int64_t ty_str_len(TyStr* s);
 char    ty_str_byte(TyStr* s, int64_t idx);

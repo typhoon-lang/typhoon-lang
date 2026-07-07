@@ -6,6 +6,34 @@ impl Buf {
     fn toStr(self: Buf) -> Str {
         return ty_buf_into_str(self);
     }
+    fn push_int(self: Buf, n: Int64) {
+        let mut nm = n
+        if nm == 0 as Int64 {
+            ty_buf_push_byte(self, 48 as Int8)
+            return
+        }
+        let neg = nm < 0 as Int64
+        if neg {
+            ty_buf_push_byte(self, 45 as Int8)
+            let v = 0 as Int64 - nm
+            self.__push_int_inner(v)
+        } else {
+            self.__push_int_inner(nm)
+        }
+    }
+    fn push_byte(self: Buf, c: Int8) {
+        ty_buf_push_byte(self, c)
+    }
+    fn __push_int_inner(self: Buf, n: Int64) {
+        let mut nm = n
+        if nm == 0 as Int64 {
+            return
+        }
+        let d = (nm % 10 as Int64) as Int8
+        let rest = nm / 10 as Int64
+        self.__push_int_inner(rest)
+        ty_buf_push_byte(self, d + 48 as Int8)
+    }
 }
 
 extern "C" {

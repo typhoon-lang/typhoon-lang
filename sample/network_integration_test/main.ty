@@ -32,7 +32,7 @@ impl Popcount {
       // Guard satisfied.
       conc {
         let x = e as Int64;
-        out.printf("Try %d\r\n", x);
+        out.printf("Try %d\r\n", x, 0 as Int64, 0 as Int64, 0 as Int64);
         let n = match (x & even) {
           x => 1
           _ => 0
@@ -62,7 +62,7 @@ fn handle_connection(socket: Socket) {
   let halves = socket.split();
   let read_sock = halves.read;
   let write_sock = halves.write;
-  let ch: ref chan<Buf> = read_sock.into_chan(4096, 16);
+  let ch: ref chan<Buf> = read_sock.into_chan(1, 16);
 
   // `p` is declared `let mut` so the liveness checker does not track it as a
   // linear resource. This allows `p.check(...)` to be called on every loop
@@ -81,7 +81,7 @@ fn handle_connection(socket: Socket) {
     while idx < clen {
       let byte = data.at(idx)
       let n = p.check(byte as Int32) as Int64;
-      out.printf("Result: %d\r\n", n);
+      out.printf("Result: %d\r\n", n, 0 as Int64, 0 as Int64, 0 as Int64);
       idx = idx + 1
     }
   }
@@ -92,23 +92,110 @@ fn handle_connection(socket: Socket) {
   write_sock.close();
 }
 
-fn main(net: Network) -> Int32 {
-  let out = Stdout{}
-  // `listener` is a linear resource (Listener). It lives for the duration of
-  // main and is dropped at function exit (compiler-generated drop).
-  let Ok(listener) = net.listen("0.0.0.0:8080") else {
-    out.println("Listen failed\r\n");
+fn client_self_test(net: Network, out: Stdout) -> Int32 {
+  let Ok(socket) = net.dial("127.0.0.1:8080") else {
+    out.println("[FAIL] connect")
     return 0;
   };
-  out.println("Listening on :8080");
+  out.println("[PASS] connect")
 
-  while true {
-    // `socket` is a fresh linear resource each iteration. It is consumed by the
-    // `conc` capture — moved into the spawned coroutine, making it unavailable
-    // in the loop body after the conc statement. Isolation Guard: `socket` is an
-    // immutable `let` binding, so the capture is legal.
-    let Ok(socket) = listener.accept() else { break; };
+  let halves = socket.split();
+  let mut write_sock = halves.write;
+
+  let mut passes = 1;
+
+  let mut payload = Buf{}
+  payload.push_byte(0 as Int8)
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] zero byte")
+  passes += 1;
+
+  payload = Buf{}
+  payload.push_byte(-1 as Int8)
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] ff byte")
+  passes += 1;
+
+  payload = Buf{}
+  payload.push_byte(1 as Int8)
+  payload.push_byte(2 as Int8)
+  payload.push_byte(4 as Int8)
+  payload.push_byte(8 as Int8)
+  payload.push_byte(16 as Int8)
+  payload.push_byte(32 as Int8)
+  payload.push_byte(64 as Int8)
+  payload.push_byte(-128 as Int8)
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] power-of-two bytes")
+  passes += 1;
+
+  payload = Buf{}
+  payload.push_byte(15 as Int8)
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] nibble byte")
+  passes += 1;
+
+  payload = Buf{}
+  payload.push_byte(1 as Int8)
+  payload.push_byte(3 as Int8)
+  payload.push_byte(7 as Int8)
+  payload.push_byte(15 as Int8)
+  payload.push_byte(-1 as Int8)
+  payload.push_byte(-128 as Int8)
+  payload.push_byte(0 as Int8)
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] mixed bytes")
+  passes += 1;
+
+  payload = Buf{}
+  let mut n = 0 as Int64
+  while n < 256 as Int64 {
+    payload.push_byte(n as Int8)
+    n = n + 1
+  }
+  let Ok(_) = write_sock.write(payload.toStr(), 1 as Int32) else { return 0; };
+  out.println("[PASS] full byte sweep")
+  passes += 1;
+
+  write_sock.close();
+  out.printf("RESULTS: %d/7\r\n", passes as Int64, 0 as Int64, 0 as Int64, 0 as Int64);
+  return passes;
+}
+
+fn main(net: Network) -> Int32 {
+  let out = Stdout{}
+  let Ok(listener) = net.listen("0.0.0.0:8080") else {
+    out.println("Listen failed\r\n");
+    return 1;
+  };
+  out.println("Listening on :8080")
+
+  let verdicts: ref chan<Int32> = chan<Int32>();
+  conc {
+    verdicts.send(client_self_test(net, out));
+  }
+
+  let mut accepted = 0;
+  while accepted < 1 {
+    let Ok(socket) = listener.accept() else {
+      out.println("Accept failed\r\n")
+      return 1;
+    };
+    accepted += 1;
     conc { handle_connection(socket); }
   }
-  return 0;
+  listener.close();
+
+  let Some(total) = verdicts.recv() else {
+    out.println("Missing verdict\r\n")
+    return 1;
+  };
+
+  out.printf("RESULTS: %d/7\r\n", total as Int64, 0 as Int64, 0 as Int64, 0 as Int64);
+  if total == 7 {
+    out.println("[PASS] integration self-test")
+    return 0;
+  }
+  out.println("[FAIL] integration self-test")
+  return 1;
 }

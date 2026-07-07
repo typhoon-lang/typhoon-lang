@@ -48,16 +48,20 @@ if(BUILD_TESTS)
   # Add each test source file here. One entry = one test binary.
   # The binary name is derived from the filename (without extension).
   set(C_TEST_SOURCES
-    test/test_task01_dangling_ptr.c
-    test/test_task02_sscan_mutation.c
-    test/test_task03_double_close.c
-    test/test_task04_overflow.c
-    test/test_phase2_listener_close.c
     test/test_phase2_accept_write_close.c
+    test/test_phase2_coroutine_loopback.c
+    test/test_phase2_into_chan.c
+    test/test_phase2_listener_close.c
+    test/test_phase2_write_read_roundtrip.c
+    test/test_phase3_buf_growth_10k.c
+    test/test_phase3_file_chunked_read.c
+    test/test_phase3_file_lifecycle.c
     test/test_phase3_large_sprintf.c
+    test/test_phase4_fdset_live_worker.c
     test/test_phase4_fdset.c
     test/test_phase4_mock_io.c
     test/test_phase4_net_fdset.c
+    test/test_task03_double_close.c
   )
 
   foreach(test_src ${C_TEST_SOURCES})

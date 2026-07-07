@@ -1,10 +1,33 @@
 /*
  * ty_io_kqueue.c — macOS kqueue backend for Typhoon IO
  *
- * One kqueue fd per scheduler worker thread.
- * submit() registers EVFILT_READ/EVFILT_WRITE with EV_ONESHOT + udata=op.
- * poll() calls kevent64 with zero timeout, then performs the actual
- * read()/write()/accept() syscall (kqueue is readiness-based), and wakes the coro.
+ * REWRITTEN: single shared kqueue fd for the whole process, not one per
+ * scheduler worker thread. This is the direct macOS translation of the
+ * shared-reactor pattern Go's netpoller and Tokio's mio reactor both
+ * use — kevent() is explicitly documented as safe for concurrent calls
+ * from multiple threads against the same kq fd, so this is the natural
+ * fit, not a workaround.
+ *
+ * Why this changed from one-kq-per-worker: with a private kq per
+ * worker, an op registered by whichever worker happened to call
+ * submit() could only ever be seen by that SAME worker's own poll()
+ * loop. A coroutine that submitted a read and then got stolen to a
+ * different worker (completely normal, expected work-stealing) left
+ * its readiness event sitting unseen in its *original* worker's kq
+ * until that worker got back around to polling — a latency/fairness
+ * gap, not a hard failure the way the equivalent bug was on Windows
+ * (see ty_io_iocp.c's rewrite), but a real gap all the same, present
+ * on every op that outlives a steal.
+ *
+ * submit() registers EVFILT_READ/EVFILT_WRITE with EV_ONESHOT + udata=op
+ * against the one shared kq. poll() calls kevent64 with zero timeout,
+ * then performs the actual read()/write()/accept() syscall (kqueue is
+ * readiness-based, not completion-based), and wakes the coro. Whichever
+ * worker happens to call poll() next picks up whatever's ready,
+ * regardless of which worker originally submitted it — the kernel's
+ * own readiness delivery does the work-stealing-equivalent distribution
+ * for us, so nothing else in this file needed to change to get that
+ * property.
  */
 
 #ifdef __APPLE__
@@ -21,10 +44,15 @@
 #include "ty_io_kqueue.h"
 #include "io_driver.h"
 #include "atomic.h"
+#include "platform.h" /* TyMutex — guards the singleton create/destroy path */
 
 #define MAX_EVENTS 64
 
-/* Pending request pool — same pattern as io_driver.c */
+/* Pending request pool — already process-global before this rewrite,
+ * not per-worker, so no change needed here at all. Every in-flight op
+ * (read/write/accept alike) gets a slot from this single pool
+ * regardless of which worker submitted it or which worker's poll()
+ * eventually drains its completion. */
 #define POOL_CAP 256
 
 typedef struct {
@@ -72,6 +100,9 @@ static int kq_submit(TyIoBackend* base, const TyIoOp* op) {
     ev.flags = EV_ADD | EV_ENABLE | EV_ONESHOT;
     ev.udata = (uint64_t)(uintptr_t)req;
 
+    /* b->kq is now the one shared fd every worker submits against —
+     * kevent64() is documented safe for concurrent multi-thread use on
+     * the same kq, no locking needed here unlike io_uring's SQ ring. */
     int n = kevent64(b->kq, &ev, 1, NULL, 0, 0, NULL);
     if (n < 0) {
         pool_free(req);
@@ -88,6 +119,11 @@ static int kq_poll(TyIoBackend* base, TySchedWakeFn wake) {
 
     struct kevent64_s events[MAX_EVENTS];
     struct timespec ts = { 0, 0 }; /* zero timeout — non-blocking */
+    /* Whichever worker calls this next drains whatever's ready on the
+     * shared kq, regardless of which worker originally submitted it —
+     * this is the actual fix. kevent64() itself handles safely handing
+     * out ready events to concurrent callers; no additional
+     * synchronization needed on this side either. */
     int n = kevent64(b->kq, NULL, 0, events, MAX_EVENTS, 0, &ts);
     if (n <= 0) return 0;
 
@@ -137,32 +173,114 @@ static int kq_poll(TyIoBackend* base, TySchedWakeFn wake) {
     return n;
 }
 
-/* ── lifecycle ────────────────────────────────────────────────────────────── */
+/* ── shared singleton kq fd ──────────────────────────────────────────────
+ *
+ * Every worker calls ty_kq_backend_new() once during its own startup
+ * (unchanged call site — the scheduler doesn't need to know this became
+ * a singleton). First caller actually creates the kqueue fd; every
+ * caller after that gets the SAME TyKqBackend* back and a bumped
+ * refcount. ty_kq_backend_destroy() only actually closes the fd once
+ * every worker that got a reference has released it.
+ *
+ * Double-checked locking under g_lock: cheap fast path once created
+ * (a single atomic load), only ever contends during the brief startup
+ * window while workers are spinning up.
+ * ────────────────────────────────────────────────────────────────────── */
+
+static TyMutex g_lock;
+static TyKqBackend* g_backend = NULL;
+static int g_refcount = 0;
+
+/* Guards first-ever init of g_lock itself. A plain int flag here would
+ * be a genuine data race if two threads ever called
+ * ty_kq_backend_new() for the first time concurrently — both could see
+ * "not yet initialized" and both call ty_mutex_init() on the same
+ * TyMutex simultaneously, which is undefined behavior. The current
+ * scheduler.c happens to call this from a single serial loop on the
+ * main thread during ty_sched_init(), not concurrently from each
+ * worker's own thread, so this race isn't live against today's actual
+ * caller — but a singleton's whole point is to be correct regardless
+ * of caller pattern, not to quietly depend on that. CAS-based
+ * once-guard instead: exactly one thread wins the race to actually
+ * call ty_mutex_init(); everyone else spins on the state flag until
+ * it's ready, rather than racing the init call itself. Same atomic
+ * style already used by this file's own KqPending pool above. */
+static _Atomic(int) g_lock_state = 0; /* 0=uninit, 1=initializing, 2=ready */
+
+static void ensure_lock_inited(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_lock_state, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        ty_mutex_init(&g_lock);
+        atomic_store_explicit(&g_lock_state, 2, memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&g_lock_state, memory_order_acquire) != 2) {
+        /* busy-wait — this window is one mutex_init() call, contended
+         * only during the brief process-startup race, if ever. */
+    }
+}
 
 TyKqBackend* ty_kq_backend_new(void) {
+    ensure_lock_inited();
+    ty_mutex_lock(&g_lock);
+
+    if (g_backend) {
+        g_refcount++;
+        ty_mutex_unlock(&g_lock);
+        return g_backend;
+    }
+
     TyKqBackend* b = (TyKqBackend*)malloc(sizeof(TyKqBackend));
-    if (!b) return NULL;
+    if (!b) {
+        ty_mutex_unlock(&g_lock);
+        return NULL;
+    }
     memset(b, 0, sizeof(*b));
 
     b->kq = kqueue();
     if (b->kq < 0) {
         free(b);
+        ty_mutex_unlock(&g_lock);
         return NULL;
     }
 
     b->base.impl = b;
     b->base.submit = kq_submit;
     b->base.poll = kq_poll;
+
+    g_backend = b;
+    g_refcount = 1;
+    ty_mutex_unlock(&g_lock);
     return b;
 }
 
 void ty_kq_backend_destroy(TyKqBackend* b) {
     if (!b) return;
+    ensure_lock_inited();
+    ty_mutex_lock(&g_lock);
+
+    if (b != g_backend) {
+        /* Not the singleton — shouldn't happen given every caller gets
+         * the same pointer back from ty_kq_backend_new(), but fail
+         * safe rather than double-free something unexpected. */
+        ty_mutex_unlock(&g_lock);
+        return;
+    }
+
+    g_refcount--;
+    if (g_refcount > 0) {
+        ty_mutex_unlock(&g_lock);
+        return; /* other workers still holding a reference */
+    }
+
     if (b->kq >= 0) {
         close(b->kq);
         b->kq = -1;
     }
     free(b);
+    g_backend = NULL;
+    ty_mutex_unlock(&g_lock);
 }
 
 #endif /* __APPLE__ */

@@ -1,0 +1,108 @@
+namespace std::io
+
+struct Stdin {}
+extern "C" {
+  fn ty_stdin_new() -> Stdin
+  fn ty_str_len(s: Str) -> Int64
+  fn ty_str_byte(s: Str, idx: Int64) -> Int8
+  fn ty_stdin_read_line(self: Stdin) -> Str
+}
+
+impl Stdin {
+  /* Reads the next line from stdin, without the trailing newline.
+   * KNOWN LIMITATION: returns "" both at end-of-stream and for a
+   * genuine blank line — see ty_stdin_read_line's comment in ty_io.c.
+   * Buffered underneath: safe to call repeatedly, handles a line split
+   * across reads or several lines arriving in one read correctly. */
+  fn read_line(self) -> Str {
+    return ty_stdin_read_line(self)
+  }
+}
+
+impl Str {
+  fn parse_int(self) -> Int64 {
+    let mut text = self
+    let mut i = 0 as Int64
+    while i < ty_str_len(text) {
+      if self.__is_space(ty_str_byte(text, i)) == 1 as Int8 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    let mut neg = 0 as Int8
+    if i < ty_str_len(text) {
+      if ty_str_byte(text, i) == 45 as Int8 {
+        neg = 1 as Int8
+        i = i + 1
+      }
+    }
+    let mut n = 0 as Int64
+    let mut scanning = 1 as Int8
+    while i < ty_str_len(text) {
+      if scanning == 1 as Int8 {
+        if self.__is_digit(ty_str_byte(text, i)) == 1 as Int8 {
+          n = n * 10 as Int64 + (ty_str_byte(text, i) - 48 as Int8) as Int64
+          i = i + 1
+        } else {
+          scanning = 0 as Int8
+        }
+      } else {
+        i = ty_str_len(text)
+      }
+    }
+    if neg == 1 as Int8 {
+      return 0 as Int64 - n
+    }
+    return n
+  }
+
+  fn parse_word(self, start: Int64) -> Str {
+    let mut text = self
+    let mut i = start
+    while i < ty_str_len(text) {
+      if self.__is_space(ty_str_byte(text, i)) == 1 as Int8 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    let mut tok = ty_buf_new()
+    let mut j = i
+    let mut scanning = 1 as Int8
+    while j < ty_str_len(text) {
+      if scanning == 1 as Int8 {
+        if self.__is_space(ty_str_byte(text, j)) == 1 as Int8 {
+          scanning = 0 as Int8
+        } else {
+          ty_buf_push_byte(tok, ty_str_byte(text, j))
+          j = j + 1
+        }
+      } else {
+        j = ty_str_len(text)
+      }
+    }
+    return ty_buf_into_str(tok)
+  }
+
+  fn __is_space(self, c: Int8) -> Int8 {
+    let mut is_sp = 0 as Int8
+    if c == 32 as Int8 {
+      is_sp = 1 as Int8
+    }
+    if c == 9 as Int8 {
+      is_sp = 1 as Int8
+    }
+    return is_sp
+  }
+
+  fn __is_digit(self, c: Int8) -> Int8 {
+    let mut is_d = 0 as Int8
+    if c >= 48 as Int8 {
+      if c <= 57 as Int8 {
+        is_d = 1 as Int8
+      }
+    }
+    return is_d
+  }
+}

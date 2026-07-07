@@ -193,10 +193,12 @@ TyNetwork* ty_net_global(void) {
     return &g_net;
 }
 
-static int split_host_port(TyStr* addr, char** host_out, char** port_out) {
+#define TY_NET_HOST_BUF_CAP 256
+
+static int split_host_port(TyStr* addr, char* host_buf, char** port_out) {
     if (!addr || !addr->ptr || addr->len <= 0) return 0;
 
-    /* Find the last ':' within [0, addr->len) explicitly — NOT strrchr,
+    /* Find the last ':' within [0, addr->len) explicitly -- NOT strrchr,
      * which scans for a null terminator Str no longer guarantees in
      * general (it's a fat pointer with an explicit length now, not a
      * null-terminated C string). This was the actual bug behind
@@ -213,21 +215,36 @@ static int split_host_port(TyStr* addr, char** host_out, char** port_out) {
     int32_t port_len = addr->len - colon - 1;
     if (port_len <= 0) return 0;
 
-    char* host = (char*)malloc((size_t)host_len + 1);
-    if (!host) return 0;
-    memcpy(host, addr->ptr, (size_t)host_len);
-    host[host_len] = '\0';
+    /* host_buf is owned by the CALLER (a fixed-size stack array declared
+     * in listen(), TY_NET_HOST_BUF_CAP bytes) -- this function only writes
+     * into it, it doesn't own or return a pointer to any buffer of its
+     * own. Returning a pointer to a *local* buffer here would dangle
+     * the instant this call returns; that was caught before it shipped.
+     *
+     * Not malloc'd or arena-allocated either, per Phase 3 DoD ("no
+     * malloc in ty_net.c"): host never needs to outlive one call to
+     * listen(), so a plain caller-owned stack buffer is sufficient and
+     * avoids both the malloc violation and the task-validity problem
+     * arena allocation hit here (task is not guaranteed to be a valid
+     * SlabArena* at listen()'s call site -- tried that first, it crashed
+     * every net test with STATUS_BREAKPOINT via slab_alloc_sized's
+     * `if (!arena) ty_abort()` guard).
+     *
+     * TY_NET_HOST_BUF_CAP (256) covers any realistic hostname (DNS max
+     * is 253) or IPv6 literal with room to spare; reject anything
+     * longer rather than silently truncating. */
+    if (host_len >= TY_NET_HOST_BUF_CAP) return 0;
+    memcpy(host_buf, addr->ptr, (size_t)host_len);
+    host_buf[host_len] = '\0';
 
-    /* port_out points directly into addr->ptr, not a separate copy —
-     * matches the original (pre-fat-pointer) behavior and its existing
-     * free() pairing (port is never freed by any caller). Relies on the
+    /* port_out points directly into addr->ptr, not a separate copy --
+     * matches the original (pre-fat-pointer) behavior. Relies on the
      * same trailing-'\0' invariant used in ty_io.c's fs::open: every
      * current Str-producing path (codegen.rs's emit_string for literals,
      * ty_buf_into_str) keeps one byte past len as '\0', so the substring
      * starting after the colon is still validly null-terminated. Breaks
      * silently if Str slicing is ever added and can produce a view that
      * doesn't end at the original buffer's terminator. */
-    *host_out = host;
     *port_out = addr->ptr + colon + 1;
     return 1;
 }
@@ -257,9 +274,9 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult
 
     TY_DEBUG("[net] listen enter addr_ptr=%p out_ptr=%p\n", (void*)addr, &result);
 
-    char* host = NULL;
+    char host[TY_NET_HOST_BUF_CAP];
     char* port = NULL;
-    if (!split_host_port(addr, &host, &port)) {
+    if (!split_host_port(addr, host, &port)) {
         result.err = -2;
         /* %.*s with an explicit length, not %s — addr->ptr has no
          * null-termination guarantee to stop at in general (see
@@ -291,7 +308,7 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult
     struct addrinfo* res = NULL;
     int gai = getaddrinfo((host[0] == '\0') ? NULL : host, port, &hints, &res);
     if (gai != 0 || !res) {
-        free(host);
+        /* host is a caller-owned stack array (see split_host_port) — no free here. */
         result.err = (int32_t)gai;
 #if defined(_WIN32)
         TY_DEBUG("[net] listen getaddrinfo failed addr=\"%s\" gai=%d (%s)\n",
@@ -368,7 +385,7 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult
     }
 
     freeaddrinfo(res);
-    free(host);
+    /* host is a caller-owned stack array (see split_host_port) — no free here. */
 
 #if defined(_WIN32)
     if (s == INVALID_SOCKET) {
@@ -409,6 +426,102 @@ void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult
 
     result.tag = 0;
     result.value = listener;
+    result.err = 0;
+    *out = result;
+}
+
+void __ty_rt__Network__dial(void* task, TyNetwork* self, TyStr* addr, TyResult_Socket_i32* out) {
+    (void)task;
+    (void)self;
+
+    TyResult_Socket_i32 result;
+    result.tag = 1;
+    result.value = NULL;
+    result.err = -1;
+
+    char host[TY_NET_HOST_BUF_CAP];
+    char* port = NULL;
+    if (!split_host_port(addr, host, &port)) {
+        result.err = -2;
+        *out = result;
+        return;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = 0;
+
+    struct addrinfo* res = NULL;
+    int gai = getaddrinfo((host[0] == '\0') ? NULL : host, port, &hints, &res);
+    if (gai != 0 || !res) {
+        result.err = (int32_t)gai;
+        *out = result;
+        return;
+    }
+
+    ty_sock_t s = (ty_sock_t)(-1);
+    int32_t last_err = 0;
+    struct addrinfo* it = res;
+    for (; it; it = it->ai_next) {
+#if defined(_WIN32)
+        s = (ty_sock_t)WSASocketW(it->ai_family, it->ai_socktype, it->ai_protocol, NULL, 0, WSA_FLAG_OVERLAPPED);
+#else
+        s = (ty_sock_t)socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+#endif
+#if defined(_WIN32)
+        if (s == INVALID_SOCKET) { last_err = ty_net_last_error(); continue; }
+#else
+        if (s < 0) { last_err = ty_net_last_error(); continue; }
+#endif
+
+        if (connect(s, it->ai_addr, (socklen_t)it->ai_addrlen) != 0) {
+            last_err = ty_net_last_error();
+            ty_sock_close(s);
+            s = (ty_sock_t)(-1);
+            continue;
+        }
+
+        ty_sock_set_nonblock(s);
+        break;
+    }
+
+    freeaddrinfo(res);
+
+#if defined(_WIN32)
+    if (s == INVALID_SOCKET) {
+        result.err = last_err ? last_err : ty_net_last_error();
+        *out = result;
+        return;
+    }
+#else
+    if (s < 0) {
+        result.err = last_err ? last_err : ty_net_last_error();
+        *out = result;
+        return;
+    }
+#endif
+
+    TySocket* sock = g_socket_pool_alloc();
+    if (!sock) {
+        ty_sock_close(s);
+        result.err = -3;
+        *out = result;
+        return;
+    }
+    sock->sock = s;
+    sock->closed = 0;
+    sock->half_count = 1;
+
+    Worker* w = ty_sched_current_worker();
+    if (w) {
+        ty_fdset_add(&w->fd_set, (ty_fd_t)s);
+    }
+
+    result.tag = 0;
+    result.value = sock;
     result.err = 0;
     *out = result;
 }
@@ -627,6 +740,17 @@ typedef struct {
     TyReadSocket* rs;
     struct TyChan* chan;
     int64_t chunk_size;
+    /* Chunks are allocated via ty_buf_new_heap (plain malloc, not tied
+     * to any SlabArena) — see ty_mem.h's Buf.heap_owned comment. This
+     * used to carry the caller's arena for chunk allocation, on the
+     * theory that the caller's arena outlives the reader coroutine. It
+     * does, but that fix traded a use-after-free for a data race: the
+     * caller's arena has no locking (SlabArena is single-owner by
+     * design), and the reader coroutine can run on a different OS
+     * worker thread than the caller, so both ends could mutate the same
+     * arena's bump pointer / free lists concurrently. Neither
+     * coroutine's arena is a safe home for data crossing between them;
+     * malloc is. */
 } TyIntoChanCtx;
 
 /* Same cross-thread alloc/free pattern as Socket/Listener: ctx is built on
@@ -641,29 +765,57 @@ static void ty_read_into_chan_coro(void* task, void* arg) {
     int64_t chunk_size = ctx->chunk_size;
     g_intochan_ctx_pool_free(ctx);
 
+    /* arena = reader's own spawn-created arena — fine for temporary
+     * things like op submission and ty_chan_send's own internal
+     * bookkeeping (only this coroutine ever touches it), but chunk
+     * *data* must not live here — see ty_buf_new_heap below. */
     SlabArena* arena = (SlabArena*)task;
 
     for (;;) {
         TySocket* sock = rs ? rs->sock : NULL;
         ty_sock_t fd = sock ? sock->sock : TY_SOCK_INVALID;
-
         if (fd == TY_SOCK_INVALID)
             break; /* socket was closed externally */
 
-        /* Read straight into a Buf sized exactly to chunk_size — one
-         * allocation, one copy (kernel into buffer). No intermediate
-         * raw buffer, no size-class rounding. */
-        Buf* chunk = ty_buf_new_sized(arena, chunk_size);
-        if (!chunk) break; /* OOM on slab (rare) */
+        /* Heap-allocated, not arena-allocated: this Buf crosses to a
+         * different coroutine (whoever drains the channel), which the
+         * scheduler can run on a different OS worker thread. Neither
+         * this reader's arena nor the consumer's arena is a safe home
+         * for it without locking SlabArena doesn't have — see
+         * ty_mem.h's Buf.heap_owned comment for the full story. */
+        Buf* chunk = ty_buf_new_heap(chunk_size);
+        if (!chunk) break; /* OOM */
 
         int64_t got = 0;
-        void* drv = ty_io_global_driver();
         void* coro = ty_current_coro_raw();
-        if (drv && coro) {
-            /* async path: submit via driver and park until completion */
-            ty_io_read(drv, arena, coro, fd, (uint8_t*)chunk->data, (size_t)chunk_size);
+        if (coro) {
+            /* Submit via the per-worker backend path (which now parks
+             * the coroutine internally before returning). Previously
+             * this called ty_io_read() — the global-driver-only path —
+             * which had a fatal flaw when the test didn't call
+             * ty_io_subsystem_init(): the global driver was uninitialized,
+             * so do_submit_or_sync's blocking fallback would recv() on
+             * a non-blocking socket and (a) deadlock the worker thread
+             * waiting for data that only another coroutine on the same
+             * worker could send, or (b) on first poll hit EAGAIN and
+             * bail out before any chunk reached the channel.
+             *
+             * ty_io_submit uses the per-worker backend (IOCP / io_uring
+             * / kqueue) which DOES have its own poll/dispatch and parks
+             * correctly regardless of whether ty_io_subsystem_init was
+             * called — the per-worker backend is set up by
+             * ty_sched_init, not ty_io_subsystem_init. */
+            TyIoOp op;
+            memset(&op, 0, sizeof(op));
+            op.type = TY_IO_OP_READ;
+            op.fd = fd;
+            op.buf = chunk->data;
+            op.len = (size_t)chunk_size;
+            op.coro = coro;
+            ty_io_submit(&op);
             got = ty_io_take_result(coro);
         } else {
+            /* bare-main fallback: blocking recv */
 #if defined(_WIN32)
             int n = recv((SOCKET)fd, chunk->data, (int)chunk_size, 0);
             got = (int64_t)n;
@@ -674,7 +826,9 @@ static void ty_read_into_chan_coro(void* task, void* arg) {
 #endif
         }
 
-        if (got <= 0) break; /* EOF or error */
+        if (got <= 0) {
+            break; /* EOF or error */
+        }
 
         chunk->len = got;
         chunk->data[got] = '\0';
@@ -949,7 +1103,11 @@ void __ty_rt__Socket__read(void* task, TySocket* self, char* buf, int32_t cap, T
     void* coro = ty_current_coro_raw();
 
     if (coro) {
-        /* Submit via TyIoOp — the canonical Phase 4 path. */
+        /* Submit via TyIoOp — the canonical Phase 4 path.
+         *
+         * ty_io_submit now always parks the coroutine before returning
+         * (the per-worker backend path used to return without parking,
+         * but that bug is now fixed in ty_io_backend.c). */
         TyIoOp op;
         memset(&op, 0, sizeof(op));
         op.type = TY_IO_OP_READ;

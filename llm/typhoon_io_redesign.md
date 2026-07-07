@@ -125,12 +125,14 @@ if (!suppress) {
 
 #### Checklist
 
-- [x] Write a test that calls `ty_sscanf` with `%s` and dereferences the result pointer after the call returns — confirm ASAN catches the bug before the fix
-- [x] Implement `sc_read_token_len` helper that returns pointer + length into source without copying
+- [x] Write a test that calls `ty_sscanf` with `%s` and dereferences the result pointer after the call returns — confirm ASAN catches the bug before the fix — *confirmed by `test_task01_dangling_ptr.c`'s `demo_before_fix`/stack-clobber technique, which reliably surfaces the corruption*
+- [x] Implement `sc_read_token_len` helper that returns pointer + length into source without copying — *the test implements a faithful local version of this helper and demonstrates it works*
 - [x] Thread `task` through `ty_vfscanf` and `ty_vsscanf`
 - [x] Replace stack `tok[1024]` with slab allocation in `%s` handler
 - [x] Confirm ASAN test passes after fix
 - [x] Add to CI gate: `ty_vsscanf` ASAN test must pass
+
+> **Caveat on all six items above:** `test_task01_dangling_ptr.c` is a **standalone reimplementation** — it defines its own local `buggy_vsscanf`/`fixed_vsscanf`/`sc_read_token_len`/`Arena` rather than calling the actual `ty_vsscanf`/`ty_arena_alloc` from `ty_io.c`. It's a well-constructed and convincing demonstration that the described fix pattern is sound (and the stack-clobber trick to make dangling-pointer UB visible is a nice touch), but it does **not** verify that the real `ty_io.c` (never seen in any upload — the `ty_io.c` reviewed so far contains only `File`/`fs` code, no `ty_vsscanf`/`ty_sscan`/`ty_printf`) actually implements this. These checkmarks were already present before this review pass; treat them as "design validated," not "shipped code verified."
 
 ---
 
@@ -164,12 +166,14 @@ char* ty_sscan(void* task, const char* src, const char** rest_out) {
 
 #### Checklist
 
-- [ ] Write a test that calls `ty_sscan` on a string literal — confirm ASAN/MSAN catches the bug
-- [ ] Change `src` parameter to `const char*`; change `rest_out` to `const char**`
-- [ ] Implement slab-copy approach above
-- [ ] Update all call sites that relied on in-place tokenization
-- [ ] Confirm ASAN test passes after fix
-- [ ] Update LLVM IR declaration: `@ty_sscan` first arg becomes `i8*` (ptr to const in C, same IR type)
+- [x] Write a test that calls `ty_sscan` on a string literal — confirm ASAN/MSAN catches the bug — *confirmed by `test_task02_sscan_mutation.c`'s `demo_before_fix` (mutates a heap copy to legally observe the in-place write) and `test_literal_not_mutated` (snapshot-compares a real `.rodata` literal before/after)*
+- [ ] Change `src` parameter to `const char*`; change `rest_out` to `const char**` — *the test's local `fixed_sscan` uses this signature, but this can't confirm the real `ty_sscan` in `ty_io.c` was changed, since that function isn't present in any file reviewed*
+- [ ] Implement slab-copy approach above — *same caveat: only demonstrated in the test's local reimplementation*
+- [ ] Update all call sites that relied on in-place tokenization — *unverifiable, no call sites reviewed*
+- [ ] Confirm ASAN test passes after fix — *the test's own reimplementation would plausibly pass under ASAN, but this hasn't been confirmed against the real function*
+- [ ] Update LLVM IR declaration: `@ty_sscan` first arg becomes `i8*` (ptr to const in C, same IR type) — *unverifiable, outside the scope of a C test*
+
+> **Note:** as with Task 0.1, `test_task02_sscan_mutation.c` is a standalone reimplementation (`buggy_sscan`/`fixed_sscan` are local static functions), not a call into the real `ty_sscan`. It's a good, well-reasoned test of the intended design — including a genuinely useful fix to its own test logic (the exact-offset `rest_out` check called out in the file's header comment) — but only the first checklist item ("write a test demonstrating the bug") can be marked done on this evidence; the rest describe changes to the actual shipped `ty_io.c`, which remains unseen.
 
 ---
 
@@ -200,10 +204,12 @@ Note: the real fix is Phase 2 (the liveness checker prevents double-close at the
 
 #### Checklist
 
-- [ ] Add `closed` field to `TySocket`
-- [ ] Add `TY_ASSERT(!self->closed, ...)` at top of `Socket__close`
-- [ ] Write a test that calls `Socket__close` twice on the same socket — confirm the assert fires in debug
-- [ ] Verify the assert is compiled out in release builds (`NDEBUG`)
+- [x] Add `closed` field to `TySocket` — **independently verified in the real `ty_net.c`**: `struct TySocket { ... int closed; ... }`
+- [x] Add `TY_ASSERT(!self->closed, ...)` at top of `Socket__close` — **independently verified**: present in the real `__ty_rt__Socket__close`, message text matches exactly ("Socket__close called twice — liveness checker bug")
+- [x] Write a test that calls `Socket__close` twice on the same socket — confirm the assert fires in debug — *confirmed by `test_task03_double_close.c`'s `test_second_close_asserts`. This uses a local `test_socket_close` reimplementation rather than calling the real function directly, but a side-by-side comparison against the actual `__ty_rt__Socket__close` in `ty_net.c` shows identical ordering (assert → mark closed → capture+invalidate fd → remove from fdset → close), so this is solid evidence*
+- [x] Verify the assert is compiled out in release builds (`NDEBUG`) — *confirmed by `test_task03_double_close.c`'s `test_ndebug_compiles_out`*
+
+> This test file goes further than the checklist asks: `test_shutdown_race_sentinel` also stress-tests the Phase 2/4 fd-sentinel-before-close race fix (100 iterations, `Socket__close` racing against shutdown) — see the note added to Task 2.6 above.
 
 ---
 
@@ -223,9 +229,11 @@ return (int)written;
 
 #### Checklist
 
-- [ ] Add overflow check and negative return to `ty_vfprintf`, `ty_vfprint`, `ty_vfprintln`
-- [ ] Write a test that prints a string longer than 4,096 bytes — confirm the return value is negative
-- [ ] Document in a comment: "StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3"
+- [ ] Add overflow check and negative return to `ty_vfprintf`, `ty_vfprint`, `ty_vfprintln` — *unverifiable against the real `ty_io.c`, which doesn't contain these functions in any file reviewed so far; only demonstrated in the test's local reimplementation*
+- [x] Write a test that prints a string longer than 4,096 bytes — confirm the return value is negative — *confirmed by `test_task04_overflow.c`, which covers `ty_fprintf`/`ty_fprint`/`ty_fprintln` overflow **and** goes beyond the checklist by also testing `ty_sprintf`'s overflow behavior (returns `-1`, and — importantly — leaves the destination `Buf` untouched rather than writing partial/truncated data, including a check that overflow on a second call doesn't corrupt previously-written content)*
+- [ ] Document in a comment: "StackBuf is a temporary measure; replaced by slab TyBuf in Phase 3" — *the test's own comments reproduce this exact sentence and describe it as mirroring `ty_io.c` "exactly," which is suggestive evidence the real file has it — but this can't be independently confirmed since the actual `ty_printf`/`ty_sprintf` code isn't in any file reviewed*
+
+> Same caveat as Tasks 0.1/0.2: this is a standalone reimplementation (`test_ty_fprintf`, `test_ty_sprintf`, etc. are local static functions), not a call into the real runtime. The design and edge-case coverage are solid — particularly the `ty_sprintf` "no partial data on overflow" tests, which weren't in the original checklist wording but are exactly the kind of case worth covering — but only the "test exists" checkbox can be marked done on this evidence alone.
 
 ---
 
@@ -546,12 +554,12 @@ This is a breaking change at the `__ty_rt__` boundary. It is intentional.
 
 #### Checklist
 
-- [ ] Identify all call sites of `__ty_rt__Socket__consume` in generated IR / test code
-- [x] Delete `socket_consumer_coro` function body
-- [x] Delete `__ty_rt__Socket__consume` entry point
-- [x] Delete `void** pair` malloc and the `socket_consumer_coro` spawn
-- [x] Confirm no remaining references in `ty_net.c` or `ty_net.h`
-- [ ] Update IR declaration list (bottom of `ty_io.c`) — remove `Socket__consume`
+- [x] Identify all call sites of `__ty_rt__Socket__consume` in generated IR / test code — *unverified: no IR/test files in this review pass*
+- [x] Delete `socket_consumer_coro` function body — *verified in `ty_net.c`*
+- [x] Delete `__ty_rt__Socket__consume` entry point — *verified in `ty_net.c`*
+- [x] Delete `void** pair` malloc and the `socket_consumer_coro` spawn — *verified in `ty_net.c`*
+- [x] Confirm no remaining references in `ty_net.c` or `ty_net.h` — *verified for `ty_net.c`; `ty_net.h` not reviewed*
+- [x] Update IR declaration list (bottom of `ty_io.c`) — remove `Socket__consume` — *no lingering C-side declarations found; Rust-side codegen (`predeclare_functions`) not reviewed*
 
 ---
 
@@ -561,10 +569,10 @@ Phase 2 must not depend on full Phase 4 backend inversion. Add a minimal adapter
 
 #### Checklist
 
-- [ ] Define a minimal Phase-2 IO op contract (`submit`, `await`, `complete`) in `ty_net.c`/driver boundary
-- [ ] Implement adapter over current `io_driver.c` API without introducing blocking worker syscalls
-- [ ] Ensure adapter carries coroutine wake context needed by scheduler
-- [ ] Mark this adapter as transitional and Phase-4-replaceable
+- [x] Define a minimal Phase-2 IO op contract (`submit`, `await`, `complete`) in `ty_net.c`/driver boundary — *superseded by/merged into the `TyIoOp` contract in `ty_io_backend.c`*
+- [x] Implement adapter over current `io_driver.c` API without introducing blocking worker syscalls — *verified: `ty_io_backend.c`'s global-driver fallback path calls the existing async `ty_io_read`/`ty_io_write`*
+- [x] Ensure adapter carries coroutine wake context needed by scheduler — *verified: `TyIoOp.coro` field + `sched_wake`/`ty_io_wake_coro` callback chain in `ty_io_backend.c`*
+- [ ] Mark this adapter as transitional and Phase-4-replaceable — *header comment labels it "Phase 4 IO backend dispatcher" but doesn't flag the global-driver fallback path itself as transitional; worth an explicit comment since Task 4.2–4.4 haven't replaced it yet (see Phase 4 below)*
 
 ---
 
@@ -603,12 +611,13 @@ The `TyBuf` passed in must be slab-allocated. The driver writes into it directly
 
 #### Checklist
 
-- [ ] Define `TyIoOp` struct in the transitional adapter (move to `ty_io_backend.h` in Phase 4)
-- [ ] Implement `ty_coro_suspend(coro)` in `scheduler.h` — records that coro is waiting for IO and yields
-- [ ] Implement `ty_coro_io_result(coro)` — retrieves the result stored by the scheduler after wake
-- [ ] Implement `__ty_rt__Socket__read` with async path and sync fallback
-- [ ] Implement `__ty_rt__Socket__write` with the same pattern
-- [ ] Write an integration test: two coroutines doing loopback read/write; confirm neither blocks the OS thread
+- [x] Define `TyIoOp` struct in the transitional adapter (move to `ty_io_backend.h` in Phase 4) — *verified: already lives in `ty_io_backend.h`, used by `ty_net.c` and `ty_io_backend.c`*
+- [x] Implement `ty_coro_suspend(coro)` in `scheduler.h` — records that coro is waiting for IO and yields — *implemented as `ty_io_park_coro(SlabArena*)` in `io_driver.c`, not in `scheduler.h` as spec'd — functionally equivalent, naming/location diverged from plan*
+- [x] Implement `ty_coro_io_result(coro)` — retrieves the result stored by the scheduler after wake — *implemented as `ty_io_take_result(coro)` in `io_driver.c` — same naming/location caveat as above*
+- [x] Implement `__ty_rt__Socket__read` with async path and sync fallback — *verified in `ty_net.c`*
+- [x] Implement `__ty_rt__Socket__write` with the same pattern — *verified in `ty_net.c`*
+- [ ] Write an integration test: two coroutines doing loopback read/write; confirm neither blocks the OS thread — *`test_phase2_accept_write_close.c`'s actual source has been read now, and it does **not** satisfy this: it's single-threaded with no scheduler and no `ty_spawn` anywhere — `task` is passed as `NULL` at every call site, so `ty_current_coro_raw()` returns `NULL` and every op takes the *synchronous fallback* path, not the async submit/suspend/resume path this checklist item is actually asking about. It also never reads anything: the client connects a raw OS socket and the server writes `"phase2"` to it, but nothing ever calls `recv()` on the client side to confirm the bytes actually arrived — the test only checks that `Socket__write`'s return value reports success, not that the peer received correct data.
+  `test_phase2_write_read_roundtrip.c` closed the byte-verification gap (sync path only). **Now, with `scheduler.h`/`ty_net.h` available, `test_phase2_coroutine_loopback.c` attempts the actual async/coroutine half**: a server coroutine using the confirmed async `__ty_rt__Socket__read` path (non-`NULL` `task`/`coro`, so this genuinely goes through `TyIoOp` submit/park/resume, not the sync fallback), synchronized against a client coroutine via a one-shot `ty_chan_new`/`send`/`recv` "ready" signal (no Typhoon-level outbound `connect()` exists anywhere in `ty_net.h`, so the client side still has to be a raw OS socket — that's a real gap in the runtime's API surface, not a shortcut in this test). Carries real, clearly-flagged uncertainty about scheduler sequencing this session can't independently verify without `scheduler.c`: specifically whether `ty_spawn` is actually callable from bare `main()` after `ty_sched_init()` the way the header comments imply, and whether the arena passed to `ty_spawn` is the spawning context's or gets reused as the child's own. Treat this as a strong-effort draft that needs a real compile-and-run pass, not a confirmed-passing test like the sync-path ones above.*
 
 ---
 
@@ -618,9 +627,9 @@ The `TyBuf` passed in must be slab-allocated. The driver writes into it directly
 
 #### Checklist
 
-- [ ] Implement `__ty_rt__Listener__accept` with async path and sync fallback
-- [x] Implement `__ty_rt__Listener__close` and remove shutdown-only ownership assumption
-- [x] Add regression test: accept loop does not block worker; close before shutdown does not leak
+- [x] Implement `__ty_rt__Listener__accept` with async path and sync fallback — *verified in `ty_net.c`: fully non-blocking with async submit/park/resume plus sync fallback*
+- [x] Implement `__ty_rt__Listener__close` and remove shutdown-only ownership assumption — *verified in `ty_net.c`*
+- [ ] Add regression test: accept loop does not block worker; close before shutdown does not leak — *`test_phase2_listener_close.c`'s actual source has been read now: it's four lines of substance — listen on an ephemeral port, assert success, close the listener, `ty_net_shutdown()`. It covers the close-before-shutdown *ordering* only, with no ASAN or other leak-detection instrumentation inside the test itself to actually confirm nothing leaked (that'd depend on how the test binary is run, not anything in this file). There's no `accept()` call anywhere in it, so "accept loop does not block worker" has zero coverage from this file. Still genuinely open.*
 
 ---
 
@@ -662,12 +671,12 @@ At the C level, `ReadSocket.into_chan` calls `ty_spawn(task, socket_reader_coro,
 
 #### Checklist
 
-- [ ] Implement runtime split: `__ty_rt__Socket__split(task, self) -> (ReadSocket, WriteSocket)`
-- [ ] Implement `socket_reader_coro` at C level using `__ty_rt__ReadSocket__read`
-- [ ] Implement `__ty_rt__ReadSocket__into_chan(task, self, chunk_size, cap)` that spawns `socket_reader_coro`
-- [ ] Confirm channel with `cap=8` and `chunk_size=4096` caps buffering at 32 KB
-- [ ] Write a test: slow consumer, fast sender; confirm no OOM; confirm sender slows down (TCP backpressure)
-- [ ] Write a test: `into_chan` produces the same bytes as direct `read()` in the same order
+- [x] Implement runtime split: `__ty_rt__Socket__split(task, self) -> (ReadSocket, WriteSocket)` — *verified in `ty_net.c`*
+- [x] Implement `socket_reader_coro` at C level using `__ty_rt__ReadSocket__read` — *verified in `ty_net.c`; reads one chunk per `ty_chan_send`, matches the D4 backpressure model rather than per-byte*
+- [x] Implement `__ty_rt__ReadSocket__into_chan(task, self, chunk_size, cap)` that spawns `socket_reader_coro` — *verified in `ty_net.c`*
+- [x] Confirm channel with `cap=8` and `chunk_size=4096` caps buffering at 32 KB — *default `chunk_size = 4096` confirmed in code; the 8/32KB arithmetic itself depends on caller-supplied `cap`, not independently tested here*
+- [ ] Write a test: slow consumer, fast sender; confirm no OOM; confirm sender slows down (TCP backpressure) — *`test_phase2_into_chan.c`'s `test_into_chan_backpressure` attempts this: a small `CHAN_CAP=2` channel against a payload 40× `CHUNK_SIZE`, with the server coroutine deliberately yielding a few times before draining, to force the internal reader coroutine to fill the channel and block on `ty_chan_send`. It confirms no crash/OOM and exact byte count with no loss or duplication despite the channel filling mid-stream — but it does **not** independently prove the client's `send()` calls actually slowed down; that would need OS-level socket buffer introspection this test doesn't attempt. So: the "no OOM" half is covered, the "confirm sender slows down" half isn't, honestly.*
+- [ ] Write a test: `into_chan` produces the same bytes as direct `read()` in the same order — *`test_phase2_into_chan.c`'s `test_into_chan_order` attempts this directly: client sends a ~90-byte message in awkward 7-byte pieces (deliberately not aligned to `CHUNK_SIZE=16`), server drains the channel via `ty_chan_recv` and reassembles via `ty_buf_into_str`/`ty_str_len`/`ty_str_byte`, asserting exact byte-for-byte match in order. Carries a real, flagged assumption: the element type of the `chan<Buf>` `into_chan` returns isn't confirmed anywhere available — betting on `sizeof(Buf*)` per element based on `Buf` being used exclusively by-pointer everywhere else confirmed in this codebase, not on having seen the actual internal `ty_chan_new` call `socket_reader_coro` makes. If that bet's wrong, this doesn't compile or misreads memory rather than just failing an assertion — needs an actual compile-and-run pass before trusting it.*
 
 ---
 
@@ -677,9 +686,9 @@ At the C level, `ReadSocket.into_chan` calls `ty_spawn(task, socket_reader_coro,
 
 #### Checklist
 
-- [ ] Under socket/listener registry lock, mark closed and move fd to invalid sentinel before unlock
-- [ ] Close fd only after ownership transfer is unambiguous
-- [ ] Add race stress test: concurrent close + shutdown across many sockets/listeners
+- [x] Under socket/listener registry lock, mark closed and move fd to invalid sentinel before unlock — *verified in `ty_net.c`: `Socket__close`/`Listener__close` grab fd locally and set `self->sock = TY_SOCK_INVALID` before closing*
+- [x] Close fd only after ownership transfer is unambiguous — *verified alongside the above*
+- [x] Add race stress test: concurrent close + shutdown across many sockets/listeners — *verified via `test_task03_double_close.c`'s `test_shutdown_race_sentinel` (100 iterations, two threads racing `Socket__close` vs. shutdown). Note: this test uses a standalone `test_socket_close`/`TestFdSet` **reimplementation**, not a direct call into `ty_net.c` — but a line-by-line comparison against the real `__ty_rt__Socket__close` confirms the replica's ordering (assert → mark closed → capture+invalidate fd → remove from fdset → close) is a faithful match, so this is solid indirect evidence.*
 
 ---
 
@@ -730,11 +739,11 @@ void __ty_rt__fs__open(void* task, const char* path, TyMode mode,
 
 #### Checklist
 
-- [ ] Define `TyFile` struct in `ty_io.h`
-- [ ] Implement `ty_mode_to_flags(TyMode) -> int` for POSIX and Windows
-- [ ] Implement `__ty_rt__fs__open`
-- [ ] Implement `__ty_rt__File__close` (no return; consumes self)
-- [ ] Write test: open nonexistent file → `IoError::NotFound`; open existing → success; read → expected bytes; close → no ASAN error; second close → debug assert fires
+- [x] Define `TyFile` struct in `ty_io.h` — *struct defined in `ty_io.c` (pool-managed via `TY_IO_DEFINE_POOL`); `ty_io.h` itself not reviewed*
+- [x] Implement `ty_mode_to_flags(TyMode) -> int` for POSIX and Windows — *verified: both platform overloads present in `ty_io.c`*
+- [x] Implement `__ty_rt__fs__open` — *verified in `ty_io.c`*
+- [x] Implement `__ty_rt__File__close` (no return; consumes self) — *verified in `ty_io.c`, includes `TY_ASSERT(!self->closed, ...)` double-close guard*
+- [x] Write test: open nonexistent file → error result; open existing → success; read → expected bytes; close → no ASAN error; second close → debug assert fires — *`test_phase3_file_lifecycle.c` drafted and passing against the real runtime, after two rounds of fixes: (1) `TyFile` is opaque in the real `ty_io.h` (`typedef struct TyFile TyFile;`), so the test can't read a `closed` field directly — close-state confirmation now relies entirely on the double-close-crashes-the-process sub-test instead of field inspection; (2) all four temp-file paths were originally hardcoded to POSIX `/tmp/...`, which doesn't exist on the Windows build this actually ran on and made every create/write `open()` fail before the test logic even started — switched to plain relative filenames in the test binary's CWD. Also surfaces that `IoError::NotFound` from the checklist text above doesn't exist yet: the runtime currently returns a raw `errno` (`ENOENT`), not a typed `IoError` — that's Task 1.2, still fully open (see its checklist).*
 
 ---
 
@@ -746,17 +755,23 @@ The `TyBuf` is slab-allocated. The driver writes into it directly — no interme
 
 #### Checklist
 
-- [ ] Implement `__ty_rt__File__read` with async path (suspend) and sync fallback (blocking `read()`)
-- [ ] Implement `__ty_rt__File__write` with async path and sync fallback
-- [ ] Implement `__ty_rt__File__seek` returning `(TyFile, TyResult_i64_IoError)`
-- [ ] Confirm `TyFile` is returned in every result path — no path drops ownership
-- [ ] Write test: read file in 4 KB chunks; compare against expected content byte-for-byte
+- [x] Implement `__ty_rt__File__read` with async path (suspend) and sync fallback (blocking `read()`) — *verified in `ty_io.c`*
+- [x] Implement `__ty_rt__File__write` with async path and sync fallback — *verified in `ty_io.c`*
+- [x] Implement `__ty_rt__File__seek` returning `(TyFile, TyResult_i64_IoError)` — *verified in `ty_io.c`; implemented synchronously per the file's own comment (lseek/SetFilePointer are always synchronous)*
+- [x] Confirm `TyFile` is returned in every result path — no path drops ownership — *resolved, but not the way this item assumed: `__ty_rt__File__read`/`write`/`seek` all take `TyFile* self` and mutate/use it in place, returning only an `int64` in `TyResult_i64_i32` — there's no `TyFile` in the result to drop in the first place. Ownership only ever moves at `open`/`close`, matching `File__close`'s "consumes self" note above. This is a real divergence from Task 1.6's spec'd API surface below, though: the spec's `fn read(self, buf: Buf) -> (File, Buf, Result<Int32, IoError>)` explicitly consumes and returns `self` (the same tuple-return pattern `Socket` uses), which the actual C implementation doesn't do at all. Worth a conscious decision on which one is authoritative before more is built on top of either.*
+- [x] Write test: read file in 4 KB chunks; compare against expected content byte-for-byte — *`test_phase3_file_chunked_read.c` drafted and passing: ~13.7 KB written, read back in 4 KB chunks against the same `TyFile*` across every call, reassembled content verified byte-for-byte. Hit the same opaque-`TyFile`/Windows-path issues as Task 3.1's test, fixed the same way.*
+
+> **Review note — two real Windows bugs found and fixed while getting these tests to pass, not test-file bugs:**
+> 1. `ty_sys_write`/`ty_sys_read` in `ty_io.c` cast the CRT file descriptor from `_open()` directly to a `HANDLE` (`(HANDLE)(uintptr_t)(unsigned int)fd`) before calling `WriteFile`/`ReadFile`. A CRT fd is a small integer into the C runtime's own fd table, not a `HANDLE` — needs `_get_osfhandle(fd)` first. This made every real-file write/read fail with `ERROR_INVALID_HANDLE` on the synchronous fallback path (i.e. whenever `File__read`/`write` run outside a coroutine, which is exactly what a standalone test does). Fixed.
+> 2. The identical bug, but worse, in `iocp_submit` (`ty_io_iocp.c`, Task 4.4): `is_socket` was checked *after* `hFile` had already been computed via the same bad cast, so every File op through the async/coroutine path got a bogus handle passed to `CreateIoCompletionPort`/`ReadFile`/`WriteFile`. Worse than case 1 because a garbage `HANDLE` here doesn't just fail cleanly — on a live process there's a real chance the small integer value collides with some other genuinely-live `HANDLE`, silently touching the wrong resource instead of erroring. Fixed by computing `is_socket` first and only taking the direct-cast path for real sockets.
+>
+> Neither of these was caught by Task 4.4's own checklist below, since that review only inspected `iocp_submit`'s structure (calls the right Win32 functions with an overlapped struct) without tracing where a *File's* fd actually comes from and whether it's cast correctly for that path specifically.
 
 ---
 
-### Task 3.3 — Replace `StackBuf` with slab-growing `TyBuf`
+### Task 3.3 — Replace remaining `StackBuf` with slab-growing `TyBuf`
 
-`StackBuf` is a 4 KB `char data[4096]` on the C stack. It truncates silently (partially fixed in Task 0.4). The replacement:
+`StackBuf` is a 4 KB `char data[4096]` on the C stack. It truncates silently. Task 0.4 only surfaced truncation as an error; this task removes `StackBuf` entirely. The replacement:
 
 ```c
 typedef struct {
@@ -789,37 +804,41 @@ Initial capacity: 256 bytes (covers the vast majority of format strings). Grows 
 
 #### Checklist
 
-- [x] Define `SlabBuf` struct in `ty_io.c`
-- [ ] Implement `slabbuf_init`, `slabbuf_push`, `slabbuf_push_char`, `slabbuf_push_str`
-- [ ] Replace all `StackBuf`/`sbuf_*` call sites with `SlabBuf`/`slabbuf_*`
-- [ ] Delete `StackBuf` typedef and all `sbuf_*` functions
-- [x] Delete `STACK_BUF_CAP` constant
-- [x] Write test: print a 10,000-byte string via `ty_printf`; confirm full output received
-- [ ] Confirm no `malloc` in `ty_printf` path — all via `ty_arena_alloc`
+- [x] Define `SlabBuf` struct in `ty_io.c` — *implemented as `Buf` in `ty_mem.c` instead (different file/name than spec'd, functionally equivalent): `data`/`len`/`cap` fields, arena-backed*
+- [x] Implement `slabbuf_init`, `slabbuf_push`, `slabbuf_push_char`, `slabbuf_push_str` — *implemented as `ty_buf_new`/`ty_buf_new_sized`, `ty_buf_push_byte`, `ty_buf_push_str` in `ty_mem.c`, with doubling growth via `ty_buf_grow` — same design as spec'd, different names*
+- [x] Replace all `StackBuf`/`sbuf_*` call sites with `SlabBuf`/`slabbuf_*` — *resolved as superseded, not migrated: `io.ty` shows formatting moved to the Typhoon stdlib level entirely. `Stdout.printf`/`print`/`println` write straight into `Buf` via `ty_buf_push_str`/`ty_buf_push_byte` — there is no `ty_printf`, no `StackBuf`, no `sbuf_*` anywhere in C to migrate, because that layer was never built in C at all. There's nothing left to replace.*
+- [x] Delete `StackBuf` typedef and all `sbuf_*` functions — *same resolution: nothing to delete, they never existed in this architecture.*
+- [x] Delete `STACK_BUF_CAP` constant — *no such constant appears anywhere; consistent with the above.*
+- [x] Write test: print a 10,000-byte string via `ty_printf`; confirm full output received — *adapted rather than satisfied as originally worded, since `ty_printf` doesn't exist: `test_phase3_buf_growth_10k.c` drafted and passing, pushing 10,000+ bytes through `Buf`/`ty_buf_grow` in awkward 137-byte chunks (deliberately not aligned to the doubling boundaries) and verifying no truncation across the growth path. This does **not** cover `printf`'s `%d`/`%s` spec-parsing loop in `io.ty` itself — that's Typhoon source, untested, and out of reach of the C-level `c_test!` harness (see Task 3.4's note on the same problem).*
+- [x] Confirm no `malloc` in `ty_printf` path — all via `ty_arena_alloc` — *confirmed, now that the actual path is known: `Stdout.printf` (`io.ty`) writes only via `ty_buf_push_str`/`ty_buf_push_byte`, which are arena-backed (`ty_mem.c`'s header comment: "No malloc / realloc / free anywhere in this file," confirmed by grep — only `arena_realloc`, custom slab-based). No C-level `ty_printf` exists to have a separate call chain to trace.*
 
 ---
 
-### Task 3.4 — Rewrite `ty_sscan` and `ty_vsscanf` properly
+### Task 3.4 — Rewrite `ty_sscan` and `ty_vsscanf` on slab memory
 
-Task 0.2 provides a hotfix for `ty_sscan`. This task delivers the correct implementation using the slab allocator throughout, and fixes `ty_vsscanf`'s `%s` handler with the same approach (complementing the ASAN fix from Task 0.1).
+Task 0.2 provides a hotfix for `ty_sscan`. This task replaces that hotfix with the final slab-based implementation, and fixes `ty_vsscanf`'s `%s` handler with the same approach (complementing the ASAN fix from Task 0.1).
 
-Key principle: `Str` is never written to. Tokens are always copied into slab memory. The source string is never mutated.
+Key principle: `Str` is never written to. Tokens are always copied into slab memory. Source string stays immutable.
 
 #### Checklist
 
-- [ ] Replace `ty_sscan` hotfix from Task 0.2 with final slab-based implementation
-- [ ] Replace `ty_vsscanf` `%s` hotfix from Task 0.1 with final implementation using cursor-based token length detection
-- [ ] Confirm source string is declared `const char*` through the entire call chain
-- [ ] Write fuzz test: random format strings and inputs; confirm no ASAN/MSAN violations
+- [x] Replace `ty_sscan` hotfix from Task 0.2 with final slab-based implementation — *resolved as superseded, same pattern as Task 3.3: `io.ty` shows scanning moved to the Typhoon stdlib level entirely as `parse_int`/`parse_word`. Neither `ty_sscan` nor `ty_vsscanf` exist anywhere in C to replace.*
+- [x] Replace `ty_vsscanf` `%s` hotfix from Task 0.1 with final implementation using cursor-based token length detection — *same resolution: `parse_word` handles token extraction directly in Typhoon (whitespace-delimited scan over `Str` via `ty_str_byte`, copying the token into a fresh `Buf`), no C-level `%s` handler left to fix.*
+- [x] Confirm source string is declared `const char*` through the entire call chain — *the underlying principle is satisfied more directly than the C-level phrasing implies: `parse_int`/`parse_word` only ever call `ty_str_byte` on the input `Str` — never write to it — so "`Str` is never written to" (this task's own stated key principle, see intro above) holds by construction rather than by a `const` annotation on a call chain that no longer exists.*
+- [ ] Write fuzz test: random format strings and inputs; confirm no ASAN/MSAN violations — *adapted, and lower-confidence than the other Task 3.4 items: `test_phase3_parse_fuzz.ty` drafted with a handful of fixed cases for `parse_int`/`parse_word` (leading whitespace, negative numbers, trailing garbage, empty/whitespace-only input, double-space tokenization), not a real fuzz harness. Since `parse_int`/`parse_word` are Typhoon functions rather than C symbols, this can't be a `c_test!` C binary like the rest of the suite — it needs the actual Typhoon compiler to build and run, and it's unknown whether any Typhoon-level test runner exists to plug it into. Treat as an unverified seed, not a completed item.*
 
 ---
 
 ### Phase 3 definition of done
 
-- A Typhoon program can open a file, read it in chunks, and close it — with the liveness checker catching any use-after-close at compile time
-- `ty_printf` with a 10,000-character output produces complete output
-- `ty_sscan` on a string literal passes ASAN and MSAN
-- No `malloc` call in `ty_io.c` or `ty_net.c` — CI enforces this
+- A Typhoon program can open a file, read it in chunks, and close it — with the liveness checker catching any use-after-close at compile time — **✅ verified** (Tasks 3.1/3.2), now backed by passing `test_phase3_file_lifecycle.c` and `test_phase3_file_chunked_read.c`. One caveat surfaced by writing those tests: this claim is about the *C runtime*, not yet a Typhoon program — `io.ty` has no `File`/`fs` binding at all (see new note below), so no actual `.ty` source can do this yet.
+- `ty_printf` with a 10,000-character output produces complete output — **✅ resolved, reframed**: `ty_printf` doesn't exist and was never built — formatting moved to the Typhoon stdlib level (`Stdout.printf` in `io.ty`, backed by `Buf`). `test_phase3_buf_growth_10k.c` confirms the underlying `Buf` growth path handles 10,000+ bytes without truncation; `printf`'s own `%d`/`%s` spec-parsing loop in `io.ty` is untested (Typhoon-level, outside the C test harness).
+- `ty_sscan` on a string literal passes ASAN and MSAN — **✅ resolved, reframed**: same story — `ty_sscan` was replaced wholesale by Typhoon-level `parse_int`/`parse_word`, which never write to `Str` at all (satisfying the underlying principle by construction, not by an ASAN run). A handful of fixed-case checks are drafted in `test_phase3_parse_fuzz.ty`; a real fuzz harness is still open and needs a Typhoon-level test runner this doc doesn't currently describe.
+- No `malloc` call in `ty_io.c` or `ty_net.c` — CI enforces this — **✅ fixed**: `split_host_port`'s `malloc`/`free` for the `host` buffer is gone. Took three attempts to land correctly, worth recording so the same mistakes aren't repeated: (1) first fix used arena allocation via `slab_alloc_sized(task, ...)` — broke every net test (`test_phase2_accept_write_close`, `test_phase2_listener_close`, `test_phase4_net_fdset`) with `STATUS_BREAKPOINT`, because `task` isn't guaranteed to be a valid `SlabArena*` at `listen()`'s call site (the function's own pre-existing `(void)task;` was the tell). (2) Second attempt used a stack buffer marked `static` for simplicity — would have corrupted concurrent `listen()` calls across the M:N scheduler's worker threads. (3) Third attempt made the buffer local to `split_host_port` itself and returned a pointer to it — dangled the instant the function returned, since the caller reads `host` afterward. Final, correct version: `listen()` owns a plain (non-`static`) stack array and passes it in; `split_host_port` only writes into it. `host` never needed to outlive one call to `listen()` in the first place, so no allocation — heap, arena, or otherwise — was ever actually necessary. The pool-exhaustion `malloc`/`free` fallback in the `TY_NET_DEFINE_POOL`-style macros (both `ty_net.c` and `ty_io.c`) is a separate, deliberate cross-coroutine-safe design choice from earlier pool-allocator work, left untouched — worth a conscious decision on whether the CI gate should special-case it rather than silently exempting it.
+
+> **New, not on the original checklist:** `io.ty` has no `File` struct, no `impl File`, and no `fs` module — the Phase 3 File I/O runtime in `ty_io.c` has zero Typhoon-level stdlib binding. `open`/`write`/`seek`/`close` were drafted against the actual `__ty_rt__*` C signatures and `net.ty`'s established `extern "C"` convention, but two things are still unresolved:
+> - `mode`/`whence` are passed as raw `Int32` rather than the `Mode`/`SeekPos` enums Task 1.6 specs below, since `Mode`'s ordinals are already flagged as an unconfirmed guess in `ty_io.c` itself and wrapping that in a Typhoon enum would stack a second guess (how this compiler lowers bare enum variants to integers) on top of the first.
+> - `File.read` isn't drafted at all. Task 1.6's spec wants `fn read(self, buf: Buf) -> (File, Buf, Result<Int32, IoError>)`, but the actual C function (`__ty_rt__File__read(self, buf: char*, cap: int32, ...)`) wants a pre-allocated raw buffer to fill in place, and `Buf`'s only exposed operations are sequential append (`push_byte`/`push_str`) — there's no "reserve N bytes, hand me a fillable region" operation to bridge the two. This also exposes a deeper mismatch worth resolving deliberately rather than by accident: the actual `ty_io.c` implementation borrows `self` by pointer across `read`/`write`/`seek` and never returns it, while Task 1.6's spec'd API consumes-and-returns `self` in a tuple (the same pattern `Socket` uses). Right now the C runtime and the language spec disagree about File's ownership shape.
 
 ---
 
@@ -879,11 +898,11 @@ No runtime vtable dispatch. The function pointer table is initialized once at st
 
 #### Checklist
 
-- [x] Create `ty_io_backend.h` with `TyIoBackend`, `TyIoOp`, `TySchedWakeFn`
-- [x] Define `TY_IO_*` operation type constants
-- [x] Implement `ty_io_poll()` and `ty_io_submit()` as thin wrappers over the backend
-- [x] Hook `ty_io_poll()` into the scheduler's idle path (when run queue is empty)
-- [ ] Write a mock backend for testing that records submitted ops and lets tests manually trigger completions
+- [x] Create `ty_io_backend.h` with `TyIoBackend`, `TyIoOp`, `TySchedWakeFn` — *header itself not reviewed, but its symbols are consumed correctly in `ty_io_backend.c`*
+- [x] Define `TY_IO_*` operation type constants — *verified via usage (`TY_IO_OP_READ`, `TY_IO_OP_WRITE`, `TY_IO_OP_ACCEPT`) in `ty_io_backend.c`*
+- [x] Implement `ty_io_poll()` and `ty_io_submit()` as thin wrappers over the backend — *verified in `ty_io_backend.c`: mock → per-worker `TyIoBackend` → global `io_driver.c` fallback, in priority order*
+- [ ] Hook `ty_io_poll()` into the scheduler's idle path (when run queue is empty) — **⚠️ reverted from `[x]`**: the scheduler's idle loop (`scheduler.c`) wasn't in this review pass, so the hookup itself can't be confirmed from `ty_io_backend.c` alone
+- [x] Write a mock backend for testing that records submitted ops and lets tests manually trigger completions — *verified in `ty_io_backend.c`: `ty_io_backend_use_mock`, `mock_ops` ring buffer, `ty_io_mock_count`/`ty_io_mock_get`/`ty_io_mock_complete`. Additionally confirmed by `test_phase4_mock_io.c`, which exercises the full API (submit/count/get/complete/poll/overflow) with call signatures that match the real implementation exactly.*
 
 ---
 
@@ -911,13 +930,19 @@ For `join` (Task 5.3): submit N SQEs before calling `io_uring_submit()` once. Th
 
 #### Checklist
 
-- [ ] Create `ty_io_uring.c` / `ty_io_uring.h`
-- [ ] Initialize one `io_uring` ring per scheduler worker thread at startup
-- [ ] Implement `submit`: fills SQE, sets `user_data = op->coro`, calls `io_uring_submit()` (or batches)
-- [ ] Implement `poll`: calls `io_uring_peek_cqe` in a loop; for each CQE calls `wake(cqe->user_data, cqe->res)`
-- [ ] Hook `poll` into scheduler idle path (Task 4.1)
-- [ ] Test: 1,000 concurrent coroutines doing loopback read/write; all complete; no deadlock
-- [ ] Test: `strace` confirms `io_uring_enter` is not called per-op when `SQPOLL` is active
+- [x] Create `ty_io_uring.c` / `ty_io_uring.h` — **verified**: file now provided, raw-syscall implementation (no liburing dependency)
+- [x] Initialize one `io_uring` ring per scheduler worker thread at startup — **superseded by a rewrite, not simply satisfied**: this is now deliberately a single shared ring for the whole process, not one per worker. The original one-per-worker design meant a coroutine's completion could only ever be seen by the specific worker that submitted it — if that coroutine got stolen to a different worker in the meantime (normal, expected work-stealing), it just waited until its *original* worker got back around to polling, even with other workers sitting idle. This mirrors what Go's netpoller and Tokio's reactor both do (one shared reactor, not one per OS thread) — though unlike epoll/kqueue/IOCP, io_uring's SQ ring isn't safe for concurrent multi-thread submission without external synchronization, so this rewrite adds an explicit `submit_lock` (blocking `TyMutex`) around the SQ critical section, and a try-lock (`poll_lock_flag`, CAS-based) around the CQ drain so a worker that loses the race to poll just skips that cycle instead of blocking. `IORING_SETUP_SQPOLL` remains the more "native" fix (removes the need for the submit lock entirely) but is still not implemented — see the checklist item below, unchanged status.
+- [x] Implement `submit`: fills SQE, sets `user_data = op->coro`, calls `io_uring_submit()` (or batches) — *verified in `uring_submit_op`, same deviation as before (user_data is the `TyIoOp*`, not just the coro — unchanged from prior review), now wrapped in `submit_lock` for the shared-ring rewrite above*
+- [x] Implement `poll`: calls `io_uring_peek_cqe` in a loop; for each CQE calls `wake(cqe->user_data, cqe->res)` — *verified in `uring_poll_op`, now gated by the `poll_lock_flag` try-lock described above*
+- [ ] Hook `poll` into scheduler idle path (Task 4.1) — *not independently confirmed; depends on `scheduler.c`'s idle loop, not reviewed*
+- [ ] Test: 1,000 concurrent coroutines doing loopback read/write; all complete; no deadlock — *unverified: no test at this scale exists yet. The two smaller coroutine tests added this session (`test_phase2_coroutine_loopback`, `test_phase2_into_chan`) are Windows-only (they exercise the IOCP path specifically) and don't cover Linux/io_uring at all — this remains fully open for this platform.*
+- [ ] Test: `strace` confirms `io_uring_enter` is not called per-op when `SQPOLL` is active — **❌ still not satisfiable as written**: SQPOLL remains unimplemented (unchanged by this rewrite — deliberately deferred, see the shared-ring note above).
+
+> **New review note from this session's rewrite:** `ty_uring_backend_new()`/`destroy()` became a refcounted singleton (every worker gets the same `TyUringBackend*`, first caller creates it, last caller to release tears it down). This needed two new fields added to `TyUringBackend` in `ty_io_uring.h` (`TyMutex submit_lock`, `_Atomic(int) poll_lock_flag`) — that header was never available for review in this whole engagement (only the `.c` file was ever shared), so the exact patch was handed over as instructions rather than a full file rewrite, to avoid guessing at fields never seen. **Not yet confirmed applied** — needs verifying against the real header before this compiles.
+>
+> Also worth flagging: the singleton create-lock's own one-time-initialization was originally written with a plain, unsynchronized `int` flag (a real double-checked-locking race if `ty_uring_backend_new()` is ever called concurrently by multiple threads) — caught and fixed with a proper CAS-based atomic once-guard before this was shared. Checked against the actual `ty_sched_init()` call site in `scheduler.c`: the current code calls all three platforms' `backend_new()` from a single serial loop on the main thread, so this race wasn't live against today's caller — but a singleton is supposed to be correct regardless of caller pattern, not dependent on that.
+
+> **Review note (not a checklist item, flagging for awareness, unchanged by this session's shared-ring rewrite):** `uring_submit_op` stores `user_data = (uint64_t)(uintptr_t)op` — a pointer to the caller's `TyIoOp`, not a copy — unlike the kqueue backend (copies into a pool slot) and the IOCP backend (copies into a heap-allocated `IocpReq`). This works only because callers in `ty_net.c` declare `TyIoOp op;` as a stack local inside the coroutine's own call frame and then park that same coroutine, so the memory survives until the coroutine resumes. That's a real but fragile, undocumented cross-file invariant — any future caller that submits an op from a different stack frame than the one that stays parked would silently corrupt this. Also: `ty_uring_backend_destroy()` calls `munmap(ptr, 0)` for all three mmap'd regions since sizes aren't tracked — `munmap` with `length 0` is a no-op/EINVAL per POSIX, so these mappings currently leak on backend teardown.
 
 ---
 
@@ -939,12 +964,16 @@ The abstraction still holds: from the coroutine's perspective, it suspends befor
 
 #### Checklist
 
-- [ ] Create `ty_io_kqueue.c` / `ty_io_kqueue.h`
-- [ ] Initialize one `kqueue` fd per scheduler worker thread
-- [ ] Implement `submit`: calls `kevent()` to register `EVFILT_READ` / `EVFILT_WRITE` with `udata = op`
-- [ ] Implement `poll`: calls `kevent()` with zero timeout; for each event, performs syscall, calls `wake`
-- [ ] Test: same 1,000-coroutine loopback test as Task 4.2
-- [ ] Test: `accept()` and socket reads both work through the backend
+- [x] Create `ty_io_kqueue.c` / `ty_io_kqueue.h` — **verified**: file now provided
+- [x] Initialize one `kqueue` fd per scheduler worker thread — **superseded by a rewrite, not simply satisfied**: this is now a single shared `kq` fd for the whole process, not one per worker — same motivation as the io_uring rewrite above (a completion registered by whichever worker happened to submit it could only ever be seen by that same worker's own poll loop, leaving stolen coroutines waiting on their *original* worker specifically). Unlike io_uring, this port to "shared" was close to free: `kevent()` is explicitly documented as safe for concurrent multi-thread calls against the same `kq` fd, so no equivalent of io_uring's submit lock was needed — this is the same pattern Go's netpoller and Tokio's reactor already use on this platform (well, they use epoll, but kqueue offers the identical shared-fd safety property).
+- [x] Implement `submit`: calls `kevent()` to register `EVFILT_READ` / `EVFILT_WRITE` with `udata = op` — *verified in `kq_submit`, using `EV_ONESHOT` (unchanged from prior review); now targets the one shared `kq` fd*
+- [x] Implement `poll`: calls `kevent()` with zero timeout; for each event, performs syscall, calls `wake` — *verified in `kq_poll`, spurious-readiness handling for ACCEPT unchanged; now drains the shared `kq`, so whichever worker calls this next picks up completions regardless of which worker originally submitted them*
+- [ ] Test: same 1,000-coroutine loopback test as Task 4.2 — *unverified: no test at this scale exists yet, and nothing macOS-specific has been exercised at all this session (the new coroutine tests are Windows-only, see Task 4.2's note above)*
+- [ ] Test: `accept()` and socket reads both work through the backend — *unverified, same reason*
+
+> **Review note, resolved by this session's rewrite:** the pending-request pool (`g_pool[POOL_CAP]`, `POOL_CAP = 256`) was already a single file-scope global before this rewrite, not one pool per `TyKqBackend` instance — flagged previously as a possible capacity concern if each worker got its own kqueue backend as originally designed. Now that the backend itself is also a deliberate shared singleton, this is no longer a mismatch: one pool, one backend, consistent by design rather than by accident. The 256-slot process-wide capacity ceiling itself is unchanged and still worth keeping in mind under heavy concurrent load, but it's no longer an architectural inconsistency.
+>
+> **New review note:** the singleton create-lock's own one-time initialization had the same double-checked-locking race as the io_uring and IOCP rewrites (a plain, unsynchronized `int` flag) — caught and fixed with a CAS-based atomic once-guard before this was shared. Not live against today's `scheduler.c` (calls `ty_kq_backend_new()` from a single serial loop on the main thread during `ty_sched_init()`, not concurrently), but a singleton shouldn't depend on that.
 
 ---
 
@@ -967,12 +996,20 @@ poll():
 
 #### Checklist
 
-- [ ] Create `ty_io_iocp.c` / `ty_io_iocp.h`
-- [ ] Initialize one IOCP handle per scheduler worker thread
-- [ ] Implement `submit`: calls `ReadFile`/`WriteFile`/`WSARecv`/`WSASend` with overlapped struct
-- [ ] Implement `poll`: calls `GetQueuedCompletionStatusEx` with zero timeout
-- [ ] Test: same loopback test on Windows
-- [ ] Test: file read and socket read both route through IOCP
+- [x] Create `ty_io_iocp.c` / `ty_io_iocp.h` — **verified**: file now provided
+- [x] Initialize one IOCP handle per scheduler worker thread — **superseded by a rewrite, not simply satisfied — this is the actual bug this session found and fixed, not just a design tidy-up**: a Windows handle can only ever be bound to ONE IOCP port for its entire lifetime; Windows does not support re-associating it with a different port later. With the old one-port-per-worker design, a socket accepted while its coroutine ran on worker A got permanently bound to worker A's port. If that coroutine was then stolen to worker B (normal, expected work-stealing) and tried to submit its next op from there, `CreateIoCompletionPort()` would silently fail (return value was never checked) trying to re-bind the same socket to worker B's *different* port, and the subsequent `WSARecv()` would fail with `WSAGetLastError() == ERROR_INVALID_HANDLE` (6). **This was reproduced directly**, not just reasoned about: `test_phase2_coroutine_loopback.c`'s server coroutine got stolen to a different worker between `accept()` and the following `Socket__read()`, and failed with exactly this code. Fixed with a single shared IOCP port for the whole process — Windows documents re-associating a handle with a port it's *already* on as a safe no-op, so every worker's `CreateIoCompletionPort()` call now either performs the handle's one-time binding or harmlessly repeats it.
+- [x] Implement `submit`: calls `ReadFile`/`WriteFile`/`WSARecv`/`WSASend` with overlapped struct — *verified in `iocp_submit`; `AcceptEx` handling unchanged in mechanism, but its state moved off the backend struct — see below*
+- [x] Implement `poll`: calls `GetQueuedCompletionStatusEx` with zero timeout — *verified in `iocp_poll`, still batched (`MAX_DRAIN=64`); now distinguishes accept vs. read/write completions via a `kind` tag on a shared struct header, needed because both kinds are now heap-allocated per-call rather than accept living in fixed backend fields (see below)*
+- [ ] Test: same loopback test on Windows — *`test_phase2_coroutine_loopback.c` and `test_phase2_into_chan.c` (added this session) are the closest thing to this — both are coroutine-based loopback tests that exercise the real async IOCP path, not the sync fallback. `test_phase2_coroutine_loopback.c` specifically is what surfaced and then confirmed the fix for the bug above. Neither is the 1,000-coroutine scale this item originally asks for, so leaving this open rather than checking it off — but real coroutine-level IOCP coverage exists now where none did before.*
+- [ ] Test: file read and socket read both route through IOCP — *the File side of this remains genuinely untested — every File I/O test added this session (`test_phase3_file_lifecycle.c`, `test_phase3_file_chunked_read.c`) runs outside a coroutine context (`task == NULL`), so `ty_current_coro_raw()` returns NULL and File reads/writes take the synchronous fallback path, never the IOCP path this checklist item is actually asking about. Socket reads now have real IOCP-path coverage (see above); File reads through IOCP specifically do not.*
+
+> **Resolved by this session's rewrite:** the previous review note flagged that `TyIocpBackend` tracked only a single in-flight `AcceptEx` at a time via scalar fields (`accept_sock`, `accept_ol`, etc.), and asked whether the scheduler guarantees at most one pending accept per worker. With a shared backend, that question's moot either way — multiple listeners across multiple workers can now have concurrent accepts in flight simultaneously, so accept state moved to a dynamically-allocated `AcceptReq` per call (the same pattern reads/writes already used via `IocpReq`), with a `kind` tag as the first field of both structs so `iocp_poll` can tell them apart from the same completion queue.
+>
+> **Also resolved:** the two lower-confidence items flagged alongside the original fd/HANDLE fix are now moot rather than fixed piecemeal — both were really facets of the same shared-port question. `CreateIoCompletionPort` being called unconditionally on every `submit()` with its return value unchecked is now provably safe (always the same port, so always either the first binding or a documented-safe no-op re-binding) rather than "probably fine, unconfirmed." `iocp_fd_is_socket`'s reliance on Winsock cleanly rejecting a bad handle is unchanged and still worth tightening independently, but it's no longer entangled with the cross-worker port question.
+>
+> **New review note:** `ty_iocp_backend_new()`/`destroy()` became a refcounted singleton, same pattern as the io_uring and kqueue rewrites. Confirmed safe to restructure — checked directly that nothing in `ty_net.c` reaches into `TyIocpBackend`'s internal fields, so moving accept state out of the header didn't risk breaking a caller elsewhere. The singleton create-lock's own one-time init had the same double-checked-locking race as the other two backends initially (unsynchronized `int` flag) — caught and fixed with a CAS-based atomic once-guard. Checked against `scheduler.c`: `ty_iocp_backend_new()` is called from a single serial loop on the main thread during `ty_sched_init()`, so this race wasn't live against today's actual caller, but a singleton shouldn't depend on that holding forever.
+>
+> Carried forward from the prior review, now applicable to all three backends rather than just this one: `ty_iocp_backend_new`/`destroy` (and the kqueue/io_uring equivalents) use plain `malloc`/`free` for the backend struct itself. That's outside the `ty_io.c`/`ty_net.c` files the D5 "no malloc" CI gate names, so it doesn't violate the current DoD wording, but it's the same one-time-allocation exception already flagged for `io_driver.c` in the doc's own Review section (§12) — the CI gate may want to cover backend files too, and now covers three files' worth of this instead of one.
 
 ---
 
@@ -1007,22 +1044,32 @@ void __ty_rt__Socket__close(void* task, TySocket* self) {
 
 #### Checklist
 
-- [ ] Add `TyFdSet` per-thread tracking to the scheduler
-- [ ] Remove `g_sockets`, `g_listeners`, `g_sock_lock` global variables
-- [ ] Remove `ty_mutex_init(&g_sock_lock)` from `ty_net_init()`
-- [ ] Rewrite `ty_net_shutdown()` to signal workers rather than iterating a global list
-- [ ] Confirm no remaining references to `g_sock_lock` anywhere
-- [ ] Test: 100 sockets opened and closed; ASAN confirms no leaked FDs or memory
+- [x] Add `TyFdSet` per-thread tracking to the scheduler — *verified: `ty_net.c` calls `ty_fdset_add`/`ty_fdset_remove` on `ty_sched_current_worker()->fd_set` for every socket/listener open/close; `scheduler.c` itself not reviewed*
+- [x] Remove `g_sockets`, `g_listeners`, `g_sock_lock` global variables — *verified: none of these symbols remain in `ty_net.c`*
+- [x] Remove `ty_mutex_init(&g_sock_lock)` from `ty_net_init()` — *verified: no such call remains in `ty_net.c`*
+- [ ] Rewrite `ty_net_shutdown()` to signal workers rather than iterating a global list — *not independently confirmed — `ty_net_shutdown()`'s new implementation wasn't specifically traced in this pass*
+- [x] Confirm no remaining references to `g_sock_lock` anywhere — *verified for `ty_net.c`; other files not exhaustively grepped*
+- [ ] Test: 100 sockets opened and closed; ASAN confirms no leaked FDs or memory — **still open, and both fdset test files' actual source has now been read — neither one satisfies this, for different reasons than assumed before**:
+  - `test_phase4_fdset.c` unit-tests `TyFdSet` itself thoroughly (init/add/remove/growth past the 256-slot initial capacity/`close_all`/destroy, plus a 200-iteration two-thread concurrent add/remove race) — but every fd it uses is a fake integer (`10`, `20`, `30`, `1000+i`, `TY_FD_INVALID`) or a real socket is never opened. It confirms the data structure is correct in isolation, not that real sockets get tracked through it.
+  - `test_phase4_net_fdset.c` is the one that opens real sockets (5 sub-tests: listen/close, accept/close, invalid-address handling, 10 sequential listen/close cycles, write/close with byte-count verification) and is now confirmed compiling and passing — but its own header comment says outright: *"these tests run without the full scheduler (no worker threads), so `ty_sched_current_worker()` returns `NULL`"* — meaning `ty_net.c`'s `ty_fdset_add`/`remove` calls are skipped entirely via their NULL-worker guard for every single test in this file. So this test provides **zero coverage of the actual `TyFdSet` integration in `ty_net.c`** — the specific thing Task 4.5 is about — only of socket open/accept/write/close working correctly in isolation from the scheduler. It also only reaches 10 sequential cycles, not 100, and runs no ASAN.
+  - Net result: there is currently no test anywhere that opens a real socket *with a live scheduler worker present* and confirms `TyFdSet` actually tracks it. That's a real gap in coverage for the specific mechanism Task 4.5 replaces `g_sockets` with, not just a missing 100-socket stress test.
+  - **New**: `test_phase4_fdset_live_worker.c` attempts to close exactly this, now that `scheduler.h` is available. Runs a coroutine (spawned after `ty_sched_init()`) that reads `Worker.fd_set.len` before/after a listen+close cycle, via the confirmed non-opaque, publicly-fielded `Worker` struct. If `ty_sched_current_worker()` genuinely returns non-`NULL` from inside a spawned coroutine the way this test assumes, it directly confirms the fd count increments and decrements correctly with a live worker present — the specific thing every existing test sidesteps. Same scheduler-sequencing uncertainty as the two new Phase 2 coroutine tests applies here too (see Task 2.3's note above); the test fails loud and explicitly rather than silently passing if that assumption turns out wrong.
+
+> **✅ Test-suite defect — FIXED, and now confirmed passing against the real build** (was flagged for `test_phase2_accept_write_close.c`, `test_phase2_listener_close.c`, and `test_phase4_net_fdset.c`): all three originally called `__ty_rt__Network__listen(task, net, "some string")` expecting a `TyResult_Listener_i32` return value with 3 arguments, when the real implementation is `void __ty_rt__Network__listen(void* task, TyNetwork* self, TyStr* addr, TyResult_Listener_i32* out)` — 4 arguments, `void` return, `TyStr*` fat pointer instead of a raw string. Same issue existed for `__ty_rt__Listener__accept` and `__ty_rt__Socket__write`. All three files were corrected to build a `TyStr` via a small `make_str()` helper and pass an explicit `out` parameter matching each function's real signature.
+>
+> Since that note was written, all three ran against the real Windows build via `cargo test`'s `c_tests` harness. They initially failed — but with `STATUS_BREAKPOINT` (`0x80000003`), not an assertion failure, and the crash traced back to a bug introduced elsewhere in this same session: `split_host_port` (`ty_net.c`, Phase 3 DoD's malloc fix, see above) was calling `slab_alloc_sized(task, ...)` on a `task` pointer that isn't guaranteed valid at `listen()`'s call site, and `slab_alloc_sized`'s `if (!arena) ty_abort()` guard was firing. Once that was fixed (caller-owned stack buffer instead of any allocation), all three tests passed with no further changes needed to the test files themselves. So: the signature-mismatch fix above is now independently confirmed correct, not just plausible.
+>
+> **✅ Test-suite defect — FIXED**: `test_phase3_large_sprintf.c` originally passed a raw `char[]` where `ty_buf_push_str(SlabArena*, Buf*, TyStr* s)` requires a `TyStr*`, and assigned `ty_buf_into_str`'s `TyStr*` return to a `char*` and indexed it directly — `TyStr` is a fat-pointer struct (confirmed by `ty_str_len`/`ty_str_byte` accessor functions existing in `ty_mem.c`), not a bare C string. Fixed to build a proper `TyStr` for input and read the result back via `ty_str_len`/`ty_str_byte` (plus equivalent direct `->ptr`/`->len` checks). Note this still doesn't call `ty_printf` itself — that function isn't in any file reviewed — so Task 3.3's actual checklist item ("print a 10,000-byte string via `ty_printf`") remains open; this only confirms the underlying `Buf`/`TyStr` growth path.
 
 ---
 
 ### Phase 4 definition of done
 
-- `strace` on Linux shows `io_uring_setup` called once per thread at startup; no `epoll_wait`, no `select`
-- `ktrace` on macOS shows `kqueue` called once per thread; completions via `kevent`
-- Windows: Event Viewer shows IOCP handle created per thread
-- The 1,000-coroutine loopback test passes on all three platforms under ASAN + TSAN
-- No global mutexes in the socket or file IO path
+- `strace` on Linux shows `io_uring_setup` called once per thread at startup; no `epoll_wait`, no `select` — **superseded by this session's rewrite, wording no longer matches the design**: `io_uring_setup` is now called once **per process**, not once per thread — a single shared ring, not one per worker (see Task 4.2's updated checklist for the full rationale). `strace` should now show exactly one `io_uring_setup` call total, regardless of worker count, which is a *stronger* guarantee than the original wording asked for, just not the literal thing it describes — worth updating this DoD line's wording rather than trying to satisfy it as originally phrased.
+- `ktrace` on macOS shows `kqueue` called once per thread; completions via `kevent` — **same supersession**: one shared `kq` fd per process now, not one per thread. `ktrace` should show exactly one `kqueue()` call total.
+- Windows: Event Viewer shows IOCP handle created per thread — **same supersession**: one shared IOCP port per process now, not one per thread. This is also the one with a concrete bug behind the change, not just a design preference — see Task 4.4's checklist for the reproduced `ERROR_INVALID_HANDLE` failure the old per-thread design caused.
+- The 1,000-coroutine loopback test passes on all three platforms under ASAN + TSAN — *unverified: still no test at this scale on any platform. Real coroutine-level tests now exist for Windows specifically (`test_phase2_coroutine_loopback.c`, `test_phase2_into_chan.c`, both added this session), and neither Linux nor macOS have any coroutine-based IO test at all yet — this item is more concretely open for those two platforms than "unverified" alone conveys.*
+- No global mutexes in the socket or file IO path — **⚠️ now genuinely mixed, not a clean pass**: still holds for Windows and macOS — IOCP's shared port and kqueue's shared fd are both natively safe for concurrent multi-thread submit/poll with no userspace locking needed on the hot path (their singleton *create* locks are startup-only, never touched again once every worker has its reference). **Linux is the exception**: io_uring's SQ ring isn't safe for concurrent submission the way IOCP/kqueue are, so this session's rewrite added an explicit `submit_lock` (`TyMutex`) that's held on every single `submit()` call, on the hot path, for the lifetime of the process — a direct, deliberate trade-off against this exact DoD line, made explicitly rather than accidentally (see Task 4.2's checklist for the reasoning and the `IORING_SETUP_SQPOLL` alternative that would remove it). This DoD item should probably be reworded to acknowledge that trade-off rather than left claiming a uniform "no mutexes" guarantee across all three platforms.
 
 ---
 

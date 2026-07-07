@@ -1,0 +1,73 @@
+/*
+ * test_phase3_parse_fuzz.ty — Task 3.4 (adapted)
+ *
+ * The checklist calls for replacing ty_sscan/ty_vsscanf and fuzz-testing
+ * them. Neither function exists — io.ty shows scanning moved entirely
+ * to the Typhoon stdlib level as parse_int/parse_word, which only ever
+ * read `s: Str` via ty_str_byte and never write to it (satisfying the
+ * "Str is never written to" principle directly, no hotfix needed).
+ *
+ * Because parse_int/parse_word are Typhoon functions, not C symbols,
+ * this can't be a C file under the c_test! multi-binary model the rest
+ * of your suite uses — it needs the actual Typhoon compiler to build
+ * and run it. I don't know if a Typhoon-level test runner exists yet;
+ * if not, this is a candidate seed for one, not a drop-in replacement
+ * for your existing harness. Treat everything below as UNVERIFIED —
+ * I can't compile or run Typhoon source in this session.
+ *
+ * No panic/assert builtin was visible in any .ty file I've seen, so
+ * this reports failures via println rather than aborting — adjust to
+ * whatever your real assertion mechanism is once you have one.
+ */
+
+namespace main
+
+use std::io::Stdout;
+
+fn check_int(out: Stdout, label: Str, input: Str, expected: Int64) {
+  let got = input.parse_int()
+  if got == expected {
+    out.print("[ok] ")
+    out.println(label)
+  } else {
+    out.print("[FAIL] ")
+    out.println(label)
+  }
+}
+
+fn main() {
+  let out = Stdout {}
+
+  /* basic cases */
+  check_int(out, "positive digits", "42", 42 as Int64)
+  check_int(out, "negative digits", "-17", 0 as Int64 - 17 as Int64)
+  check_int(out, "leading whitespace", "   99", 99 as Int64)
+  check_int(out, "zero", "0", 0 as Int64)
+  check_int(out, "no digits at all", "abc", 0 as Int64)
+  check_int(out, "empty string", "", 0 as Int64)
+  check_int(out, "trailing garbage stops scan", "123abc", 123 as Int64)
+  check_int(out, "only a minus sign, no digits", "-", 0 as Int64)
+  check_int(out, "only whitespace", "    ", 0 as Int64)
+  check_int(out, "whitespace then minus then digits", "  -5", 0 as Int64 - 5 as Int64)
+
+  /* parse_word: whitespace-delimited tokenization */
+  let sentence = "the quick  brown fox"
+  let w1 = sentence.parse_word(0 as Int64)
+  out.print("word 1: ")
+  out.println(w1)
+
+  /* start mid-string, including the double-space case, which is the
+   * kind of thing a fuzz harness would want to hammer on with random
+   * whitespace-run lengths and random start offsets — not attempted
+   * here beyond this handful of fixed cases, since I have no way to
+   * run this and iterate. A real fuzz test should generate random
+   * Str content (varying whitespace runs, leading/trailing spaces,
+   * unicode bytes if Str allows arbitrary bytes) and confirm parse_word
+   * never reads out of bounds and parse_int never diverges from a
+   * reference scanf-style implementation. */
+  let w2 = sentence.parse_word(9 as Int64)
+  out.print("word starting mid-double-space: ")
+  out.println(w2)
+
+  out.println("phase 3.4 parse_fuzz smoke checks done — expand with real fuzzing")
+}

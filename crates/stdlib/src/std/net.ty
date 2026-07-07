@@ -5,14 +5,35 @@ use std::result::Result;
 use std::buf::Buf;
 
 struct Network {}
+struct Listener {}
+struct Socket {}
+struct ReadSocket {}
+struct WriteSocket {}
+
+// ReadSocket/WriteSocket/SocketHalves — Task 2.5. Socket.consume() (below)
+// sent one channel op per BYTE (chan<Int8>), the opposite of D4's
+// chunk-based backpressure model, and its C implementation
+// (__ty_rt__Socket__consume) has been deleted from ty_net.c — this
+// extern declaration is now dead and calling it will fail to link.
+// split()/into_chan() is the replacement.
+//
+// Named struct instead of an anonymous tuple return for Socket.split():
+// field access (self.ar-style) is confirmed syntax in this codebase;
+// tuple destructuring isn't confirmed anywhere I've seen, so this is the
+// lower-risk choice. Field names match TySplitResult in ty_net.c exactly.
+struct SocketHalves {
+  read: ReadSocket,
+  write: WriteSocket,
+}
 
 impl Network {
   fn listen(self: Network, addr: Str) -> Result<Listener, Int32> {
     return __ty_rt__Network__listen(self, addr);
   }
+  fn dial(self: Network, addr: Str) -> Result<Socket, Int32> {
+    return __ty_rt__Network__dial(self, addr);
+  }
 }
-
-struct Listener {}
 
 impl Listener {
   fn accept(self: Listener) -> Result<Socket, Int32> {
@@ -21,26 +42,6 @@ impl Listener {
   fn close(self: Listener) {
     __ty_rt__Listener__close(self);
   }
-}
-
-struct Socket {}
-
-// ReadSocket/WriteSocket/SocketHalves — Task 2.5. Socket.consume() (below)
-// sent one channel op per BYTE (chan<Int8>), the opposite of D4's
-// chunk-based backpressure model, and its C implementation
-// (__ty_rt__Socket__consume) has been deleted from ty_net.c — this
-// extern declaration is now dead and calling it will fail to link.
-// split()/into_chan() is the replacement.
-struct ReadSocket {}
-struct WriteSocket {}
-
-// Named struct instead of an anonymous tuple return for Socket.split():
-// field access (self.ar-style) is confirmed syntax in this codebase;
-// tuple destructuring isn't confirmed anywhere I've seen, so this is the
-// lower-risk choice. Field names match TySplitResult in ty_net.c exactly.
-struct SocketHalves {
-  read: ReadSocket,
-  write: WriteSocket,
 }
 
 impl Socket {
@@ -87,6 +88,7 @@ impl WriteSocket {
 
 extern "C" {
     fn __ty_rt__Network__listen(self: Network, addr: Str) -> Result<Listener, Int32>
+    fn __ty_rt__Network__dial(self: Network, addr: Str) -> Result<Socket, Int32>
     fn __ty_rt__Listener__accept(self: Listener) -> Result<Socket, Int32>
     fn __ty_rt__Listener__close(self: Listener)
     fn __ty_rt__Socket__close(self: Socket)

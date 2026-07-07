@@ -66,8 +66,27 @@ int ty_io_submit(const TyIoOp* op) {
     Worker* w = ty_sched_current_worker();
     if (w && w->io_backend) {
         TyIoBackend* be = w->io_backend;
-        if (be->submit)
-            return be->submit(be, op);
+        if (be->submit) {
+            int rc = be->submit(be, op);
+            if (rc < 0) return rc;
+            /* Per-worker backends (IOCP, io_uring, kqueue) only
+             * register interest and return — they do NOT park the
+             * coroutine internally. The caller expects ty_io_submit to
+             * have waited for and yielded control context for the
+             * completion before returning (same as what the global
+             * driver's ty_io_read/ty_io_write do internally).
+             *
+             * For ACCEPT the existing callers (Listener__accept)
+             * already park separately and we must not double-park, so
+             * skip parking here — the caller handles it exactly.
+             * For READ/WRITE, callers (Socket__read, File__read,
+             * File__write) rely on us doing it. */
+            if (op->type != TY_IO_OP_ACCEPT) {
+                ty_coro_set_blocked();
+                ty_io_park_coro((SlabArena*)ty_current_arena());
+            }
+            return rc;
+        }
     }
 
     /* 3. Global io_driver fallback */

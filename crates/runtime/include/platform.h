@@ -139,9 +139,18 @@ static inline void ty_mutex_destroy(TyMutex* m) { pthread_mutex_destroy(m); }
 
 #if defined(__x86_64__) || defined(_M_X64)
 
+/*
+ * __attribute__((aligned(16))) is functionally unnecessary on x86-64
+ * (movq has no alignment requirement), but keeps the ABI identical to
+ * the AArch64 TyCtx which *must* be 16-byte-aligned for stp/ldp/movsp
+ * instructions.  An 8-byte TyCtx embedded in a Worker struct that is
+ * only 8-byte aligned hits stp alignment faults (SIGBUS) on AArch64;
+ * making TyCtx 16-byte-aligned forces every containing struct to
+ * respect that alignment, sidestepping the issue wholesale.
+ */
 typedef struct {
-	uint64_t regs[8]; /* rsp, r15, r14, r13, r12, rbx, rbp, rip */
-} TyCtx;
+	uint64_t regs[8];
+} __attribute__((aligned(16))) TyCtx;
 
 /* Implemented in ty_ctx.S — one translation unit only. */
 __attribute__((no_sanitize("address")))
@@ -171,7 +180,7 @@ static inline void ty_ctx_init(TyCtx* ctx, void* stack_bottom, size_t stack_size
 typedef struct {
 	uint64_t regs[22];
 	/* x19,x20,x21,x22,x23,x24,x25,x26,x27,x28,x29,x30(lr),sp,pad,d8-d15 */
-} TyCtx;
+} __attribute__((aligned(16))) TyCtx;
 
 /* Implemented in ty_ctx.S — one translation unit only. */
 __attribute__((no_sanitize("address")))

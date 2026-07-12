@@ -187,6 +187,7 @@ void ty_safepoint(void);
 void ty_await(SlabArena* arena, TyCoro* coro);
 
 void ty_coro_set_blocked(void);
+void ty_coro_set_running(void);
 
 /* Exit the current coroutine. Called automatically at function return. */
 void ty_coro_exit(void);

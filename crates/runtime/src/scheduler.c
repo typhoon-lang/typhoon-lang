@@ -1128,6 +1128,19 @@ void ty_coro_set_blocked(void) {
     coro_state_store(me, CORO_BLOCKED, "io_pre_submit");
 }
 
+/* Undo counterpart to ty_coro_set_blocked(), for callers that
+ * pre-emptively mark BLOCKED before a submit call that can then fail.
+ * If submit fails, nothing was queued with the kernel/backend, so
+ * nothing will ever wake this coroutine back up — it must go back to
+ * RUNNING (matching its actual state — still executing, right here)
+ * rather than park into a BLOCKED state with no rescuer. */
+void ty_coro_set_running(void) {
+    Worker* w = current_worker();
+    TyCoro* me = w ? w->current : NULL;
+    if (!me) return;
+    coro_state_store(me, CORO_RUNNING, "io_submit_failed_unblock");
+}
+
 void ty_coro_exit(void) {
     Worker* w = current_worker();
     TyCoro* co = w ? w->current : NULL;

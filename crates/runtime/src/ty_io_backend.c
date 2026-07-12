@@ -67,22 +67,41 @@ int ty_io_submit(const TyIoOp* op) {
     if (w && w->io_backend) {
         TyIoBackend* be = w->io_backend;
         if (be->submit) {
-            int rc = be->submit(be, op);
-            if (rc < 0) return rc;
-            /* Per-worker backends (IOCP, io_uring, kqueue) only
-             * register interest and return — they do NOT park the
-             * coroutine internally. The caller expects ty_io_submit to
-             * have waited for and yielded control context for the
-             * completion before returning (same as what the global
-             * driver's ty_io_read/ty_io_write do internally).
+            /* Mark BLOCKED *before* the kernel can see this op, not
+             * after submit() returns. Per-worker backends can complete
+             * fast enough (io_uring especially, against data already
+             * sitting in a socket buffer — often microseconds) that
+             * another worker's ty_io_poll() can process the completion
+             * and enqueue this coroutine as RUNNABLE while it's still
+             * genuinely executing here. sched_enqueue_wake does a
+             * plain, unconditional state store with no CAS, so that
+             * race clobbers CORO_RUNNING out from under us and lets a
+             * different worker steal + resume the same coroutine while
+             * this one is still running it — two OS threads executing
+             * the same coroutine stack concurrently. Setting BLOCKED
+             * first closes the window: any completion that races in
+             * now sees a coroutine that's supposed to be blocked, which
+             * is what ty_coro_block_and_yield (via ty_io_park_coro,
+             * called right below) is built to reconcile safely.
              *
-             * For ACCEPT the existing callers (Listener__accept)
-             * already park separately and we must not double-park, so
-             * skip parking here — the caller handles it exactly.
-             * For READ/WRITE, callers (Socket__read, File__read,
-             * File__write) rely on us doing it. */
+             * For ACCEPT the existing callers (Listener__accept) park
+             * separately themselves and must not be double-blocked
+             * here, so this still only applies to READ/WRITE. */
             if (op->type != TY_IO_OP_ACCEPT) {
                 ty_coro_set_blocked();
+            }
+            int rc = be->submit(be, op);
+            if (rc < 0) {
+                if (op->type != TY_IO_OP_ACCEPT) {
+                    /* Submit failed — nothing was queued with the
+                     * kernel, so nothing will ever wake this coroutine
+                     * back up. Undo the BLOCKED marking rather than
+                     * parking into a state nothing can rescue it from. */
+                    ty_coro_set_running();
+                }
+                return rc;
+            }
+            if (op->type != TY_IO_OP_ACCEPT) {
                 ty_io_park_coro((SlabArena*)ty_current_arena());
             }
             return rc;
@@ -126,17 +145,22 @@ int ty_io_submit(const TyIoOp* op) {
 int ty_io_poll(void) {
     if (use_mock) return 0;
 
+    TY_DEBUG("[io] ty_io_poll called\n");
+
     /* 1. Per-worker backend path */
     Worker* w = ty_sched_current_worker();
     if (w && w->io_backend) {
         TyIoBackend* be = w->io_backend;
-        if (be->poll)
+        if (be->poll) {
+            TY_DEBUG("[io] calling backend poll\n");
             return be->poll(be, sched_wake);
+        }
     }
 
     /* 2. Global io_driver fallback */
     void* drv = ty_io_global_driver();
     if (!drv) return 0;
+    TY_DEBUG("[io] calling global driver poll\n");
     ty_io_driver_poll(drv);
     return 0;
 }

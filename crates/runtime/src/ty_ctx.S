@@ -95,11 +95,14 @@ SYM(ty__coro_entry):
 /*
  * ty_ctx_swap(TyCtx* from [x0], TyCtx* to [x1])
  *
- * TyCtx.regs layout (uint64_t[14]):
+ * TyCtx.regs layout (uint64_t[22]):
  *   [0]  x19  [8]  x20  [16] x21  [24] x22
  *   [32] x23  [40] x24  [48] x25  [56] x26
  *   [64] x27  [72] x28  [80] x29(fp) [88] x30(lr)
- *   [96] sp   [104] pad
+ *   [96] sp   [104] d8   [112] d9   [120] d10  [128] d11
+ *   [136] d12  [144] d13  [152] d14  [160] d15
+ *   regs[]=22 fits save (12 GPR + sp + 8 SIMD = 21 uint64_t = 168 bytes)
+ *   in the 176-byte struct; TyCtx is 16-byte-aligned for stp/ldp.
  */
 .globl SYM(ty_ctx_swap)
 SYM_ALIAS(ty_ctx_swap)

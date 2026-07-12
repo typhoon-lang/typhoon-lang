@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#ifdef __linux__
+#include <sys/uio.h>   /* struct iovec — needed inside TyIoOp for
+                        * IORING_OP_READV/WRITEV iovec submission */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +19,15 @@ typedef struct TyIoOp {
   size_t len;
   void* coro;
   int32_t cancel_token; /* reserved for Phase 5 */
+#ifdef __linux__
+  struct iovec iov;   /* IORING_OP_READV/WRITEV need an iovec, not raw
+                       * buf+len. sqe->len for vectored ops is the iovec
+                       * *count*, not byte count — passing buf directly
+                       * makes the kernel treat buf as an iovec array
+                       * and causes EFAULT.  Storing the iovec here
+                       * (in stack-local op, alive while coro parked)
+                       * keeps the submission-side code simple. */
+#endif
 } TyIoOp;
 
 typedef void (*TySchedWakeFn)(void* coro, int64_t result);

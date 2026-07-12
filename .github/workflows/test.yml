@@ -64,6 +64,9 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -E '/usr/bin$|/mingw64/bin$' | paste -sd ':')
+          fi
           cargo build -p typhoon-cli
           cargo build -p typhoon-stdlib
           set -o pipefail

@@ -35,6 +35,23 @@
  * principle. Whichever worker does hold the lock will see every
  * completion in the ring, including ones meant for coroutines that
  * migrated elsewhere, so nothing is lost by skipping.
+ *
+ * ACCEPT — direct IORING_OP_ACCEPT, not IORING_OP_POLL_ADD.
+ * Earlier revisions used POLL_ADD with POLLIN, then called accept()
+ * synchronously in the completion handler — a common pattern, but
+ * the user-visible result was a 60s hang with `cq_head == cq_tail`
+ * forever despite nonstop calls to uring_enter(..., GETEVENTS). Root
+ * cause: POLL_ADD's registration semantics on a freshly-bindsocket'd
+ * listener interact badly with the kernel's poll wait queue when
+ * paired with our poll-on-cooperative-tick design — the wake we want
+ * is for "fd became readable", but the kernel only registers the
+ * waitqueue callback the first time conn-side ack's RTT allows, and
+ * if GETEVENTS-driven peels happen microseconds-before the CQE is
+ * posted (essentially always, in our test workloads), userspace never
+ * sees the transition. Direct IORING_OP_ACCEPT avoids the entire
+ * waitqueue dance: the kernel owns the wait, posts a CQE with the
+ * accepted fd in res, and we wake the coroutine from `result = c`.
+ * Cleaner side: no spurious-readiness EAGAIN re-submit loop.
  */
 
 #ifdef __linux__
@@ -58,8 +75,8 @@
 #define IORING_OP_READV 1
 #define IORING_OP_WRITEV 2
 #endif
-#ifndef IORING_OP_POLL_ADD
-#define IORING_OP_POLL_ADD 6
+#ifndef IORING_OP_ACCEPT
+#define IORING_OP_ACCEPT 13
 #endif
 #ifndef IORING_ENTER_GETEVENTS
 #define IORING_ENTER_GETEVENTS 1u
@@ -113,15 +130,23 @@ static int uring_submit_op(TyIoBackend* base, const TyIoOp* op) {
     memset(sqe, 0, sizeof(*sqe));
 
     if (op->type == TY_IO_OP_ACCEPT) {
-        /* Use IORING_OP_POLL_ADD with POLLIN to detect when the
-         * listener socket has a pending connection. When the
-         * completion fires, poll() calls accept() to get the fd.
+        /* Direct IORING_OP_ACCEPT — kernel owns the wait; we get a CQE
+         * with the accepted fd in `res`. Cleaner than POLL_ADD + manual
+         * accept() because there's no spurious-readiness race and no
+         * re-arm dance for one-shot accept completion.
          *
-         * POLL_ADD uses sqe->fd for the target fd and sqe->len
-         * for the poll mask; sqe->addr is unused. */
-        sqe->opcode = IORING_OP_POLL_ADD;
+         * flags = 0 (no SOCK_NONBLOCK, no SOCK_CLOEXEC), so the
+         * accepted fd inherits listener flags. We need O_NONBLOCK for
+         * the async read/write paths downstream, so set it explicitly
+         * afterwards in ty_net.c's Listener__accept — same place
+         * kqueue/IOCP backends do their post-accept setup.
+         *
+         * addr/addrlen must be present (may pass NULL/0 to skip). */
+        sqe->opcode = IORING_OP_ACCEPT;
         sqe->fd = (int)op->fd;
-        sqe->len = POLLIN;
+        sqe->addr = 0;
+        sqe->len = 0;
+        TY_DEBUG("[uring] submit ACCEPT fd=%d\n", (int)op->fd);
     } else {
         if (op->type == TY_IO_OP_READ) {
             sqe->opcode = IORING_OP_READV;
@@ -132,8 +157,20 @@ static int uring_submit_op(TyIoBackend* base, const TyIoOp* op) {
             return -1;
         }
         sqe->fd = (int)op->fd;
-        sqe->addr = (uint64_t)(uintptr_t)op->buf;
-        sqe->len = (uint32_t)op->len;
+        /* READV and WRITEV are vectored ops — sqe->len is iovec
+         * *count*, not byte count. Passing a raw buffer pointer with
+         * len=N causes the kernel to read N * sizeof(struct iovec)
+         * bytes of metadata from the buffer region, which crosses
+         * past the buffer end → EFAULT (-14). Wrap the buffer as a
+         * single-element iovec and pass its address instead.
+         *
+         * Const-cast is safe: we only write iovec fields (not
+         * structural corruption), and this op struct is stack-local
+         * to the caller (ty_net.c) — alive while coro is parked. */
+        ((TyIoOp*)op)->iov.iov_base = op->buf;
+        ((TyIoOp*)op)->iov.iov_len  = op->len;
+        sqe->addr = (uint64_t)(uintptr_t)&((TyIoOp*)op)->iov;
+        sqe->len = 1; /* single iovec */
     }
 
     /* NOTE, unchanged from before this rewrite and still worth flagging:
@@ -180,15 +217,36 @@ static int uring_poll_op(TyIoBackend* base, TySchedWakeFn wake) {
     TyUringBackend* b = (TyUringBackend*)base;
     if (!b || b->ring_fd < 0) return 0;
 
+    TY_DEBUG("[uring] poll: entry ring_fd=%d\n", b->ring_fd);
+
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(
             &b->poll_lock_flag, &expected, 1,
             memory_order_acquire, memory_order_relaxed)) {
+        TY_DEBUG("[uring] poll: try-lock failed, another worker draining\n");
         return 0; /* someone else is already draining this cycle */
     }
 
-    /* Non-blocking peek: enter with min_complete=0 and no GETEVENTS flag. */
-    int peek_rc = uring_enter(b->ring_fd, 0, 0, 0);
+    TY_DEBUG("[uring] poll: got lock, calling uring_enter(GETEVENTS)\n");
+
+    /* Enter with GETEVENTS so IORING_OP_POLL_ADD completions actually
+     * get delivered. Without this flag, a plain enter(0,0,0) returns
+     * immediately without driving kernel-side poll queues — reaping
+     * only whatever CQEs are already sitting in the ring buffer, which
+     * is never enough to see new accept/read/write completions that
+     * haven't been manually flushed from kernel-side poll work.
+     * GETEVENTS tells the kernel to actively drive pending internal
+     * operations (IORING_OP_POLL_ADD notably), post their CQEs, and
+     * make them visible to userspace via the CQ head/tail pointers.
+     *
+     * min_complete=0 (non-blocking): still returns immediately; it
+     * just also does the internal poll sweep before peeking, which costs
+     * microseconds but ensures no completion is stuck waiting for
+     * someone to call enter. */
+    int peek_rc = uring_enter(b->ring_fd, 0, 0, IORING_ENTER_GETEVENTS);
+
+    TY_DEBUG("[uring] poll: uring_enter(GETEVENTS) returned peek_rc=%d errno=%d\n",
+        peek_rc, peek_rc < 0 ? errno : 0);
 
     uint32_t* cq_head_ptr = (uint32_t*)((uint8_t*)b->cq_ring + b->cq_head_off);
     uint32_t* cq_tail_ptr = (uint32_t*)((uint8_t*)b->cq_ring + b->cq_tail_off);
@@ -198,6 +256,8 @@ static int uring_poll_op(TyIoBackend* base, TySchedWakeFn wake) {
     uint32_t head = *cq_head_ptr;
     uint32_t tail = *cq_tail_ptr;
     __sync_synchronize();
+
+    TY_DEBUG("[uring] poll: CQ head=%u tail=%u (diff=%u)\n", head, tail, tail - head);
 
     if (peek_rc < 0) {
         TY_DEBUG("[uring] poll: uring_enter(peek) failed rc=%d errno=%d\n", peek_rc, errno);
@@ -226,54 +286,13 @@ static int uring_poll_op(TyIoBackend* base, TySchedWakeFn wake) {
             int64_t result;
 
             if (op->type == TY_IO_OP_ACCEPT) {
-                /* POLL_ADD completion — the listener may be readable.
-                 * Call accept() to get the new client fd.
-                 * Spurious readiness is possible: POLL_ADD can fire
-                 * even when no connection is pending.  If accept()
-                 * returns EAGAIN, re-submit POLL_ADD and do NOT wake
-                 * the coroutine — it stays parked until a real
-                 * connection arrives.
-                 *
-                 * This re-submit goes through the SAME submit_lock as
-                 * uring_submit_op — it's manipulating the same SQ ring,
-                 * so it needs the same protection, not a separate
-                 * ad-hoc critical section. */
-                if (res >= 0) {
-                    int c = accept((int)op->fd, NULL, NULL);
-                    TY_DEBUG("[uring] ACCEPT cqe res=%d -> accept() returned c=%d errno=%d\n",
-                        res, c, c < 0 ? errno : 0);
-                    if (c < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        TY_DEBUG("[uring] ACCEPT spurious readiness (EAGAIN), re-submitting POLL_ADD fd=%d\n",
-                            (int)op->fd);
-                        ty_mutex_lock(&b->submit_lock);
-                        struct io_uring_sqe* rsqe;
-                        uint32_t* sq_tail_ptr2 = (uint32_t*)((uint8_t*)b->sq_ring + b->sq_tail_off);
-                        uint32_t* sq_array2 = (uint32_t*)((uint8_t*)b->sq_ring + b->sq_array_off);
-                        uint32_t tail2 = *sq_tail_ptr2;
-                        uint32_t idx2 = tail2 & b->sq_mask;
-                        rsqe = &((struct io_uring_sqe*)b->sqes)[idx2];
-                        memset(rsqe, 0, sizeof(*rsqe));
-                        rsqe->opcode = IORING_OP_POLL_ADD;
-                        rsqe->fd = (int)op->fd;
-                        rsqe->len = POLLIN;
-                        rsqe->user_data = (uint64_t)(uintptr_t)op;
-                        sq_array2[idx2] = idx2;
-                        __sync_synchronize();
-                        *sq_tail_ptr2 = tail2 + 1;
-                        __sync_synchronize();
-                        int resub_rc = uring_enter(b->ring_fd, 1, 0, 0);
-                        TY_DEBUG("[uring] ACCEPT re-submit POLL_ADD enter_rc=%d errno=%d\n",
-                            resub_rc, resub_rc < 0 ? errno : 0);
-                        ty_mutex_unlock(&b->submit_lock);
-                        continue; /* skip wake — coro stays parked */
-                    }
-                    result = (c < 0) ? -(int64_t)errno : (int64_t)c;
-                } else {
-                    /* POLL_ADD itself failed — propagate the error
-                     * so the accept loop in ty_net.c can handle it
-                     * (e.g. retry on EINVAL from old kernels). */
-                    result = (int64_t)res;
-                }
+                /* Direct IORING_OP_ACCEPT completion: kernel has
+                 * performed accept() and `res` is the new fd (>=0)
+                 * or -errno (<0) on failure. Wake the parked
+                 * coroutine with that value, then let ty_net.c's
+                 * Listener__accept do the post-accept setup
+                 * (O_NONBLOCK, fdset tracking, TySocket allocation). */
+                result = (int64_t)res;
             } else if (res < 0) {
                 /* io_uring negative results are -errno */
                 result = (int64_t)res;
@@ -290,6 +309,8 @@ static int uring_poll_op(TyIoBackend* base, TySchedWakeFn wake) {
 
     __sync_synchronize();
     *cq_head_ptr = head;
+
+    TY_DEBUG("[uring] poll: processed %d CQE(s), new head=%u\n", count, head);
 
     atomic_store_explicit(&b->poll_lock_flag, 0, memory_order_release);
     return count;

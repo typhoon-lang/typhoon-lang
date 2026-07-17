@@ -43,37 +43,40 @@
 
 #include "ty_io.h"
 
-typedef struct TyStr {
-    char* ptr;
-    int32_t len;
-} TyStr;
-
-typedef enum {
-    TY_MODE_READ = 0,
-    TY_MODE_WRITE = 1,
-    TY_MODE_APPEND = 2,
-    TY_MODE_READ_WRITE = 3,
-    TY_MODE_CREATE = 4,
-} TyMode;
-
-typedef struct { int32_t tag; TyFile* value; int32_t err; } TyResult_FilePtr_i32;
-typedef struct { int32_t tag; int64_t value; int32_t err; } TyResult_i64_i32;
-
 extern SlabArena* slab_arena_new(void);
 extern void slab_arena_free(SlabArena* arena);
 
 extern void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode,
-    TyResult_FilePtr_i32* out);
+    TyResult_File_i32* out);
 extern void __ty_rt__File__close(void* task, TyFile* self);
 extern void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap,
-    TyResult_i64_i32* out);
-extern void __ty_rt__File__write(void* task, TyFile* self, char* buf, int32_t len,
-    TyResult_i64_i32* out);
+    TyResult_i32* out);
+extern void __ty_rt__File__write(void* task, TyFile* self, TyStr* content,
+    TyResult_i32* out);
 
 static TyStr make_str(const char* s) {
     TyStr str;
     str.ptr = (char*)s;
     str.len = (int32_t)strlen(s);
+    return str;
+}
+
+/* make_str() truncates at the first 0x00 via strlen() — fine for the
+ * null-terminated path string, wrong for binary test content. This test's
+ * content is deliberately non-repeating across all 256 byte values
+ * ((i*31+7)&0xFF), which guarantees an embedded 0x00 well before
+ * TOTAL_SIZE (first one lands at i=231) — strlen(expected) silently
+ * returns 231 instead of TOTAL_SIZE=13065, so only 231 bytes ever actually
+ * got written. That's the root cause of the access violation: the write
+ * assert further down was comparing against the wrong (truncated) length,
+ * and the reassembled-content memcmp against `expected` was running past
+ * what was ever actually written to disk. Use the explicit-length version
+ * for content; make_str() stays as-is for the path.
+ */
+static TyStr make_str_n(const char* s, int32_t len) {
+    TyStr str;
+    str.ptr = (char*)s;
+    str.len = len;
     return str;
 }
 
@@ -96,28 +99,30 @@ int main(void) {
     }
 
     /* write the whole thing in one call */
+    /* write */
     {
         TyStr path = make_str(path_str);
-        TyResult_FilePtr_i32 open_out;
+        TyResult_File_i32 open_out;
         __ty_rt__fs__open((void*)arena, &path, TY_MODE_CREATE, &open_out);
         assert(open_out.tag == 0 && "create/write open should succeed");
-        TyFile* f = open_out.value;
+        TyFile* f = open_out.ok;
 
-        TyResult_i64_i32 write_out;
-        __ty_rt__File__write((void*)arena, f, expected, TOTAL_SIZE, &write_out);
+        TyResult_i32 write_out;
+        TyStr content_str = make_str_n(expected, TOTAL_SIZE);
+        __ty_rt__File__write((void*)arena, f, &content_str, &write_out);
         assert(write_out.tag == 0 && "write should succeed");
-        assert(write_out.value == TOTAL_SIZE && "write should report full length");
+        assert(write_out.ok == TOTAL_SIZE && "write should report full length");
 
         __ty_rt__File__close((void*)arena, f);
     }
 
-    /* read it back in 4KB chunks against the *same* TyFile* across calls */
+    /* read back */
     {
         TyStr path = make_str(path_str);
-        TyResult_FilePtr_i32 open_out;
+        TyResult_File_i32 open_out;
         __ty_rt__fs__open((void*)arena, &path, TY_MODE_READ, &open_out);
         assert(open_out.tag == 0 && "read open should succeed");
-        TyFile* f = open_out.value;
+        TyFile* f = open_out.ok;
 
         char* actual = (char*)malloc(TOTAL_SIZE + CHUNK_SIZE); /* pad for last chunk */
         assert(actual);
@@ -126,13 +131,13 @@ int main(void) {
 
         for (;;) {
             char chunk[CHUNK_SIZE];
-            TyResult_i64_i32 read_out;
+            TyResult_i32 read_out;
             __ty_rt__File__read((void*)arena, f, chunk, CHUNK_SIZE, &read_out);
             assert(read_out.tag == 0 && "each chunked read should succeed");
-            if (read_out.value == 0) break; /* EOF */
+            if (read_out.ok == 0) break; /* EOF */
 
-            memcpy(actual + total_read, chunk, (size_t)read_out.value);
-            total_read += read_out.value;
+            memcpy(actual + total_read, chunk, (size_t)read_out.ok);
+            total_read += read_out.ok;
             chunk_count++;
 
             assert(chunk_count < 1000 && "runaway read loop — EOF never signaled");

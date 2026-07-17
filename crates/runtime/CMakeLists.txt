@@ -55,16 +55,24 @@ if(BUILD_TESTS)
     test/test_phase2_write_read_roundtrip.c
     test/test_phase3_buf_growth_10k.c
     test/test_phase3_file_chunked_read.c
+    test/test_phase3_file_iocp_coroutine.c
     test/test_phase3_file_lifecycle.c
     test/test_phase3_large_sprintf.c
+    test/test_phase4_fdset_100_sockets_asan.c
     test/test_phase4_fdset_live_worker.c
     test/test_phase4_fdset.c
+    test/test_phase4_linux_1000_coroutines.c
+    test/test_phase4_macos_coroutine_loopback.c
     test/test_phase4_mock_io.c
     test/test_phase4_net_fdset.c
     test/test_task03_double_close.c
   )
 
   foreach(test_src ${C_TEST_SOURCES})
+    if(WIN32 AND (test_src MATCHES "linux" OR test_src MATCHES "macos"))
+        continue()
+    endif()
+
     # Derive binary name from filename without extension
     get_filename_component(test_name ${test_src} NAME_WE)
 

@@ -65,6 +65,19 @@
 #include "atomic.h"   /* _Atomic — singleton create-lock once-guard */
 #include "platform.h" /* TyMutex — guards the singleton create/destroy path */
 
+/* TyFile definition (must match ty_io.c) — needed for FILE_FLAG_OVERLAPPED
+ * position tracking in iocp_submit and iocp_poll. Kept here to avoid
+ * exposing TyFile in the public ty_io.h while still allowing the IOCP
+ * backend to access the file position field. */
+struct TyFile {
+    int fd;
+    int closed;
+#ifdef _WIN32
+    int64_t pos; /* file position for FILE_FLAG_OVERLAPPED handles */
+#endif
+};
+typedef struct TyFile TyFile;
+
 #define MAX_DRAIN 64
 
 /* ── request kinds, and the shared header every request struct starts
@@ -278,6 +291,13 @@ static int iocp_submit(TyIoBackend* base, const TyIoOp* op) {
     req->hdr.kind = IOCP_REQ_RW;
     req->op = *op;
 
+    /* For non-socket files with FILE_FLAG_OVERLAPPED, set file offset from TyFile.pos */
+    if (!is_socket && op->file_ptr) {
+        TyFile* file = (TyFile*)op->file_ptr;
+        req->hdr.ol.Offset = (DWORD)(file->pos & 0xFFFFFFFF);
+        req->hdr.ol.OffsetHigh = (DWORD)(file->pos >> 32);
+    }
+
     BOOL ok = FALSE;
     DWORD bytes = 0;
 
@@ -286,7 +306,18 @@ static int iocp_submit(TyIoBackend* base, const TyIoOp* op) {
         DWORD flags = 0;
         wb.buf = (CHAR*)op->buf;
         wb.len = (ULONG)op->len;
+        {
+            struct sockaddr_storage peer;
+            int peer_len = (int)sizeof(peer);
+            int peer_rc = getpeername((SOCKET)op->fd, (struct sockaddr*)&peer, &peer_len);
+            int peer_err = peer_rc == 0 ? 0 : WSAGetLastError();
+            TY_DEBUG("[iocp] read submit fd=%d len=%lu getpeername rc=%d wsa_err=%d peer_len=%d\n",
+                     (int)op->fd, (unsigned long)wb.len, peer_rc, peer_err, peer_len);
+        }
         ok = (WSARecv((SOCKET)op->fd, &wb, 1, &bytes, &flags, &req->hdr.ol, NULL) == 0);
+        TY_DEBUG("[iocp] WSARecv ret=%d bytes=%lu flags=%lu last_err=%lu\n",
+                 ok, (unsigned long)bytes, (unsigned long)flags,
+                 (unsigned long)WSAGetLastError());
     } else if (is_socket && op->type == TY_IO_OP_WRITE) {
         WSABUF wb;
         wb.buf = (CHAR*)op->buf;
@@ -301,7 +332,6 @@ static int iocp_submit(TyIoBackend* base, const TyIoOp* op) {
         return -1;
     }
 
-    (void)bytes;
     if (!ok) {
         DWORD err = is_socket ? (DWORD)WSAGetLastError() : GetLastError();
         DWORD pending = is_socket ? WSA_IO_PENDING : ERROR_IO_PENDING;
@@ -310,6 +340,14 @@ static int iocp_submit(TyIoBackend* base, const TyIoOp* op) {
             HeapFree(GetProcessHeap(), 0, req);
             return 0;
         }
+    } else {
+        /* IOCP still queues a completion for overlapped operations that
+         * complete immediately (unless FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+         * was explicitly requested, which we never do). Let poll() deliver
+         * the real dwNumberOfBytesTransferred value instead of trusting the
+         * synchronous bytes out-param, which can be 0 on overlapped sockets
+         * even when the queued completion carries data. */
+        (void)bytes;
     }
 
     return 0;
@@ -386,6 +424,11 @@ static int iocp_poll(TyIoBackend* base, TySchedWakeFn wake) {
                 result = -(int64_t)(ol->Internal & 0xFFFF);
             } else {
                 result = (int64_t)transferred;
+                /* Update file position for FILE_FLAG_OVERLAPPED files */
+                if (op->file_ptr) {
+                    TyFile* file = (TyFile*)op->file_ptr;
+                    file->pos += transferred;
+                }
             }
 
             if (wake && op->coro) {

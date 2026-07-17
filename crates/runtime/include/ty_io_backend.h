@@ -19,6 +19,7 @@ typedef struct TyIoOp {
   size_t len;
   void* coro;
   int32_t cancel_token; /* reserved for Phase 5 */
+  void* file_ptr;     /* For Windows FILE_FLAG_OVERLAPPED files: pointer to TyFile for position tracking */
 #ifdef __linux__
   struct iovec iov;   /* IORING_OP_READV/WRITEV need an iovec, not raw
                        * buf+len. sqe->len for vectored ops is the iovec

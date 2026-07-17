@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "ty_mem.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,25 @@ TyStdin*  ty_stdin_new(SlabArena* arena);
 
 int64_t ty_sys_write(int fd, const char* buf, size_t len);
 int64_t ty_sys_read (int fd, char* buf, size_t len);
+
+/* ── File System ─────────────────────────────────────────────────────────── */
+
+typedef enum {
+    TY_MODE_READ = 0,
+    TY_MODE_WRITE = 1,
+    TY_MODE_APPEND = 2,
+    TY_MODE_READ_WRITE = 3,
+    TY_MODE_CREATE = 4,
+} TyMode;
+
+typedef struct { int32_t tag; TyFile* ok; int32_t err; } TyResult_File_i32;
+typedef struct { int32_t tag; int32_t ok; int32_t err; } TyResult_i32;
+typedef struct { int32_t tag; int64_t value; int32_t err; } TyResult_i64_i32;
+
+void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode, TyResult_File_i32* out);
+void __ty_rt__File__close(void* task, TyFile* self);
+void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap, TyResult_i32* out);
+void __ty_rt__File__write(void* task, TyFile* self, TyStr* content, TyResult_i32* out);
 
 #ifdef __cplusplus
 }

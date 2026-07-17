@@ -70,35 +70,26 @@
 #include "ty_io.h" /* real header: gives us SlabArena, Buf, TyFile (opaque),
                        TyStdout, TyStdin, ty_stdout_*, ty_sys_read/write */
 
-/* Not declared in ty_io.h — see ASSUMPTIONS note 2 above. */
-typedef struct TyStr {
-    char* ptr;
-    int32_t len;
-} TyStr;
-
-typedef enum {
-    TY_MODE_READ = 0,
-    TY_MODE_WRITE = 1,
-    TY_MODE_APPEND = 2,
-    TY_MODE_READ_WRITE = 3,
-    TY_MODE_CREATE = 4,
-} TyMode;
-
-typedef struct { int32_t tag; TyFile* value; int32_t err; } TyResult_FilePtr_i32;
-typedef struct { int32_t tag; int64_t value; int32_t err; } TyResult_i64_i32;
-
 /* slab_arena_new/free aren't in ty_io.h either (likely ty_mem.h, not
  * yet shared) — forward-declared here for the same reason. */
 extern SlabArena* slab_arena_new(void);
 extern void slab_arena_free(SlabArena* arena);
 
+/* Forward declarations for runtime entry points not in ty_io.h */
 extern void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode,
-    TyResult_FilePtr_i32* out);
+    TyResult_File_i32* out);
 extern void __ty_rt__File__close(void* task, TyFile* self);
 extern void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap,
-    TyResult_i64_i32* out);
-extern void __ty_rt__File__write(void* task, TyFile* self, char* buf, int32_t len,
-    TyResult_i64_i32* out);
+    TyResult_i32* out);
+extern void __ty_rt__File__write(void* task, TyFile* self, TyStr* content,
+    TyResult_i32* out);
+/* NOTE: fixed 2024 — this was previously declared (and called) with a stale
+ * (char* buf, int32_t len) signature that doesn't match the real
+ * __ty_rt__File__write (TyStr* content, no separate length — length lives in
+ * the TyStr). The mismatched extra int32 argument was shifting what the real
+ * function reads as `out`, so write_out was never actually populated by the
+ * real call — it was stack garbage, which is why `write_out.ok == content_len`
+ * was failing nondeterministically. */
 
 static TyStr make_str(const char* s) {
     TyStr str;
@@ -110,15 +101,15 @@ static TyStr make_str(const char* s) {
 /* --- sub-test 1: open a file that doesn't exist ------------------------- */
 static void test_open_nonexistent(SlabArena* arena) {
     TyStr path = make_str("ty_phase3_test_definitely_does_not_exist_12345.txt");
-    TyResult_FilePtr_i32 out;
-    __ty_rt__fs__open((void*)arena, &path, TY_MODE_READ, &out);
+    TyResult_File_i32 result;
+    __ty_rt__fs__open((void*)arena, &path, TY_MODE_READ, &result);
 
-    assert(out.tag != 0 && "opening a nonexistent file should be an error result");
-    assert(out.err == ENOENT &&
+    assert(result.tag != 0 && "opening a nonexistent file should be an error result");
+    assert(result.err == ENOENT &&
         "expected ENOENT for a missing file — if this fails, check whether "
         "ty_mode_to_flags/open() on your platform surfaces a different errno");
     printf("[ok] open_nonexistent: tag=%d err=%d (ENOENT=%d)\n",
-        out.tag, out.err, ENOENT);
+        result.tag, result.err, ENOENT);
 }
 
 /* --- sub-test 2: open/write/close, then reopen/read/close --------------- */
@@ -130,35 +121,33 @@ static void test_write_then_read(SlabArena* arena) {
     /* write */
     {
         TyStr path = make_str(path_str);
-        TyResult_FilePtr_i32 open_out;
+        TyResult_File_i32 open_out;
         __ty_rt__fs__open((void*)arena, &path, TY_MODE_CREATE, &open_out);
         assert(open_out.tag == 0 && "opening for create/write should succeed");
-        TyFile* f = open_out.value;
+        TyFile* f = open_out.ok;
 
-        TyResult_i64_i32 write_out;
-        __ty_rt__File__write((void*)arena, f, (char*)content, content_len, &write_out);
+        TyResult_i32 write_out;
+        TyStr content_str = make_str(content);
+        __ty_rt__File__write((void*)arena, f, &content_str, &write_out);
         assert(write_out.tag == 0 && "write should succeed");
-        assert(write_out.value == content_len && "write should report full length written");
+        assert(write_out.ok == content_len && "write should report full length written");
 
         __ty_rt__File__close((void*)arena, f);
-        /* Can't check a "closed" flag here — TyFile is opaque per
-         * ty_io.h. Black-box confirmation of close state comes from
-         * the double-close sub-test below instead. */
     }
 
     /* read back */
     {
         TyStr path = make_str(path_str);
-        TyResult_FilePtr_i32 open_out;
+        TyResult_File_i32 open_out;
         __ty_rt__fs__open((void*)arena, &path, TY_MODE_READ, &open_out);
         assert(open_out.tag == 0 && "reopening for read should succeed");
-        TyFile* f = open_out.value;
+        TyFile* f = open_out.ok;
 
         char buf[256] = {0};
-        TyResult_i64_i32 read_out;
+        TyResult_i32 read_out;
         __ty_rt__File__read((void*)arena, f, buf, (int32_t)sizeof(buf), &read_out);
         assert(read_out.tag == 0 && "read should succeed");
-        assert(read_out.value == content_len &&
+        assert(read_out.ok == content_len &&
             "read should return exactly the bytes written");
         assert(memcmp(buf, content, (size_t)content_len) == 0 &&
             "read bytes should match what was written");
@@ -180,10 +169,10 @@ static void test_double_close_asserts(SlabArena* arena) {
 #else
     const char* path_str = "ty_phase3_test_doubleclose.txt";
     TyStr path = make_str(path_str);
-    TyResult_FilePtr_i32 open_out;
+    TyResult_File_i32 open_out;
     __ty_rt__fs__open((void*)arena, &path, TY_MODE_CREATE, &open_out);
     assert(open_out.tag == 0);
-    TyFile* f = open_out.value;
+    TyFile* f = open_out.ok;
 
     pid_t pid = fork();
     if (pid == 0) {

@@ -38,11 +38,6 @@
                        typedefs, so this doesn't fight test_phase3_file_*.c's
                        copies if they're ever compiled together */
 
-typedef struct TyStr {
-    char* ptr;
-    int32_t len;
-} TyStr;
-
 extern SlabArena* slab_arena_new(void);
 extern void slab_arena_free(SlabArena* arena);
 

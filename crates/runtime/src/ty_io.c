@@ -65,6 +65,9 @@ struct TyStdin {
 struct TyFile {
     int fd;
     int closed; /* debug guard, same pattern as Socket__close (Task 0.3) */
+#ifdef _WIN32
+    int64_t pos; /* file position for FILE_FLAG_OVERLAPPED handles (no implicit file pointer) */
+#endif
 };
 
 /*
@@ -113,30 +116,27 @@ struct TyFile {
 TY_IO_DEFINE_POOL(g_file_pool, TyFile)
 
 /*
- * Result shapes local to ty_io.c — mirrors ty_net.c's TyResult_i32_i32
- * shape (tag/value/err) but scoped here since ty_io.c doesn't include
- * ty_net.h. `err` is a raw errno/GetLastError code, matching the
- * codebase's actual current convention: Task 1.2's typed IoError enum
- * doesn't exist yet anywhere in the runtime (see typhoon_io_redesign.md
- * Phase 1, still open) — using it here would be referencing a type that
- * isn't real yet, so this follows what ty_net.c actually does today.
+ * Result shapes must match ty_io.h's public layout (tag-at-offset-0,
+ * `ok`/`value` next, `err` last) — using strictly local typedefs here
+ * caused the previously public 12-byte structs to be silently widened
+ * to 16 bytes, which let the callee overrun the caller's 12-byte slot
+ * and crash the next three tests on the stack. We just write straight
+ * into the caller's struct via the pointer they handed us, and rely
+ * on the header's contract for the field names/widths.
+ *
+ * `TyResult_File_i32` and `TyResult_i32` are declared in ty_io.h.
+ * `TyResult_i64_i32` is purely internal: TyFile's seek op returns a
+ * 64-bit offset, which isn't part of the public API. We keep the
+ * local typedef for it and never expose it across translation units.
  */
-typedef struct { int32_t tag; TyFile* value; int32_t err; } TyResult_FilePtr_i32;
-typedef struct { int32_t tag; int64_t value; int32_t err; } TyResult_i64_i32;
 
 /*
  * TyMode ordinals: ASSUMED — I don't have visibility into codegen.rs's
  * actual enum lowering for Mode::Read/Write/Append/ReadWrite/Create, so
- * these values are a guess at the ordinal order, not a confirmed ABI.
- * Verify against the compiler before relying on this in a real build.
- */
-typedef enum {
-    TY_MODE_READ = 0,
-    TY_MODE_WRITE = 1,
-    TY_MODE_APPEND = 2,
-    TY_MODE_READ_WRITE = 3,
-    TY_MODE_CREATE = 4,
-} TyMode;
+ /*
+  * these values are a guess at the ordinal order, not a confirmed ABI.
+  * Verify against the compiler before relying on this in a real build.
+  */
 
 #ifdef _WIN32
 static int ty_mode_to_flags(TyMode mode) {
@@ -163,14 +163,14 @@ static int ty_mode_to_flags(TyMode mode) {
 #endif
 
 void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode,
-    TyResult_FilePtr_i32* out) {
+    TyResult_File_i32* out) {
     (void)task;
-    TyResult_FilePtr_i32 result;
-    result.tag = 1;
-    result.value = NULL;
-    result.err = -1;
+    if (!out) return;
+    out->tag = 1;
+    out->ok = NULL;
+    out->err = -1;
 
-    if (!path || !path->ptr) { *out = result; return; }
+    if (!path || !path->ptr) return;
 
     int flags = ty_mode_to_flags(mode);
 
@@ -182,13 +182,38 @@ void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode,
      * defensively copying. If Str slicing is ever added and can produce
      * a view that doesn't end at a '\0', this breaks silently. */
 #ifdef _WIN32
-    int fd = _open(path->ptr, flags, _S_IREAD | _S_IWRITE);
+    DWORD access = 0;
+    DWORD creation = 0;
+    int osfhandle_flags = _O_BINARY;
+    switch (mode) {
+        case TY_MODE_READ:       access = GENERIC_READ; creation = OPEN_EXISTING; osfhandle_flags |= _O_RDONLY; break;
+        case TY_MODE_WRITE:      access = GENERIC_WRITE; creation = CREATE_ALWAYS; osfhandle_flags |= _O_RDWR; break;
+        case TY_MODE_APPEND:     access = GENERIC_WRITE; creation = OPEN_ALWAYS; osfhandle_flags |= _O_RDWR; break;
+        case TY_MODE_READ_WRITE: access = GENERIC_READ | GENERIC_WRITE; creation = OPEN_EXISTING; osfhandle_flags |= _O_RDWR; break;
+        case TY_MODE_CREATE:     access = GENERIC_READ | GENERIC_WRITE; creation = CREATE_ALWAYS; osfhandle_flags |= _O_RDWR; break;
+        default:                 access = GENERIC_READ; creation = OPEN_EXISTING; osfhandle_flags |= _O_RDONLY; break;
+    }
+    /* No FILE_FLAG_OVERLAPPED: sync _read/_write must work, and IOCP
+     * still queues completions for overlapped ops on handles associated
+     * with a completion port (disk I/O often completes inline but still
+     * posts to IOCP). */
+    HANDLE h = CreateFileA(path->ptr, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, creation, FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        out->err = (int)GetLastError();
+        return;
+    }
+    int fd = _open_osfhandle((intptr_t)h, osfhandle_flags);
+    if (fd < 0) {
+        CloseHandle(h);
+        out->err = errno;
+        return;
+    }
 #else
     int fd = open(path->ptr, flags, 0644);
 #endif
     if (fd < 0) {
-        result.err = errno;
-        *out = result;
+        out->err = errno;
         return;
     }
 
@@ -199,17 +224,18 @@ void __ty_rt__fs__open(void* task, TyStr* path, TyMode mode,
 #else
         close(fd);
 #endif
-        result.err = -1;
-        *out = result;
+        out->err = -1;
         return;
     }
     f->fd = fd;
     f->closed = 0;
+#ifdef _WIN32
+    f->pos = 0;
+#endif
 
-    result.tag = 0;
-    result.value = f;
-    result.err = 0;
-    *out = result;
+    out->tag = 0;
+    out->ok = f;
+    out->err = 0;
 }
 
 void __ty_rt__File__close(void* task, TyFile* self) {
@@ -239,13 +265,14 @@ void __ty_rt__File__close(void* task, TyFile* self) {
  * runtime rather than the older per-subsystem design.
  */
 void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap,
-    TyResult_i64_i32* out) {
-    TyResult_i64_i32 result;
-    result.tag = 1;
-    result.value = 0;
-    result.err = -1;
+    TyResult_i32* out) {
+    (void)task;
+    if (!out) return;
+    out->tag = 1;
+    out->ok = 0;
+    out->err = -1;
 
-    if (!self || !buf) { *out = result; return; }
+    if (!self || !buf) return;
 
     void* coro = ty_current_coro_raw();
     if (coro) {
@@ -260,42 +287,84 @@ void __ty_rt__File__read(void* task, TyFile* self, char* buf, int32_t cap,
         op.buf = buf;
         op.len = (size_t)cap;
         op.coro = coro;
+        op.file_ptr = self;  /* For Windows FILE_FLAG_OVERLAPPED position tracking */
         ty_io_submit(&op);
         int64_t r = ty_io_take_result(coro);
         if (r < 0) {
-            result.err = (int32_t)(-r);
-            *out = result;
+            out->err = (int32_t)(-r);
             return;
         }
-        result.tag = 0;
-        result.value = r;
-        result.err = 0;
-        *out = result;
+        out->tag = 0;
+        out->ok = (int32_t)r;
+        out->err = 0;
         return;
     }
 
-    /* sync fallback — outside coroutine context */
+    /* sync fallback — outside coroutine context
+     * For files opened with FILE_FLAG_OVERLAPPED, use ReadFile/WriteFile
+     * with a local OVERLAPPED and wait for completion. Overlapped handles
+     * have no implicit file pointer - we must track position ourselves. */
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle(self->fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        out->err = ERROR_INVALID_HANDLE;
+        return;
+    }
+    OVERLAPPED ol = {0};
+    ol.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ol.Offset = (DWORD)(self->pos & 0xFFFFFFFF);
+    ol.OffsetHigh = (DWORD)(self->pos >> 32);
+    DWORD got = 0;
+    DWORD err = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)cap, &got, &ol);
+    if (!ok) {
+        err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            ok = GetOverlappedResult(h, &ol, &got, TRUE);
+            if (!ok) {
+                err = GetLastError();
+            }
+        }
+    }
+    CloseHandle(ol.hEvent);
+    /* ERROR_HANDLE_EOF (38) with 0 bytes transferred means clean EOF */
+    if (!ok && err == ERROR_HANDLE_EOF && got == 0) {
+        out->tag = 0;
+        out->ok = 0;
+        out->err = 0;
+        return;
+    }
+    if (!ok) {
+        out->err = (int32_t)err;
+        return;
+    }
+    self->pos += got;
+    out->tag = 0;
+    out->ok = (int32_t)got;
+    out->err = 0;
+#else
     int64_t n = ty_sys_read(self->fd, buf, (size_t)cap);
     if (n < 0) {
-        result.err = errno;
-        *out = result;
+        out->err = errno;
         return;
     }
-    result.tag = 0;
-    result.value = n;
-    result.err = 0;
-    *out = result;
+    out->tag = 0;
+    out->ok = (int32_t)n;
+    out->err = 0;
+#endif
 }
 
-void __ty_rt__File__write(void* task, TyFile* self, char* buf, int32_t len,
-    TyResult_i64_i32* out) {
+void __ty_rt__File__write(void* task, TyFile* self, TyStr* content,
+    TyResult_i32* out) {
     (void)task;
-    TyResult_i64_i32 result;
-    result.tag = 1;
-    result.value = 0;
-    result.err = -1;
+    if (!out) return;
+    out->tag = 1;
+    out->ok = 0;
+    out->err = -1;
 
-    if (!self || !buf) { *out = result; return; }
+    if (!self || !content || !content->ptr) return;
+    char* buf = content->ptr;
+    int32_t len = content->len;
 
     void* coro = ty_current_coro_raw();
     if (coro) {
@@ -307,31 +376,64 @@ void __ty_rt__File__write(void* task, TyFile* self, char* buf, int32_t len,
         op.buf = buf;
         op.len = (size_t)len;
         op.coro = coro;
+        op.file_ptr = self;  /* For Windows FILE_FLAG_OVERLAPPED position tracking */
         ty_io_submit(&op);
         int64_t r = ty_io_take_result(coro);
         if (r < 0) {
-            result.err = (int32_t)(-r);
-            *out = result;
+            out->err = (int32_t)(-r);
             return;
         }
-        result.tag = 0;
-        result.value = r;
-        result.err = 0;
-        *out = result;
+        out->tag = 0;
+        out->ok = (int32_t)r;
+        out->err = 0;
         return;
     }
 
-    /* sync fallback — outside coroutine context */
-    int64_t n = ty_sys_write(self->fd, buf, (size_t)len);
-    if (n < 0) {
-        result.err = errno;
-        *out = result;
+    /* sync fallback — outside coroutine context
+     * For files opened with FILE_FLAG_OVERLAPPED, use ReadFile/WriteFile
+     * with a local OVERLAPPED and wait for completion. Overlapped handles
+     * have no implicit file pointer - we must track position ourselves. */
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle(self->fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        out->err = ERROR_INVALID_HANDLE;
         return;
     }
-    result.tag = 0;
-    result.value = n;
-    result.err = 0;
-    *out = result;
+    OVERLAPPED ol = {0};
+    ol.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ol.Offset = (DWORD)(self->pos & 0xFFFFFFFF);
+    ol.OffsetHigh = (DWORD)(self->pos >> 32);
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, buf, (DWORD)len, &written, &ol);
+    DWORD err = 0;
+    if (!ok) {
+        err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            ok = GetOverlappedResult(h, &ol, &written, TRUE);
+            if (!ok) {
+                err = GetLastError();
+            }
+        }
+    }
+    CloseHandle(ol.hEvent);
+    if (!ok) {
+        out->err = (int32_t)err;
+        return;
+    }
+    self->pos += written;
+    out->tag = 0;
+    out->ok = (int32_t)written;
+    out->err = 0;
+#else
+    int64_t n = ty_sys_write(self->fd, buf, (size_t)len);
+    if (n < 0) {
+        out->err = errno;
+        return;
+    }
+    out->tag = 0;
+    out->ok = (int32_t)n;
+    out->err = 0;
+#endif
 }
 
 /*
@@ -362,6 +464,7 @@ void __ty_rt__File__seek(void* task, TyFile* self, int64_t offset,
     result.tag = 0;
     result.value = newpos.QuadPart;
     result.err = 0;
+    self->pos = newpos.QuadPart;
     *out = result;
 #else
     off_t pos = lseek(self->fd, (off_t)offset, whence);

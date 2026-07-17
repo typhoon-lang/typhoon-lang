@@ -548,10 +548,9 @@ static void sched_enqueue(TyCoro* co) {
  * drive loop (which only processes worker 0) is guaranteed to see it,
  * regardless of which worker thread is executing the wakeup. */
 void sched_enqueue_wake(TyCoro* co) {
-    coro_state_store(co, CORO_RUNNABLE, "wake_enqueue");
-    // /* Only wake truly BLOCKED coroutines; avoid enqueueing RUNNING/DONE. */
-    // if (!coro_state_cas(co, CORO_BLOCKED, CORO_RUNNABLE, "wake_enqueue"))
-    //     return;
+    /* Only wake truly BLOCKED coroutines; avoid enqueueing RUNNING/DONE. */
+    if (!coro_state_cas(co, CORO_BLOCKED, CORO_RUNNABLE, "wake_enqueue"))
+        return;
     atomic_fetch_add_explicit(&dbg_woken, 1, memory_order_relaxed);
     TY_DEBUG("[sched] enqueue(wake) coro=%p onto worker 0\n", (void*)co);
     deque_push(&workers[0].deque, co);

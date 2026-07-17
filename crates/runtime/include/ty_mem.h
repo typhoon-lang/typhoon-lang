@@ -81,7 +81,12 @@ TyStr* ty_buf_into_str(SlabArena* arena, Buf* b);
 /* Frees a TyStr produced by ty_buf_into_str() from a heap_owned Buf
  * (ty_buf_new_heap). Do NOT call this on a TyStr from an arena-owned
  * Buf — that memory belongs to the arena's bump pages, not malloc, and
- * freeing it here will corrupt the heap. */
+ * freeing it here will corrupt the heap.
+ * Chunks from into_chan are now heap-allocated (ty_buf_new_heap), not
+ * arena-allocated, precisely so they're safe to hand across the
+ * coroutine boundary the channel represents. ty_buf_into_str wraps them
+ * into a TyStr as before, but that TyStr must be released with this
+ * instead of just letting the arena reclaim it at teardown. */
 void  ty_str_free_heap(TyStr* s);
 
 int64_t ty_str_len(TyStr* s);

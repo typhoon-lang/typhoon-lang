@@ -63,17 +63,6 @@ typedef SOCKET test_sock_t;
 typedef int test_sock_t;
 #endif
 
-/* Not in any header seen so far — see ASSUMPTIONS above. */
-extern TyStr* ty_buf_into_str(SlabArena* arena, Buf* b);
-extern int64_t ty_str_len(TyStr* s);
-extern char ty_str_byte(TyStr* s, int64_t idx);
-/* Chunks from into_chan are now heap-allocated (ty_buf_new_heap), not
- * arena-allocated, precisely so they're safe to hand across the
- * coroutine boundary the channel represents. ty_buf_into_str wraps them
- * into a TyStr as before, but that TyStr must be released with this
- * instead of just letting the arena reclaim it at teardown. */
-extern void ty_str_free_heap(TyStr* s);
-
 #define TEST_PORT 30383
 #define CHUNK_SIZE 16   /* small on purpose: forces many chunks through
                            the channel for a short payload, exercising
@@ -137,6 +126,12 @@ static void order_server_coro(void* task, void* arg) {
       task, halves.read, CHUNK_SIZE, CHAN_CAP);
   assert(chunks != NULL);
 
+  /* Let spawned reader run and post first recv before client sends. */
+  ty_yield();
+
+  ready = 2;
+  ty_chan_send(arena, ctx->ready_chan, &ready);
+
   /* Drain until the channel reports closed-and-drained (-1). */
   for (;;) {
     Buf* chunk = NULL;
@@ -170,7 +165,9 @@ static void order_client_coro(void* task, void* arg) {
 
   int32_t signal = 0;
   int got = ty_chan_recv((SlabArena*)task, ctx->ready_chan, &signal);
-  assert(got == 1);
+  assert(got == 1 && signal == 1);
+
+  fprintf(stderr, "[phase2] client: ready received\n");
 
   test_sock_t c = socket(AF_INET, SOCK_STREAM, 0);
   assert((int)c >= 0);
@@ -179,7 +176,14 @@ static void order_client_coro(void* task, void* arg) {
   sa.sin_family = AF_INET;
   sa.sin_port = htons(TEST_PORT);
   sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  fprintf(stderr, "[phase2] client: connect start\n");
   assert(connect(c, (struct sockaddr*)&sa, sizeof(sa)) == 0);
+  fprintf(stderr, "[phase2] client: connect done\n");
+
+  got = ty_chan_recv((SlabArena*)task, ctx->ready_chan, &signal);
+  assert(got == 1 && signal == 2);
+
+  fprintf(stderr, "[phase2] client: server armed\n");
 
   /* Send in small, deliberately awkward pieces rather than one write —
    * exercises reassembly across multiple underlying TCP reads, not
@@ -189,12 +193,19 @@ static void order_client_coro(void* task, void* arg) {
   while (sent < total) {
     size_t piece = 7; /* awkward, doesn't align with CHUNK_SIZE=16 */
     if (piece > total - sent) piece = total - sent;
+    fprintf(stderr, "[phase2] client: send offset=%zu piece=%zu\n", sent, piece);
     int n = send(c, ORDER_MSG + sent, (int)piece, 0);
     assert(n > 0);
     sent += (size_t)n;
   }
   ctx->client_total_sent = (int)sent;
+  fprintf(stderr, "[phase2] client: sent total=%zu\n", sent);
 
+#if defined(_WIN32)
+  shutdown(c, SD_SEND);
+  Sleep(50);
+#endif
+  fprintf(stderr, "[phase2] client: close\n");
   close_test_sock(c); /* triggers EOF on the server's read side */
 }
 

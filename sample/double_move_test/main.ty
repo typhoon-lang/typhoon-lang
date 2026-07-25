@@ -1,0 +1,7 @@
+namespace main
+fn main() -> Int32 {
+    let x: Str = "x";
+    let y = x;
+    let z = x;
+    return 0;
+}

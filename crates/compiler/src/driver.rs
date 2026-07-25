@@ -1,6 +1,6 @@
-use crate::ast::NodeId;
 use crate::ast::*;
 use crate::desugar::Desugar;
+use crate::error::SimpleError;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::span::Span;
@@ -44,10 +44,18 @@ pub fn collect_ty_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn parse_file(path: &Path) -> Result<Module, String> {
-    let source = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+fn parse_file(path: &Path) -> Result<Module, Vec<SimpleError>> {
+    let source = fs::read_to_string(path).map_err(|e| vec![SimpleError {
+        code: "E0001".to_string(),
+        message: format!("read {}: {}", path.display(), e),
+        span: Span::default(),
+    }])?;
     let tokens = Lexer::new(source).tokenize();
-    Parser::new(tokens).parse_module()
+    Parser::new(tokens).parse_module().map_err(|e| vec![SimpleError {
+        code: e.code,
+        message: format!("{}:{}: {}", path.display(), e.span.line, e.message),
+        span: e.span,
+    }])
 }
 
 fn mangle(ns: &str, name: &str) -> String {
@@ -64,7 +72,7 @@ fn mangle(ns: &str, name: &str) -> String {
 /// Replaces the round-trip: .ll → .ty source → parse_module()
 fn parse_llvm_to_namespace_unit(
     ll_source: &str,
-) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
+) -> Result<HashMap<String, NamespaceUnit>, Vec<SimpleError>> {
     let mut units: HashMap<String, NamespaceUnit> = HashMap::new();
 
     // Track method signatures by receiver type for impl block generation
@@ -217,23 +225,35 @@ fn parse_llvm_to_namespace_unit(
                         let ns = pending_ty_ns.clone().unwrap_or_else(|| "std".to_string());
                         // __ty_method__ signatures must come from explicit @ty_sig metadata.
                         let explicit_sig = pending_ty_sig.take().ok_or_else(|| {
-                            vec![format!(
-                                "Missing @ty_sig annotation for method {}::{} ({})",
-                                type_name, method_name, rest
-                            )]
+                            vec![SimpleError {
+                                code: "E0002".to_string(),
+                                message: format!(
+                                    "Missing @ty_sig annotation for method {}::{} ({})",
+                                    type_name, method_name, rest
+                                ),
+                                span: Span::default(),
+                            }]
                         })?;
                         let mut sig = parse_ty_signature(&explicit_sig, true).ok_or_else(|| {
-                            vec![format!(
-                                "Invalid @ty_sig annotation for method {}::{}: {}",
-                                type_name, method_name, explicit_sig
-                            )]
+                            vec![SimpleError {
+                                code: "E0003".to_string(),
+                                message: format!(
+                                    "Invalid @ty_sig annotation for method {}::{}: {}",
+                                    type_name, method_name, explicit_sig
+                                ),
+                                span: Span::default(),
+                            }]
                         })?;
                         let parsed_name = sig.name.name.clone();
                         if !parsed_name.is_empty() && parsed_name != method_name {
-                            return Err(vec![format!(
-                                "@ty_sig method name mismatch for {}::{} (got '{}')",
-                                type_name, method_name, parsed_name
-                            )]);
+                            return Err(vec![SimpleError {
+                                code: "E0004".to_string(),
+                                message: format!(
+                                    "@ty_sig method name mismatch for {}::{} (got '{}')",
+                                    type_name, method_name, parsed_name
+                                ),
+                                span: Span::default(),
+                            }]);
                         }
                         sig.name.name = method_name.to_string();
                         method_sigs
@@ -822,7 +842,7 @@ impl<T> ToSpanned for T {}
 
 fn extract_namespace_units(
     modules: Vec<Module>,
-) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
+) -> Result<HashMap<String, NamespaceUnit>, Vec<SimpleError>> {
     let mut errors = Vec::new();
     let mut units: HashMap<String, NamespaceUnit> = HashMap::new();
 
@@ -830,7 +850,11 @@ fn extract_namespace_units(
         let ns = match module.name.clone() {
             Some(n) => n,
             None => {
-                errors.push("Missing `namespace ...` declaration.".to_string());
+                errors.push(SimpleError {
+                    code: "E0005".to_string(),
+                    message: "Missing `namespace ...` declaration.".to_string(),
+                    span: Span::default(),
+                });
                 continue;
             }
         };
@@ -882,7 +906,7 @@ fn decl_name(decl: &Declaration) -> Option<&Identifier> {
 
 fn build_namespace_decl_maps(
     units: &HashMap<String, NamespaceUnit>,
-) -> Result<HashMap<String, HashMap<String, String>>, Vec<String>> {
+) -> Result<HashMap<String, HashMap<String, String>>, Vec<SimpleError>> {
     let mut errors = Vec::new();
     let mut out = HashMap::new();
 
@@ -891,10 +915,11 @@ fn build_namespace_decl_maps(
         for decl in &unit.declarations {
             if let Some(id) = decl_name(decl) {
                 if map.contains_key(&id.name) {
-                    errors.push(format!(
-                        "Duplicate declaration '{}' in namespace '{}'",
-                        id.name, ns
-                    ));
+                    errors.push(SimpleError {
+                        code: "E0006".to_string(),
+                        message: format!("Duplicate declaration '{}' in namespace '{}'", id.name, ns),
+                        span: Span::default(),
+                    });
                 } else {
                     map.insert(id.name.clone(), mangle(ns, &id.name));
                 }
@@ -903,10 +928,11 @@ fn build_namespace_decl_maps(
                 for v in variants {
                     let vname = v.node.name.name.clone();
                     if map.contains_key(&vname) {
-                        errors.push(format!(
-                            "Duplicate declaration '{}' in namespace '{}'",
-                            vname, ns
-                        ));
+                        errors.push(SimpleError {
+                            code: "E0006".to_string(),
+                            message: format!("Duplicate declaration '{}' in namespace '{}'", vname, ns),
+                            span: Span::default(),
+                        });
                     } else {
                         map.insert(vname.clone(), mangle(ns, &vname));
                     }
@@ -1046,7 +1072,7 @@ fn use_target(path: &UsePath) -> Option<(String, Option<String>, bool)> {
 fn topo_sort(
     names: &HashSet<String>,
     edges: &HashMap<String, HashSet<String>>,
-) -> Result<Vec<String>, Vec<String>> {
+) -> Result<Vec<String>, Vec<SimpleError>> {
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum Mark {
         Temp,
@@ -1061,7 +1087,7 @@ fn topo_sort(
         edges: &HashMap<String, HashSet<String>>,
         marks: &mut HashMap<String, Mark>,
         out: &mut Vec<String>,
-        errors: &mut Vec<String>,
+        errors: &mut Vec<SimpleError>,
         stack: &mut Vec<String>,
     ) {
         if let Some(m) = marks.get(n).copied() {
@@ -1070,10 +1096,11 @@ fn topo_sort(
             }
             if m == Mark::Temp {
                 stack.push(n.to_string());
-                errors.push(format!(
-                    "Cyclic namespace dependency: {}",
-                    stack.join(" -> ")
-                ));
+                errors.push(SimpleError {
+                    code: "E0007".to_string(),
+                    message: format!("Cyclic namespace dependency: {}", stack.join(" -> ")),
+                    span: Span::default(),
+                });
                 stack.pop();
                 return;
             }
@@ -1104,7 +1131,7 @@ fn topo_sort(
 fn compute_transitive(
     namespaces: &HashMap<String, NamespaceUnit>,
     entry_ns: &str,
-) -> Result<Vec<String>, Vec<String>> {
+) -> Result<Vec<String>, Vec<SimpleError>> {
     let mut errors = Vec::new();
     let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
     for (ns, unit) in namespaces {
@@ -1113,16 +1140,20 @@ fn compute_transitive(
             if let Some((target_ns, _name, _wild)) = use_target(u) {
                 deps.insert(target_ns);
             } else {
-                errors.push(format!(
-                    "Invalid use path in namespace '{}': {:?}",
-                    ns, u.node.segments
-                ));
+                errors.push(SimpleError {
+                    code: "E0008".to_string(),
+                    message: format!(
+                        "Invalid use path in namespace '{}': {:?}",
+                        ns, u.node.segments
+                    ),
+                    span: u.span,
+                });
             }
         }
         edges.insert(ns.clone(), deps);
     }
 
-    if errors.is_empty() == false {
+    if !errors.is_empty() {
         return Err(errors);
     }
 
@@ -1135,7 +1166,11 @@ fn compute_transitive(
         if let Some(deps) = edges.get(&ns) {
             for dep in deps {
                 if !namespaces.contains_key(dep) {
-                    errors.push(format!("Unknown namespace '{}' imported by '{}'", dep, ns));
+                    errors.push(SimpleError {
+                        code: "E0009".to_string(),
+                        message: format!("Unknown namespace '{}' imported by '{}'", dep, ns),
+                        span: Span::default(),
+                    });
                 } else {
                     stack.push(dep.clone());
                 }
@@ -1155,7 +1190,7 @@ fn build_alias_map(
     ns: &str,
     units: &HashMap<String, NamespaceUnit>,
     decl_maps: &HashMap<String, HashMap<String, String>>,
-) -> Result<HashMap<String, String>, Vec<String>> {
+) -> Result<HashMap<String, String>, Vec<SimpleError>> {
     let mut errors = Vec::new();
     let mut alias: HashMap<String, String> = HashMap::new();
 
@@ -1168,16 +1203,24 @@ fn build_alias_map(
     let unit = units.get(ns).unwrap();
     for u in &unit.uses {
         let Some((target_ns, imported_name, wildcard)) = use_target(u) else {
-            errors.push(format!("Invalid use in '{}': {:?}", ns, u.node.segments));
+            errors.push(SimpleError {
+                code: "E0008".to_string(),
+                message: format!("Invalid use in '{}': {:?}", ns, u.node.segments),
+                span: u.span,
+            });
             continue;
         };
         let target_map = match decl_maps.get(&target_ns) {
             Some(m) => m,
             None => {
-                errors.push(format!(
-                    "Unknown namespace '{}' in use from '{}'",
-                    target_ns, ns
-                ));
+                errors.push(SimpleError {
+                    code: "E0009".to_string(),
+                    message: format!(
+                        "Unknown namespace '{}' in use from '{}'",
+                        target_ns, ns
+                    ),
+                    span: u.span,
+                });
                 continue;
             }
         };
@@ -1185,10 +1228,14 @@ fn build_alias_map(
             for (name, mangled) in target_map {
                 if let Some(existing) = alias.get(name) {
                     if existing != mangled {
-                        errors.push(format!(
-                            "Conflicting import '{}' in namespace '{}' ({} vs {})",
-                            name, ns, existing, mangled
-                        ));
+                        errors.push(SimpleError {
+                            code: "E0010".to_string(),
+                            message: format!(
+                                "Conflicting import '{}' in namespace '{}' ({} vs {})",
+                                name, ns, existing, mangled
+                            ),
+                            span: u.span,
+                        });
                     }
                 } else {
                     alias.insert(name.clone(), mangled.clone());
@@ -1208,18 +1255,26 @@ fn build_alias_map(
                 })
             });
             let Some(mangled) = mangled else {
-                errors.push(format!(
-                    "Unknown import '{}' from namespace '{}' (imported by '{}')",
-                    name, target_ns, ns
-                ));
+                errors.push(SimpleError {
+                    code: "E0011".to_string(),
+                    message: format!(
+                        "Unknown import '{}' from namespace '{}' (imported by '{}')",
+                        name, target_ns, ns
+                    ),
+                    span: u.span,
+                });
                 continue;
             };
             if let Some(existing) = alias.get(&name) {
                 if existing != &mangled {
-                    errors.push(format!(
-                        "Conflicting import '{}' in namespace '{}' ({} vs {})",
-                        name, ns, existing, mangled
-                    ));
+                    errors.push(SimpleError {
+                        code: "E0010".to_string(),
+                        message: format!(
+                            "Conflicting import '{}' in namespace '{}' ({} vs {})",
+                            name, ns, existing, mangled
+                        ),
+                        span: u.span,
+                    });
                 }
             } else {
                 alias.insert(name.clone(), mangled.clone());
@@ -1234,10 +1289,14 @@ fn build_alias_map(
                                 let vmangled = mangle(&target_ns, &vname);
                                 if let Some(existing) = alias.get(&vname) {
                                     if existing != &vmangled {
-                                        errors.push(format!(
-                                            "Conflicting import '{}' in namespace '{}' ({} vs {})",
-                                            vname, ns, existing, vmangled
-                                        ));
+                                        errors.push(SimpleError {
+                                            code: "E0010".to_string(),
+                                            message: format!(
+                                                "Conflicting import '{}' in namespace '{}' ({} vs {})",
+                                                vname, ns, existing, vmangled
+                                            ),
+                                            span: u.span,
+                                        });
                                     }
                                 } else {
                                     alias.insert(vname, vmangled);
@@ -1328,8 +1387,12 @@ pub fn compile_project(
     Module,
     HashMap<String, crate::resolver::DeclInfo>,
     HashMap<String, String>,
-), Vec<String>> {
-    let mut files = collect_ty_files(path).map_err(|e| vec![e])?;
+), Vec<SimpleError>> {
+    let mut files = collect_ty_files(path).map_err(|e| vec![SimpleError {
+        code: "E0001".to_string(),
+        message: e,
+        span: Span::default(),
+    }])?;
 
     // Discover stdlib .ty source files (next to binary, like typhoon-stdlib.ll)
     let stdlib_ty_dir = std::env::current_exe()
@@ -1374,7 +1437,7 @@ pub fn compile_project(
                 parsed_files.insert(file.clone());
                 modules.push(m)
             }
-            Err(e) => errors.push(format!("{}: {}", file.display(), e)),
+            Err(e) => errors.extend(e),
         }
     }
     if !errors.is_empty() {
@@ -1398,8 +1461,11 @@ pub fn compile_project(
 
     // Load stdlib from .ll file and parse directly into "std" namespace
     if stdlib_ll_path.exists() {
-        let ll_source =
-            fs::read_to_string(stdlib_ll_path).map_err(|e| vec![format!("read stdlib: {}", e)])?;
+        let ll_source = fs::read_to_string(stdlib_ll_path).map_err(|e| vec![SimpleError {
+            code: "E0001".to_string(),
+            message: format!("read stdlib: {}", e),
+            span: Span::default(),
+        }])?;
 
         let stdlib_units = parse_llvm_to_namespace_unit(&ll_source)?;
         for (ns_name, unit) in stdlib_units {
@@ -1515,7 +1581,11 @@ pub fn compile_project(
     // after the entry file's stem — or just read the namespace line only
     let entry_ns = {
         let source = fs::read_to_string(&entry_file)
-            .map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
+            .map_err(|e| vec![SimpleError {
+                code: "E0001".to_string(),
+                message: format!("{}: {}", entry_file.display(), e),
+                span: Span::default(),
+            }])?;
         // Grab `namespace <name>` without full parse — no AST, no declarations
         source
             .lines()
@@ -1524,7 +1594,11 @@ pub fn compile_project(
                     .strip_prefix("namespace ")
                     .map(|n| n.trim().to_string())
             })
-            .ok_or_else(|| vec!["Could not find entry namespace".to_string()])?
+            .ok_or_else(|| vec![SimpleError {
+                code: "E0010".to_string(),
+                message: "Could not find entry namespace".to_string(),
+                span: Span::default(),
+            }])?
     };
 
     // Ensure entry unit exists (safety fallback only — or_insert_with is a no-op if already present)
@@ -1674,7 +1748,11 @@ pub fn compile_project(
             desugar.rename_declaration(&mut decl, &alias);
             desugar
                 .desugar_declaration(&mut decl)
-                .map_err(|e| vec![format!("{}: {}", ns, e)])?;
+                .map_err(|e| vec![SimpleError {
+                    code: e.code,
+                    message: format!("{}:{}: {}", ns, e.span.line, e.message),
+                    span: e.span,
+                }])?;
             for expanded in expand_impl_and_extension_decls(decl) {
                 all_decls.push(expanded);
             }

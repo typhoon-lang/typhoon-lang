@@ -2,6 +2,7 @@ use std::env;
 use std::path::Path;
 
 mod compile;
+mod error_display;
 mod exec;
 mod link;
 

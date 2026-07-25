@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::error::SimpleError;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,7 +55,7 @@ impl Resolver {
         &mut self,
         module: &Module,
         imports: &HashMap<String, DeclInfo>,
-    ) -> Result<(), Vec<String>> {
+    ) -> Result<(), Vec<SimpleError>> {
         println!(
             "resolve_module '{}' imports: {:?}",
             module.name.as_deref().unwrap_or("?"),
@@ -97,10 +98,14 @@ impl Resolver {
         id
     }
 
-    fn declare(&mut self, scope: ScopeId, identifier: Identifier) -> Result<DeclId, String> {
+    fn declare(&mut self, scope: ScopeId, identifier: Identifier) -> Result<DeclId, SimpleError> {
         let symbols = &mut self.scopes[scope.0].symbols;
         if symbols.contains_key(&identifier.name) {
-            Err(format!("Duplicate declaration of '{}'", identifier.name))
+            Err(SimpleError {
+                code: "E0006".to_string(),
+                message: format!("Duplicate declaration of '{}'", identifier.name),
+                span: identifier.span,
+            })
         } else {
             let decl_id = DeclId(self.next_decl_id);
             self.next_decl_id += 1;
@@ -114,7 +119,7 @@ impl Resolver {
         &mut self,
         scope: ScopeId,
         declaration: &Declaration,
-    ) -> Result<(), String> {
+    ) -> Result<(), SimpleError> {
         match &declaration.node {
             DeclarationKind::Function {
                 generics,
@@ -194,7 +199,7 @@ impl Resolver {
         scope: ScopeId,
         ty: &crate::ast::Type,
         type_params: &HashSet<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SimpleError> {
         for arg in &ty.node.generic_args {
             self.resolve_type(scope, arg, type_params)?;
         }
@@ -230,10 +235,11 @@ impl Resolver {
             }
             Ok(())
         } else {
-            Err(format!(
-                "Unknown type '{}', expected a struct/enum/newtype or builtin",
-                name
-            ))
+            Err(SimpleError {
+                code: "E0012".to_string(),
+                message: format!("Unknown type '{}', expected a struct/enum/newtype or builtin", name),
+                span: ty.span,
+            })
         }
     }
 
@@ -241,7 +247,7 @@ impl Resolver {
         &mut self,
         scope: ScopeId,
         declaration: &Declaration,
-    ) -> Result<DeclId, String> {
+    ) -> Result<DeclId, SimpleError> {
         match &declaration.node {
             DeclarationKind::Function { name, .. } => {
                 let decl_id = self.declare(scope, name.clone())?;
@@ -329,7 +335,7 @@ impl Resolver {
         }
     }
 
-    fn resolve_block(&mut self, scope: ScopeId, block: &Block) -> Result<(), String> {
+    fn resolve_block(&mut self, scope: ScopeId, block: &Block) -> Result<(), SimpleError> {
         for stmt in &block.statements {
             self.resolve_statement(scope, stmt)?;
         }
@@ -339,7 +345,7 @@ impl Resolver {
         Ok(())
     }
 
-    fn resolve_statement(&mut self, scope: ScopeId, stmt: &Statement) -> Result<(), String> {
+    fn resolve_statement(&mut self, scope: ScopeId, stmt: &Statement) -> Result<(), SimpleError> {
         match &stmt.node {
             StatementKind::LetBinding {
                 pattern,
@@ -412,7 +418,7 @@ impl Resolver {
         }
     }
 
-    fn resolve_expression(&mut self, scope: ScopeId, expr: &Expression) -> Result<(), String> {
+    fn resolve_expression(&mut self, scope: ScopeId, expr: &Expression) -> Result<(), SimpleError> {
         match &expr.node {
             ExpressionKind::Identifier(id) => {
                 // Allow built-in identifiers and enum variant constructors.
@@ -424,7 +430,11 @@ impl Resolver {
                         } else if self.visible_enum_variant(scope, &id.name) {
                             Ok(())
                         } else {
-                            Err(format!("Unresolved identifier '{}'", id.name))
+                            Err(SimpleError {
+                                code: "E0425".to_string(),
+                                message: format!("Unresolved identifier '{}'", id.name),
+                                span: id.span,
+                            })
                         }
                     }
                 }
@@ -510,7 +520,7 @@ impl Resolver {
         false
     }
 
-    fn declare_pattern(&mut self, scope: ScopeId, pattern: &Pattern) -> Result<(), String> {
+    fn declare_pattern(&mut self, scope: ScopeId, pattern: &Pattern) -> Result<(), SimpleError> {
         match &pattern.node {
             PatternKind::Wildcard => Ok(()),
             PatternKind::Identifier(id) => self.declare(scope, id.clone()).map(|_| ()),
@@ -573,7 +583,7 @@ mod tests {
             .unwrap_err();
         assert!(err
             .iter()
-            .any(|msg| msg.contains("Unresolved identifier 'missing'")));
+            .any(|msg| msg.message.contains("Unresolved identifier 'missing'")));
     }
 
     #[test]
@@ -590,7 +600,7 @@ mod tests {
         let err = resolver
             .resolve_module(&module, &HashMap::new())
             .unwrap_err();
-        assert!(err.iter().any(|msg| msg.contains("Duplicate declaration")));
+        assert!(err.iter().any(|msg| msg.message.contains("Duplicate declaration")));
     }
 
     #[test]

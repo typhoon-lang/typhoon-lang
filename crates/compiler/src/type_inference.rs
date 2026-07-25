@@ -21,6 +21,16 @@ pub enum TypeError {
     },
 }
 
+impl TypeError {
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            TypeError::UnknownIdentifier { span, .. } => *span,
+            TypeError::TypeMismatch { span, .. } => *span,
+            TypeError::OccursCheck { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeVarId(pub usize);
 
@@ -256,6 +266,28 @@ impl Solver {
                 params.iter().any(|param| self.occurs_in(var, &param)) || self.occurs_in(var, &ret)
             }
             InferType::FixedArray(elem, _) => self.occurs_in(var, &elem),
+        }
+    }
+}
+
+impl InferType {
+    /// Human-readable type name, resolving type variables through the solver.
+    pub fn display(&self, solver: &Solver) -> String {
+        let ty = solver.apply(self);
+        match &ty {
+            InferType::Var(_) => "<unknown>".to_string(),
+            InferType::Con(name) => name.clone(),
+            InferType::App(name, args) => {
+                let names: Vec<String> = args.iter().map(|a| a.display(solver)).collect();
+                format!("{}<{}>", name, names.join(", "))
+            }
+            InferType::Fn(params, ret) => {
+                let p: Vec<String> = params.iter().map(|p| p.display(solver)).collect();
+                format!("fn({}) -> {}", p.join(", "), ret.display(solver))
+            }
+            InferType::FixedArray(elem, n) => {
+                format!("[{}; {}]", elem.display(solver), n)
+            }
         }
     }
 }

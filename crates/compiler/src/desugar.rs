@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::error::SimpleError;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::span::Span;
@@ -28,7 +29,7 @@ impl Desugar {
         self.rename_in_decl(decl, aliases);
     }
 
-    pub fn desugar_declaration(&mut self, decl: &mut Declaration) -> Result<(), String> {
+    pub fn desugar_declaration(&mut self, decl: &mut Declaration) -> Result<(), SimpleError> {
         self.seed_next_id_from_decl(decl);
         match &mut decl.node {
             DeclarationKind::Function {
@@ -649,11 +650,11 @@ impl Desugar {
         }
     }
 
-    fn desugar_type(&mut self, _ty: &mut Type) -> Result<(), String> {
+    fn desugar_type(&mut self, _ty: &mut Type) -> Result<(), SimpleError> {
         Ok(())
     }
 
-    fn desugar_block(&mut self, block: &mut Block) -> Result<(), String> {
+    fn desugar_block(&mut self, block: &mut Block) -> Result<(), SimpleError> {
         for stmt in &mut block.statements {
             self.desugar_statement(stmt)?;
         }
@@ -663,7 +664,7 @@ impl Desugar {
         Ok(())
     }
 
-    fn desugar_statement(&mut self, stmt: &mut Statement) -> Result<(), String> {
+    fn desugar_statement(&mut self, stmt: &mut Statement) -> Result<(), SimpleError> {
         match &mut stmt.node {
             StatementKind::LetBinding { initializer, .. } => self.desugar_expression(initializer),
             StatementKind::Expression(expr) => self.desugar_expression(expr),
@@ -722,7 +723,7 @@ impl Desugar {
         }
     }
 
-    fn desugar_expression(&mut self, expr: &mut Expression) -> Result<(), String> {
+    fn desugar_expression(&mut self, expr: &mut Expression) -> Result<(), SimpleError> {
         match &mut expr.node {
             ExpressionKind::BinaryOp {
                 op: Operator::Pipe,
@@ -1088,12 +1089,16 @@ fn split_interpolated(s: &str) -> Vec<InterpSeg> {
     out
 }
 
-fn parse_expr_from_str(src: &str, span: Span) -> Result<Expression, String> {
+fn parse_expr_from_str(src: &str, span: Span) -> Result<Expression, SimpleError> {
     let tokens = Lexer::new(src.to_string()).tokenize();
     let mut parser = Parser::new(tokens);
     parser
         .parse_expression_only()
-        .map_err(|e| format!("interpolation expr parse error: {}", e))
+        .map_err(|e| SimpleError {
+            code: e.code,
+            message: format!("interpolation expr parse error: {}", e.message),
+            span: e.span,
+        })
         .map(|mut e| {
             e.span = span;
             e

@@ -1,0 +1,5 @@
+namespace main
+fn main() -> Int32 {
+    let x: Str = 42;
+    return 0;
+}

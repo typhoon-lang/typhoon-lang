@@ -4,6 +4,7 @@ pub mod ast;
 pub mod codegen;
 pub mod desugar;
 pub mod driver;
+pub mod error;
 pub mod lexer;
 pub mod liveness;
 pub mod parser;

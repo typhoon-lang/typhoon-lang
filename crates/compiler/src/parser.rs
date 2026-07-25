@@ -1,6 +1,7 @@
 // src/parser.rs
 
 use crate::ast::*;
+use crate::error::SimpleError;
 use crate::lexer::{Token, TokenType};
 use crate::span::Span;
 use std::cell::Cell;
@@ -63,7 +64,7 @@ impl Parser {
         Spanned::new(kind, span, self.alloc_id())
     }
 
-    pub fn parse_module(&mut self) -> Result<Module, String> {
+    pub fn parse_module(&mut self) -> Result<Module, SimpleError> {
         let start_span = self.peek_token().span;
         let mut declarations = Vec::new();
         let mut name = None;
@@ -84,18 +85,20 @@ impl Parser {
         })
     }
 
-    pub fn parse_expression_only(&mut self) -> Result<Expression, String> {
+    pub fn parse_expression_only(&mut self) -> Result<Expression, SimpleError> {
         let expr = self.expression()?;
         if self.peek_token().token_type != TokenType::Eof {
-            return Err(format!(
-                "Expected end of input, got {:?}",
-                self.peek_token()
-            ));
+            let token = self.peek_token();
+            return Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("Expected end of input, got {:?}", token.token_type),
+                span: token.span,
+            });
         }
         Ok(expr)
     }
 
-    fn declaration(&mut self) -> Result<Declaration, String> {
+    fn declaration(&mut self) -> Result<Declaration, SimpleError> {
         let token = self.peek_token();
         match token.token_type {
             TokenType::Fn => self.function_decl(),
@@ -221,11 +224,15 @@ impl Parser {
                     self.alloc_id(),
                 ))))
             }
-            _ => Err(format!("Unexpected token in declaration: {:?}", token)),
+            _ => Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("Unexpected token in declaration: {:?}", token.token_type),
+                span: token.span,
+            }),
         }
     }
 
-    fn parse_generics(&mut self) -> Result<Vec<GenericParam>, String> {
+    fn parse_generics(&mut self) -> Result<Vec<GenericParam>, SimpleError> {
         if !self.match_token(TokenType::LessThan) {
             return Ok(Vec::new());
         }
@@ -254,7 +261,7 @@ impl Parser {
         Ok(generics)
     }
 
-    fn function_decl(&mut self) -> Result<Declaration, String> {
+    fn function_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let name = self.identifier_with_span()?;
         let generics = self.parse_generics()?;
@@ -297,7 +304,7 @@ impl Parser {
         }))
     }
 
-    fn struct_decl(&mut self) -> Result<Declaration, String> {
+    fn struct_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let name = self.identifier_with_span()?;
         let generics = self.parse_generics()?;
@@ -320,7 +327,7 @@ impl Parser {
         }))
     }
 
-    fn enum_decl(&mut self) -> Result<Declaration, String> {
+    fn enum_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let name = self.identifier_with_span()?;
         let generics = self.parse_generics()?;
@@ -384,7 +391,7 @@ impl Parser {
         }))
     }
 
-    fn newtype_decl(&mut self) -> Result<Declaration, String> {
+    fn newtype_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let name = self.identifier_with_span()?;
         self.consume(TokenType::Assign, "Expected '=' after newtype name")?;
@@ -393,7 +400,7 @@ impl Parser {
         Ok(self.make_decl(DeclarationKind::Newtype { name, type_alias }))
     }
 
-    fn use_path(&mut self) -> Result<UsePath, String> {
+    fn use_path(&mut self) -> Result<UsePath, SimpleError> {
         let start_span = self.peek_token().span;
         let mut segments = Vec::new();
         let mut wildcard = false;
@@ -413,7 +420,7 @@ impl Parser {
         ))
     }
 
-    fn namespace_path(&mut self) -> Result<String, String> {
+    fn namespace_path(&mut self) -> Result<String, SimpleError> {
         let mut segments = Vec::new();
         segments.push(self.identifier_with_span()?.name);
         while self.match_token(TokenType::PathSep) {
@@ -422,7 +429,7 @@ impl Parser {
         Ok(segments.join("::"))
     }
 
-    fn block(&mut self) -> Result<Block, String> {
+    fn block(&mut self) -> Result<Block, SimpleError> {
         let start_span = self.peek_token().span;
         self.consume(TokenType::LBrace, "Expected '{'")?;
         let mut statements = Vec::new();
@@ -444,11 +451,11 @@ impl Parser {
         })
     }
 
-    fn expression(&mut self) -> Result<Expression, String> {
+    fn expression(&mut self) -> Result<Expression, SimpleError> {
         self.assignment()
     }
 
-    fn assignment(&mut self) -> Result<Expression, String> {
+    fn assignment(&mut self) -> Result<Expression, SimpleError> {
         let expr = self.pipe()?;
         if self.match_token(TokenType::Assign) {
             let value = self.assignment()?;
@@ -489,7 +496,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn pipe(&mut self) -> Result<Expression, String> {
+    fn pipe(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.equality()?;
         while self.match_token(TokenType::Pipe) {
             let right = self.equality()?;
@@ -502,7 +509,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn equality(&mut self) -> Result<Expression, String> {
+    fn equality(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.bitwise()?;
         while let Some(op) = if self.match_token(TokenType::Equal) {
             Some(Operator::Eq)
@@ -521,7 +528,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn bitwise(&mut self) -> Result<Expression, String> {
+    fn bitwise(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.comparison()?;
         while let Some(op) = if self.match_token(TokenType::BitwiseAnd) {
             Some(Operator::BitAnd)
@@ -542,7 +549,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn comparison(&mut self) -> Result<Expression, String> {
+    fn comparison(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.shift()?;
         while let Some(op) = if self.match_token(TokenType::LessThan) {
             Some(Operator::Lt)
@@ -565,7 +572,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn shift(&mut self) -> Result<Expression, String> {
+    fn shift(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.term()?;
         while let Some(op) = if self.match_token(TokenType::ShiftLeft) {
             Some(Operator::Shl)
@@ -584,7 +591,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn term(&mut self) -> Result<Expression, String> {
+    fn term(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.factor()?;
         while let Some(op) = if self.match_token(TokenType::Plus) {
             Some(Operator::Add)
@@ -603,7 +610,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn factor(&mut self) -> Result<Expression, String> {
+    fn factor(&mut self) -> Result<Expression, SimpleError> {
         let mut expr = self.unary()?;
         while let Some(op) = if self.match_token(TokenType::Star) {
             Some(Operator::Mul)
@@ -624,7 +631,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn unary(&mut self) -> Result<Expression, String> {
+    fn unary(&mut self) -> Result<Expression, SimpleError> {
         if self.match_token(TokenType::Minus) {
             let expr = self.unary()?;
             return Ok(self.make_expr(ExpressionKind::UnaryOp {
@@ -648,7 +655,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn primary(&mut self) -> Result<Expression, String> {
+    fn primary(&mut self) -> Result<Expression, SimpleError> {
         match self.peek_token().token_type {
             TokenType::IntLit => {
                 let token = self.advance_token();
@@ -774,7 +781,11 @@ impl Parser {
                         );
                         self.primary_postfix(expr)
                     } else {
-                        Err("Expected '(' after chan<T>".to_string())
+                        Err(SimpleError {
+                            code: "E1000".to_string(),
+                            message: "Expected '(' after chan<T>".to_string(),
+                            span: self.peek_token().span,
+                        })
                     }
                 } else if self.peek_token().token_type == TokenType::LParen {
                     self.advance_token();
@@ -843,11 +854,15 @@ impl Parser {
                     self.primary_postfix(expr)
                 }
             }
-            token => Err(format!("Expected expression, got {:?}", token)),
+            token => Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("Expected expression, got {:?}", token),
+                span: self.peek_token().span,
+            }),
         }
     }
 
-    fn struct_init(&mut self, name: Identifier) -> Result<Expression, String> {
+    fn struct_init(&mut self, name: Identifier) -> Result<Expression, SimpleError> {
         let start = name.span;
         self.consume(TokenType::LBrace, "Expected '{' after struct name")?;
         let mut fields = Vec::new();
@@ -867,7 +882,7 @@ impl Parser {
             .make_spanned_with_span(ExpressionKind::StructInit { name, fields }, start.join(end)))
     }
 
-    fn match_expression(&mut self) -> Result<Expression, String> {
+    fn match_expression(&mut self) -> Result<Expression, SimpleError> {
         let start_span = self.peek_token().span;
         self.consume(TokenType::Match, "Expected 'match'")?;
         let scrutinee = self.expression()?;
@@ -904,7 +919,7 @@ impl Parser {
         ))
     }
 
-    fn interface_decl(&mut self) -> Result<Declaration, String> {
+    fn interface_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let name = self.identifier_with_span()?;
         let generics = self.parse_generics()?;
@@ -957,7 +972,7 @@ impl Parser {
         }))
     }
 
-    fn impl_decl(&mut self) -> Result<Declaration, String> {
+    fn impl_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let first = self.parse_type()?;
         if self.match_token(TokenType::For) {
@@ -998,7 +1013,7 @@ impl Parser {
         }
     }
 
-    fn extend_decl(&mut self) -> Result<Declaration, String> {
+    fn extend_decl(&mut self) -> Result<Declaration, SimpleError> {
         self.advance_token();
         let generics = self.parse_generics()?;
         let type_constraint = self.parse_type()?;
@@ -1017,7 +1032,7 @@ impl Parser {
         }))
     }
 
-    fn primary_postfix(&mut self, mut expr: Expression) -> Result<Expression, String> {
+    fn primary_postfix(&mut self, mut expr: Expression) -> Result<Expression, SimpleError> {
         loop {
             if self.match_token(TokenType::Dot) {
                 let field = match self.peek_token().token_type {
@@ -1029,7 +1044,11 @@ impl Parser {
                             span: token.span,
                         }
                     }
-                    _ => return Err(format!("Expected identifier, got {:?}", self.peek_token())),
+                    _ => return Err(SimpleError {
+                        code: "E1000".to_string(),
+                        message: format!("Expected identifier, got {:?}", self.peek_token().token_type),
+                        span: self.peek_token().span,
+                    }),
                 };
                 expr = self.make_expr(ExpressionKind::FieldAccess {
                     base: Box::new(expr),
@@ -1086,7 +1105,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_type(&mut self) -> Result<Type, String> {
+    fn parse_type(&mut self) -> Result<Type, SimpleError> {
         // Handle `[T]`
         if self.peek_token().token_type == TokenType::LBracket {
             self.advance_token();
@@ -1123,7 +1142,11 @@ impl Parser {
                     generic_args: vec![inner],
                 }));
             } else {
-                return Err("Expected '<T>' after 'chan' keyword in type".to_string());
+                return Err(SimpleError {
+                    code: "E1000".to_string(),
+                    message: "Expected '<T>' after 'chan' keyword in type".to_string(),
+                    span: self.peek_token().span,
+                });
             }
         }
 
@@ -1161,7 +1184,7 @@ impl Parser {
         Ok(self.make_type(TypeKind { name, generic_args }))
     }
 
-    fn merge_expression(&mut self) -> Result<Expression, String> {
+    fn merge_expression(&mut self) -> Result<Expression, SimpleError> {
         let start_span = self.peek_token().span;
         self.advance_token();
         let mut base = None;
@@ -1192,7 +1215,7 @@ impl Parser {
         ))
     }
 
-    fn statement(&mut self) -> Result<Option<Statement>, String> {
+    fn statement(&mut self) -> Result<Option<Statement>, SimpleError> {
         let token = self.peek_token();
         match token.token_type {
             TokenType::Let => {
@@ -1271,7 +1294,11 @@ impl Parser {
                     if self.match_token(TokenType::Else) {
                         if self.peek_token().token_type == TokenType::If {
                             let else_if_stmt =
-                                self.statement()?.ok_or("Expected else-if statement")?;
+                                self.statement()?.ok_or_else(|| SimpleError {
+                                    code: "E1000".to_string(),
+                                    message: "Expected else-if statement".to_string(),
+                                    span: self.peek_token().span,
+                                })?;
                             // The `if-let` is currently parsed as an expression inside an `Expression` statement.
                             // To support `else if`, we need a more flexible `ElseBranchKind` that works for both `if` and `if-let`.
                             else_branch = Some(Box::new(self.make_spanned_with_span(
@@ -1308,7 +1335,11 @@ impl Parser {
                 let mut else_branch = None;
                 if self.match_token(TokenType::Else) {
                     if self.peek_token().token_type == TokenType::If {
-                        let else_if_stmt = self.statement()?.ok_or("Expected else if statement")?;
+                        let else_if_stmt = self.statement()?.ok_or_else(|| SimpleError {
+                            code: "E1000".to_string(),
+                            message: "Expected else if statement".to_string(),
+                            span: self.peek_token().span,
+                        })?;
                         else_branch = Some(self.make_spanned_with_span(
                             ElseBranchKind::If(Box::new(else_if_stmt.clone())),
                             else_if_stmt.span,
@@ -1377,7 +1408,11 @@ impl Parser {
                         arms,
                     } = expr.node
                     else {
-                        return Err("internal: match_expression did not return Match".to_string());
+                        return Err(SimpleError {
+                            code: "E1000".to_string(),
+                            message: "internal: match_expression did not return Match".to_string(),
+                            span: expr.span,
+                        });
                     };
                     Ok(Some(self.make_spanned_with_span(
                         StatementKind::Match {
@@ -1396,7 +1431,7 @@ impl Parser {
         }
     }
 
-    fn identifier_with_span(&mut self) -> Result<Identifier, String> {
+    fn identifier_with_span(&mut self) -> Result<Identifier, SimpleError> {
         let token = self.advance_token();
         if token.token_type == TokenType::Identifier {
             Ok(Identifier {
@@ -1404,11 +1439,15 @@ impl Parser {
                 span: token.span,
             })
         } else {
-            Err(format!("Expected identifier, got {:?}", token))
+            Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("Expected identifier, got {:?}", token.token_type),
+                span: token.span,
+            })
         }
     }
 
-    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+    fn parse_pattern(&mut self) -> Result<Pattern, SimpleError> {
         let mut pattern = self.parse_pattern_atom()?;
         while self.match_token(TokenType::BitwiseOr) {
             let right = self.parse_pattern_atom()?;
@@ -1419,7 +1458,7 @@ impl Parser {
         Ok(pattern)
     }
 
-    fn parse_pattern_atom(&mut self) -> Result<Pattern, String> {
+    fn parse_pattern_atom(&mut self) -> Result<Pattern, SimpleError> {
         let token = self.peek_token();
         match token.token_type {
             TokenType::Identifier => {
@@ -1525,7 +1564,11 @@ impl Parser {
                 let digits_clean: String = digits.chars().filter(|c| *c != '_').collect();
                 let val: i64 = digits_clean
                     .parse()
-                    .map_err(|e| format!("Invalid int literal: {}", e))?;
+                    .map_err(|e| SimpleError {
+                        code: "E1000".to_string(),
+                        message: format!("Invalid int literal: {}", e),
+                        span: token.span,
+                    })?;
                 Ok(self.make_pattern(PatternKind::Literal(Literal {
                     kind: LiteralKind::Int(val, suffix),
                     span: token.span,
@@ -1549,7 +1592,11 @@ impl Parser {
                 let num_clean: String = num_part.chars().filter(|c| *c != '_').collect();
                 let val: f64 = num_clean
                     .parse()
-                    .map_err(|e| format!("Invalid float literal: {}", e))?;
+                    .map_err(|e| SimpleError {
+                        code: "E1000".to_string(),
+                        message: format!("Invalid float literal: {}", e),
+                        span: token.span,
+                    })?;
                 Ok(self.make_pattern(PatternKind::Literal(Literal {
                     kind: LiteralKind::Float(val, suffix),
                     span: token.span,
@@ -1576,7 +1623,11 @@ impl Parser {
                     span: token.span,
                 })))
             }
-            _ => Err(format!("Unsupported pattern start: {:?}", token)),
+            _ => Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("Unsupported pattern start: {:?}", token),
+                span: token.span,
+            }),
         }
     }
 
@@ -1628,16 +1679,16 @@ impl Parser {
         }
     }
 
-    fn consume(&mut self, ty: TokenType, msg: &str) -> Result<Token, String> {
+    fn consume(&mut self, ty: TokenType, msg: &str) -> Result<Token, SimpleError> {
         if self.peek_token().token_type == ty {
             Ok(self.advance_token())
         } else {
-            Err(format!(
-                "{}: Expected {:?}, got {:?}",
-                msg,
-                ty,
-                self.peek_token()
-            ))
+            let token = self.peek_token();
+            Err(SimpleError {
+                code: "E1000".to_string(),
+                message: format!("{}: Expected {:?}, got {:?}", msg, ty, token.token_type),
+                span: token.span,
+            })
         }
     }
 }

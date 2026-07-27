@@ -44,18 +44,24 @@ pub fn collect_ty_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn parse_file(path: &Path) -> Result<Module, Vec<SimpleError>> {
-    let source = fs::read_to_string(path).map_err(|e| vec![SimpleError {
-        code: "E0001".to_string(),
-        message: format!("read {}: {}", path.display(), e),
-        span: Span::default(),
-    }])?;
+fn parse_file(path: &Path, start_id: u32) -> Result<(Module, u32), Vec<SimpleError>> {
+    let source = fs::read_to_string(path).map_err(|e| {
+        vec![SimpleError {
+            code: "E0001".to_string(),
+            message: format!("read {}: {}", path.display(), e),
+            span: Span::default(),
+        }]
+    })?;
     let tokens = Lexer::new(source).tokenize();
-    Parser::new(tokens).parse_module().map_err(|e| vec![SimpleError {
-        code: e.code,
-        message: format!("{}:{}: {}", path.display(), e.span.line, e.message),
-        span: e.span,
-    }])
+    let mut parser = Parser::new_with_start_id(tokens, start_id);
+    let module = parser.parse_module().map_err(|e| {
+        vec![SimpleError {
+            code: e.code,
+            message: format!("{}:{}: {}", path.display(), e.span.line, e.message),
+            span: e.span,
+        }]
+    })?;
+    Ok((module, parser.next_id_watermark()))
 }
 
 fn mangle(ns: &str, name: &str) -> String {
@@ -917,7 +923,10 @@ fn build_namespace_decl_maps(
                 if map.contains_key(&id.name) {
                     errors.push(SimpleError {
                         code: "E0006".to_string(),
-                        message: format!("Duplicate declaration '{}' in namespace '{}'", id.name, ns),
+                        message: format!(
+                            "Duplicate declaration '{}' in namespace '{}'",
+                            id.name, ns
+                        ),
                         span: Span::default(),
                     });
                 } else {
@@ -930,7 +939,10 @@ fn build_namespace_decl_maps(
                     if map.contains_key(&vname) {
                         errors.push(SimpleError {
                             code: "E0006".to_string(),
-                            message: format!("Duplicate declaration '{}' in namespace '{}'", vname, ns),
+                            message: format!(
+                                "Duplicate declaration '{}' in namespace '{}'",
+                                vname, ns
+                            ),
                             span: Span::default(),
                         });
                     } else {
@@ -1215,10 +1227,7 @@ fn build_alias_map(
             None => {
                 errors.push(SimpleError {
                     code: "E0009".to_string(),
-                    message: format!(
-                        "Unknown namespace '{}' in use from '{}'",
-                        target_ns, ns
-                    ),
+                    message: format!("Unknown namespace '{}' in use from '{}'", target_ns, ns),
                     span: u.span,
                 });
                 continue;
@@ -1282,7 +1291,12 @@ fn build_alias_map(
 
             if let Some(unit) = units.get(&target_ns) {
                 for decl in &unit.declarations {
-                    if let DeclarationKind::Enum { name: enum_name, variants, .. } = &decl.node {
+                    if let DeclarationKind::Enum {
+                        name: enum_name,
+                        variants,
+                        ..
+                    } = &decl.node
+                    {
                         if enum_name.name == name {
                             for variant in variants {
                                 let vname = variant.node.name.name.clone();
@@ -1383,16 +1397,21 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
 
 pub fn compile_project(
     path: &Path,
-) -> Result<(
-    Module,
-    HashMap<String, crate::resolver::DeclInfo>,
-    HashMap<String, String>,
-), Vec<SimpleError>> {
-    let mut files = collect_ty_files(path).map_err(|e| vec![SimpleError {
-        code: "E0001".to_string(),
-        message: e,
-        span: Span::default(),
-    }])?;
+) -> Result<
+    (
+        Module,
+        HashMap<String, crate::resolver::DeclInfo>,
+        HashMap<String, String>,
+    ),
+    Vec<SimpleError>,
+> {
+    let mut files = collect_ty_files(path).map_err(|e| {
+        vec![SimpleError {
+            code: "E0001".to_string(),
+            message: e,
+            span: Span::default(),
+        }]
+    })?;
 
     // Discover stdlib .ty source files (next to binary, like typhoon-stdlib.ll)
     let stdlib_ty_dir = std::env::current_exe()
@@ -1428,14 +1447,16 @@ pub fn compile_project(
     let mut errors = Vec::new();
     let mut parsed_files = HashSet::new();
 
+    let mut next_id: u32 = 1;
     for file in canonical_files {
         if parsed_files.contains(&file) {
             continue;
         }
-        match parse_file(&file) {
-            Ok(m) => {
+        match parse_file(&file, next_id) {
+            Ok((m, watermark)) => {
+                next_id = watermark;
                 parsed_files.insert(file.clone());
-                modules.push(m)
+                modules.push(m);
             }
             Err(e) => errors.extend(e),
         }
@@ -1461,11 +1482,13 @@ pub fn compile_project(
 
     // Load stdlib from .ll file and parse directly into "std" namespace
     if stdlib_ll_path.exists() {
-        let ll_source = fs::read_to_string(stdlib_ll_path).map_err(|e| vec![SimpleError {
-            code: "E0001".to_string(),
-            message: format!("read stdlib: {}", e),
-            span: Span::default(),
-        }])?;
+        let ll_source = fs::read_to_string(stdlib_ll_path).map_err(|e| {
+            vec![SimpleError {
+                code: "E0001".to_string(),
+                message: format!("read stdlib: {}", e),
+                span: Span::default(),
+            }]
+        })?;
 
         let stdlib_units = parse_llvm_to_namespace_unit(&ll_source)?;
         for (ns_name, unit) in stdlib_units {
@@ -1580,12 +1603,13 @@ pub fn compile_project(
     // Find entry namespace by looking up which unit came from a file named
     // after the entry file's stem — or just read the namespace line only
     let entry_ns = {
-        let source = fs::read_to_string(&entry_file)
-            .map_err(|e| vec![SimpleError {
+        let source = fs::read_to_string(&entry_file).map_err(|e| {
+            vec![SimpleError {
                 code: "E0001".to_string(),
                 message: format!("{}: {}", entry_file.display(), e),
                 span: Span::default(),
-            }])?;
+            }]
+        })?;
         // Grab `namespace <name>` without full parse — no AST, no declarations
         source
             .lines()
@@ -1594,11 +1618,13 @@ pub fn compile_project(
                     .strip_prefix("namespace ")
                     .map(|n| n.trim().to_string())
             })
-            .ok_or_else(|| vec![SimpleError {
-                code: "E0010".to_string(),
-                message: "Could not find entry namespace".to_string(),
-                span: Span::default(),
-            }])?
+            .ok_or_else(|| {
+                vec![SimpleError {
+                    code: "E0010".to_string(),
+                    message: "Could not find entry namespace".to_string(),
+                    span: Span::default(),
+                }]
+            })?
     };
 
     // Ensure entry unit exists (safety fallback only — or_insert_with is a no-op if already present)
@@ -1746,13 +1772,13 @@ pub fn compile_project(
         let unit = units.get(&ns).unwrap();
         for mut decl in unit.declarations.clone() {
             desugar.rename_declaration(&mut decl, &alias);
-            desugar
-                .desugar_declaration(&mut decl)
-                .map_err(|e| vec![SimpleError {
+            desugar.desugar_declaration(&mut decl).map_err(|e| {
+                vec![SimpleError {
                     code: e.code,
                     message: format!("{}:{}: {}", ns, e.span.line, e.message),
                     span: e.span,
-                }])?;
+                }]
+            })?;
             for expanded in expand_impl_and_extension_decls(decl) {
                 all_decls.push(expanded);
             }

@@ -64,8 +64,6 @@ pub struct Registry {
     pub newtype_alias: HashMap<String, InferType>,
     pub enum_variants: HashMap<String, (String, Vec<TypeVarId>, Option<InferType>)>,
     pub extern_fns: HashSet<String>,
-    pub option_type_name: Option<String>,
-    pub result_type_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -621,22 +619,6 @@ impl TypeChecker {
                             ordered_vars.iter().map(|id| InferType::Var(*id)).collect(),
                         )
                     };
-
-                    let variant_names = variants
-                        .iter()
-                        .map(|v| v.node.name.name.as_str())
-                        .collect::<Vec<_>>();
-                    if variant_names.iter().any(|&v| v == "Some")
-                        && variant_names.iter().any(|&v| v == "None")
-                    {
-                        self.registry.option_type_name = Some(name.name.clone());
-                    }
-                    if variant_names.iter().any(|&v| v == "Ok")
-                        && variant_names.iter().any(|&v| v == "Err")
-                    {
-                        self.registry.result_type_name = Some(name.name.clone());
-                    }
-
                     for variant in variants {
                         let variant_name = variant.node.name.name.clone();
                         let payload_ty = match &variant.node.payload {
@@ -687,15 +669,6 @@ impl TypeChecker {
         use crate::resolver::DeclInfo;
         for (name, info) in imports {
             if let DeclInfo::Enum { variants } = info {
-                let variant_names: Vec<&str> = variants.keys().map(|s| s.as_str()).collect();
-                let is_option = variant_names.contains(&"Some") && variant_names.contains(&"None");
-                let is_result = variant_names.contains(&"Ok") && variant_names.contains(&"Err");
-                if is_option && self.registry.option_type_name.is_none() {
-                    self.registry.option_type_name = Some(name.clone());
-                }
-                if is_result && self.registry.result_type_name.is_none() {
-                    self.registry.result_type_name = Some(name.clone());
-                }
                 // Register variant constructors so Ok(x), Err(e), Some(x), None work in user code.
                 let enum_ty = InferType::App(
                     name.clone(),
@@ -796,14 +769,14 @@ impl TypeChecker {
         }
     }
 
-    fn make_option_ty(&self, inner: InferType) -> InferType {
-        InferType::App(
-            self.registry
-                .option_type_name
-                .clone()
-                .unwrap_or_else(|| "Option".into()),
-            vec![inner],
-        )
+    fn make_enum_ty(&self, variant: &str, inner: InferType) -> InferType {
+        // Look up enum name from variant
+        let Some((enum_name, _, _)) = self.registry.enum_variants.get(variant) else {
+            // Fallback: if we don't have variant info, assume it's the variant name itself
+            // This shouldn't happen for well-formed code
+            return InferType::App(variant.to_string(), vec![inner]);
+        };
+        InferType::App(enum_name.clone(), vec![inner])
     }
 
     fn array_elem_type(&self, ty: &InferType) -> Option<InferType> {
@@ -1403,8 +1376,8 @@ impl TypeChecker {
                                         }
                                         InferType::Con("Unit".into())
                                     }
-                                    "recv" => self.make_option_ty(elem),
-                                    "try_recv" => self.make_option_ty(elem),
+                                    "recv" => self.make_enum_ty("Some", elem),
+                                    "try_recv" => self.make_enum_ty("Some", elem),
                                     _ => self.infer_method_call(
                                         &name,
                                         &field.name,
@@ -1521,7 +1494,7 @@ impl TypeChecker {
                 self.solver
                     .unify(&index_ty, &InferType::Con("Int32".into()), Some(index.span))?;
                 if let Some(elem) = self.array_elem_type(&base_ty) {
-                    self.make_option_ty(elem)
+                    self.make_enum_ty("Some", elem)
                 } else {
                     self.solver.fresh_var()
                 }

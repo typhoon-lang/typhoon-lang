@@ -6,17 +6,35 @@
 
 #pragma once
 #include <stdint.h>
+#include "atomic.h"
 #include "ty_mem.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct TyNetwork TyNetwork;
-typedef struct TyListener TyListener;
-typedef struct TySocket TySocket;
-typedef struct TyReadSocket TyReadSocket;
-typedef struct TyWriteSocket TyWriteSocket;
+#if defined(_WIN32)
+# define WIN32_LEAN_AND_MEAN
+# include <winsock2.h>
+typedef SOCKET ty_sock_t;
+#else
+# include <sys/socket.h>
+typedef int ty_sock_t;
+#endif
+
+typedef struct TyNetwork { uint32_t _tag; } TyNetwork;
+typedef struct TyListener { ty_sock_t sock; } TyListener;
+typedef struct TySocket {
+    ty_sock_t sock;
+    int closed;
+    /* Number of live halves sharing this socket's fd. 1 for a plain,
+     * never-split Socket (Socket__close always fully closes — same as
+     * before). set to 2 by split(); the fd is only actually closed once
+     * both ReadSocket__close and WriteSocket__close have run. */
+    _Atomic(int) half_count;
+} TySocket;
+typedef struct TyReadSocket  { TySocket* sock; int closed; } TyReadSocket;
+typedef struct TyWriteSocket { TySocket* sock; int closed; } TyWriteSocket;
 
 // Field layout mirrors what the compiler derives from `enum Result<T, E> { Ok(T), Err(E) }`
 // in result.ty: tag is field 0, then one payload slot per variant in

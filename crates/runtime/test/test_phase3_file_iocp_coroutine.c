@@ -77,11 +77,12 @@
 
 #include "scheduler.h"
 #include "ty_io.h"
-#include "ty_mem.h"
+#include "ty_net.h"
 
 #define TEST_FILENAME "test_phase3_file_iocp_coroutine.tmp"
 #define CONTENT "the quick brown fox jumps over the lazy dog, 43 bytes"
 #define CONTENT_LEN 54
+#define TY_RESULT_OK 0
 
 typedef struct {
     int wrote_ok;
@@ -108,9 +109,9 @@ static void file_iocp_coro(void* arena, void* arg) {
     TyFile* wf = open_w_res.ok;
 
     TyStr content = { .ptr = CONTENT, .len = CONTENT_LEN };
-    TyResult_i32 write_res;
+    TyResult_i32_i32 write_res;
     __ty_rt__File__write(arena, wf, &content, &write_res);
-    g_result.wrote_ok = (write_res.tag == 0 && write_res.ok == CONTENT_LEN);
+    g_result.wrote_ok = (write_res.tag == 0 && write_res.value == CONTENT_LEN);
     __ty_rt__File__close(arena, wf);
 
     // --- read phase: the actual thing this checklist item asks about ---
@@ -123,9 +124,9 @@ static void file_iocp_coro(void* arena, void* arg) {
     TyFile* rf = open_r_res.ok;
 
     char buf[CONTENT_LEN];
-    TyResult_i32 read_res;
+    TyResult_i32_i32 read_res;
     __ty_rt__File__read(arena, rf, buf, CONTENT_LEN, &read_res);
-    g_result.read_ok = (read_res.tag == 0 && read_res.ok == CONTENT_LEN);
+    g_result.read_ok = (read_res.tag == 0 && read_res.value == CONTENT_LEN);
     g_result.content_matches = (memcmp(buf, CONTENT, CONTENT_LEN) == 0);
 
     __ty_rt__File__close(arena, rf);

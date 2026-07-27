@@ -16,12 +16,20 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        Self::new_with_start_id(tokens, 1)
+    }
+
+    pub fn new_with_start_id(tokens: Vec<Token>, start_id: u32) -> Self {
         Parser {
             tokens,
             pos: 0,
-            next_id: Cell::new(1),
+            next_id: Cell::new(start_id),
             self_type_stack: Vec::new(),
         }
+    }
+
+    pub fn next_id_watermark(&self) -> u32 {
+        self.next_id.get()
     }
 
     fn alloc_id(&self) -> NodeId {
@@ -1044,11 +1052,16 @@ impl Parser {
                             span: token.span,
                         }
                     }
-                    _ => return Err(SimpleError {
-                        code: "E1000".to_string(),
-                        message: format!("Expected identifier, got {:?}", self.peek_token().token_type),
-                        span: self.peek_token().span,
-                    }),
+                    _ => {
+                        return Err(SimpleError {
+                            code: "E1000".to_string(),
+                            message: format!(
+                                "Expected identifier, got {:?}",
+                                self.peek_token().token_type
+                            ),
+                            span: self.peek_token().span,
+                        })
+                    }
                 };
                 expr = self.make_expr(ExpressionKind::FieldAccess {
                     base: Box::new(expr),
@@ -1293,12 +1306,11 @@ impl Parser {
                     let mut else_branch = None;
                     if self.match_token(TokenType::Else) {
                         if self.peek_token().token_type == TokenType::If {
-                            let else_if_stmt =
-                                self.statement()?.ok_or_else(|| SimpleError {
-                                    code: "E1000".to_string(),
-                                    message: "Expected else-if statement".to_string(),
-                                    span: self.peek_token().span,
-                                })?;
+                            let else_if_stmt = self.statement()?.ok_or_else(|| SimpleError {
+                                code: "E1000".to_string(),
+                                message: "Expected else-if statement".to_string(),
+                                span: self.peek_token().span,
+                            })?;
                             // The `if-let` is currently parsed as an expression inside an `Expression` statement.
                             // To support `else if`, we need a more flexible `ElseBranchKind` that works for both `if` and `if-let`.
                             else_branch = Some(Box::new(self.make_spanned_with_span(
@@ -1562,13 +1574,11 @@ impl Parser {
                     }
                 }
                 let digits_clean: String = digits.chars().filter(|c| *c != '_').collect();
-                let val: i64 = digits_clean
-                    .parse()
-                    .map_err(|e| SimpleError {
-                        code: "E1000".to_string(),
-                        message: format!("Invalid int literal: {}", e),
-                        span: token.span,
-                    })?;
+                let val: i64 = digits_clean.parse().map_err(|e| SimpleError {
+                    code: "E1000".to_string(),
+                    message: format!("Invalid int literal: {}", e),
+                    span: token.span,
+                })?;
                 Ok(self.make_pattern(PatternKind::Literal(Literal {
                     kind: LiteralKind::Int(val, suffix),
                     span: token.span,
@@ -1590,13 +1600,11 @@ impl Parser {
                     (lex.clone(), None)
                 };
                 let num_clean: String = num_part.chars().filter(|c| *c != '_').collect();
-                let val: f64 = num_clean
-                    .parse()
-                    .map_err(|e| SimpleError {
-                        code: "E1000".to_string(),
-                        message: format!("Invalid float literal: {}", e),
-                        span: token.span,
-                    })?;
+                let val: f64 = num_clean.parse().map_err(|e| SimpleError {
+                    code: "E1000".to_string(),
+                    message: format!("Invalid float literal: {}", e),
+                    span: token.span,
+                })?;
                 Ok(self.make_pattern(PatternKind::Literal(Literal {
                     kind: LiteralKind::Float(val, suffix),
                     span: token.span,

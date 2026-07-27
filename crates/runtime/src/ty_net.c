@@ -75,6 +75,7 @@ static const char* ty_net_errstr_win32(int32_t code, char* buf, size_t buf_len) 
 # include <netdb.h>
 # include <arpa/inet.h>
 # include <fcntl.h>
+# include <poll.h>
 typedef int ty_sock_t;
 static int32_t ty_net_last_error(void) { return (int32_t)errno; }
 static void ty_sock_close(ty_sock_t s) { close(s); }
@@ -94,20 +95,6 @@ static const char* ty_net_errstr_errno(int32_t code, char* buf, size_t buf_len) 
 #endif
 
 /* TyResult_i32_i32 is now defined in ty_net.h */
-
-struct TyNetwork { uint32_t _tag; };
-struct TyListener { ty_sock_t sock; };
-struct TySocket {
-    ty_sock_t sock;
-    int closed;
-    /* Number of live halves sharing this socket's fd. 1 for a plain,
-     * never-split Socket (Socket__close always fully closes — same as
-     * before). set to 2 by split(); the fd is only actually closed once
-     * both ReadSocket__close and WriteSocket__close have run. */
-    _Atomic(int) half_count;
-};
-struct TyReadSocket  { TySocket* sock; int closed; };
-struct TyWriteSocket { TySocket* sock; int closed; };
 
 /* ── Fixed-slot lock-free pool for cross-coroutine resources ────────────────
  *
@@ -609,14 +596,19 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
             op.coro = coro;
             int submit_rc = ty_io_submit(&op);
             if (submit_rc < 0) {
-                /* No backend handles ACCEPT — yield and retry.
-                 * This happens when only the global io_driver is active
-                 * (no per-worker backend).  The coroutine yields so the
-                 * scheduler can poll IO and retry accept() later. */
+                /* No per-worker backend handles ACCEPT (global-driver-
+                 * only fallback) — yield and retry. This is the only
+                 * case ty_io_submit() still returns <0 for; the
+                 * per-worker path below always submits, parks, and
+                 * resumes internally before returning, so by the time
+                 * it returns 0 a real result is already waiting in
+                 * ty_io_take_result(). Do NOT call ty_io_park_coro()
+                 * here anymore — see ty_io_backend.c's ty_io_submit()
+                 * for why calling it a second time here would double-
+                 * park an already-resumed coroutine. */
                 ty_yield();
                 continue;
             }
-            ty_io_park_coro((SlabArena*)task);
 
             /* Resumed — io_result holds the accepted fd (>=0) or error (<0).
              * The backend poll() performed the actual accept() syscall and
@@ -674,22 +666,71 @@ void __ty_rt__Listener__accept(void* task, TyListener* self, TyResult_Socket_i32
         }
     }
 
-    /* ── Sync fallback (outside coroutine) ─────────────────────────────── */
+    /* ── Sync fallback (outside coroutine) ─────────────────────────────
+     *
+     * self->sock is always O_NONBLOCK (set unconditionally in listen(),
+     * see comment there) — there is no "blocking listener" to fall back
+     * to. The async path above handles EAGAIN by parking on the
+     * scheduler; here there is no scheduler to park on, so we have to
+     * wait for readability ourselves with poll()/WSAPoll() and retry,
+     * the same thing a real blocking accept() would do internally.
+     *
+     * A single accept() call with no wait (the previous version of this
+     * function) was a genuine race: on loopback the client's connect()
+     * and this thread's accept() run concurrently, and there is no
+     * guarantee the handshake has landed in the accept queue by the
+     * time this line runs. It usually does — which is exactly what
+     * made this intermittent rather than a reliable failure — but noth-
+     * ing here has to be a race. See test_phase2_write_read_roundtrip.c:138.
+     *
+     * TY_ACCEPT_SYNC_TIMEOUT_MS bounds the wait so a genuinely-stuck
+     * caller (nothing ever connects) still returns an error instead of
+     * hanging the process forever. */
+#define TY_ACCEPT_SYNC_TIMEOUT_MS 10000
     ty_sock_t c = (ty_sock_t)(-1);
-    c = (ty_sock_t)accept(self->sock, NULL, NULL);
+    for (;;) {
+        c = (ty_sock_t)accept(self->sock, NULL, NULL);
 #if defined(_WIN32)
-    if (c == INVALID_SOCKET) {
-        result.err = ty_net_last_error();
-        *out = result;
-        return;
-    }
+        if (c != INVALID_SOCKET) break;
+        int32_t acc_err = ty_net_last_error();
+        if (acc_err != WSAEWOULDBLOCK) {
+            result.err = acc_err;
+            *out = result;
+            return;
+        }
+        WSAPOLLFD pfd;
+        pfd.fd = self->sock;
+        pfd.events = POLLRDNORM;
+        pfd.revents = 0;
+        int prc = WSAPoll(&pfd, 1, TY_ACCEPT_SYNC_TIMEOUT_MS);
 #else
-    if (c < 0) {
-        result.err = ty_net_last_error();
-        *out = result;
-        return;
-    }
+        if (c >= 0) break;
+        int32_t acc_err = ty_net_last_error();
+        if (acc_err != EAGAIN && acc_err != EWOULDBLOCK) {
+            result.err = acc_err;
+            *out = result;
+            return;
+        }
+        struct pollfd pfd;
+        pfd.fd = self->sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int prc = poll(&pfd, 1, TY_ACCEPT_SYNC_TIMEOUT_MS);
 #endif
+        if (prc == 0) {
+            /* Timed out waiting for a connection. */
+            result.err = -4;
+            *out = result;
+            return;
+        }
+        if (prc < 0) {
+            result.err = ty_net_last_error();
+            *out = result;
+            return;
+        }
+        /* Readable (or at least worth retrying) — loop back to accept(). */
+    }
+#undef TY_ACCEPT_SYNC_TIMEOUT_MS
 
     /* Accepted socket needs non-blocking for async IO. */
     ty_sock_set_nonblock(c);

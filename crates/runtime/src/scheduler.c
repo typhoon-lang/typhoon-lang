@@ -20,6 +20,8 @@
 #include "atomic.h"
 #include "ty_mem.h"
 #include "ty_io_backend.h"
+#include "io_driver.h" /* ty_io_wake_coro — used by the deferred-submit
+                         * failure path in worker_resume_coro() below */
 
 /* Platform-specific IO backend headers */
 #if defined(_WIN32)
@@ -511,9 +513,26 @@ static void coro_free(TyCoro* co) {
 #endif
     TY_DEBUG("[sched] coro_free:free_stack coro=%p base=%p size=%zu\n",
         (void*)co, (void*)co->stack_base, (size_t)co->stack_total);
+    /* co IS co->stack_base (see coro_new: co = (TyCoro*)base, then
+     * co->stack_base = base) — the TyCoro header lives at the very
+     * start of the single mmap'd [header | guard page | stack] region,
+     * not in a separate allocation. This one ty_vm_free() call already
+     * unmaps the header along with everything else.
+     *
+     * There used to be a second ty_vm_free(co, sizeof(TyCoro)) call
+     * here ("free_header"). That was a double-free of the same
+     * address: munmap() gives no grace period, so the instant this
+     * call returns, another thread's concurrent coro_new() is free to
+     * mmap a brand-new, unrelated coroutine at this exact address —
+     * and under the 1000-coroutine stress test's rapid alloc/free
+     * churn across workers, addresses cycle back into reuse fast
+     * enough that this reliably happened. The second free would then
+     * unmap memory a live, in-flight coroutine now owned, corrupting
+     * or crashing whichever unrelated coroutine got that address next
+     * — not this one, which is why it manifested as a SIGSEGV in
+     * worker_resume_coro() on a completely different coroutine being
+     * stolen and resumed, well after this call had already returned. */
     ty_vm_free(co->stack_base, co->stack_total);
-    TY_DEBUG("[sched] coro_free:free_header coro=%p\n", (void*)co);
-    ty_vm_free(co, sizeof(TyCoro));
 }
 
 /* ── scheduling helpers ──────────────────────────────────────────────────── */
@@ -696,6 +715,34 @@ static void worker_resume_coro(Worker* w, TyCoro* co) {
 #ifdef TY_ASAN
     __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #endif
+
+    /* If the coroutine we just ran parked itself via
+     * ty_io_park_coro_deferred(), its (be, op) is waiting for us here.
+     * Fire the real kernel submit now — co->ctx was just captured by
+     * the ty_ctx_swap() above, so co is now genuinely safe to be woken
+     * and resumed by any worker. Submitting any earlier (from inside
+     * the coroutine's own stack, before this swap) is the bug that
+     * dropped the phase2 backpressure test's final chunk: a fast
+     * completion (io_uring against already-buffered loopback data can
+     * complete in microseconds) could wake and resume the coroutine on
+     * a different worker while this thread was still physically
+     * executing on its stack — two OS threads running the same
+     * coroutine concurrently. */
+    if (w->pending_submit_op) {
+        TyIoBackend* be = w->pending_submit_be;
+        TyIoOp* op = w->pending_submit_op;
+        w->pending_submit_be = NULL;
+        w->pending_submit_op = NULL;
+        int rc = be->submit(be, op);
+        if (rc < 0) {
+            /* Nothing was queued with the kernel, so nothing will ever
+             * wake this coroutine on its own. Deliver the failure
+             * through the same wake+result path a real completion
+             * would use, rather than leaking a coroutine parked
+             * forever with no rescuer. */
+            ty_io_wake_coro(op->coro, (int64_t)rc);
+        }
+    }
 
     w->current = NULL;
     atomic_store_explicit(&w->in_coro, 0, memory_order_release);
@@ -1138,6 +1185,41 @@ void ty_coro_set_running(void) {
     TyCoro* me = w ? w->current : NULL;
     if (!me) return;
     coro_state_store(me, CORO_RUNNING, "io_submit_failed_unblock");
+}
+
+/* Arms a deferred IO submit and parks the current coroutine.
+ *
+ * Callers that need to hand an op to a kernel-async backend (io_uring,
+ * IOCP, kqueue) MUST NOT call be->submit() themselves before parking —
+ * see worker_resume_coro()'s comment for the full race that creates.
+ * Call ty_coro_set_blocked() first (as before), then this instead of
+ * submitting directly: it stashes (be, op) on the current worker and
+ * yields. The actual submit happens from worker_resume_coro(), safely
+ * after this coroutine's context has been captured by its own
+ * ty_ctx_swap() — so no completion can possibly race a resume ahead of
+ * that swap, because the op hasn't been handed to the kernel yet.
+ *
+ * `op` must remain valid (and unwritten by anyone else) until the
+ * deferred submit fires and a result comes back — true here because it
+ * lives on this coroutine's own stack, which stays untouched while
+ * parked, same lifetime guarantee the direct-submit path always relied
+ * on (see ty_io_uring.c's uring_submit_op comment on user_data).
+ */
+void ty_io_park_coro_deferred(SlabArena* arena, struct TyIoBackend* be, TyIoOp* op) {
+    (void)arena;
+    Worker* w = current_worker();
+    if (!w) {
+        /* No worker context (bare-main call) — nothing to defer onto.
+         * Fall back to the old, narrower-window behavior rather than
+         * silently dropping the op; bare-main callers aren't part of
+         * the M:N work-stealing pool this race depends on anyway. */
+        be->submit(be, op);
+        ty_coro_block_and_yield();
+        return;
+    }
+    w->pending_submit_be = be;
+    w->pending_submit_op = op;
+    ty_coro_block_and_yield();
 }
 
 void ty_coro_exit(void) {

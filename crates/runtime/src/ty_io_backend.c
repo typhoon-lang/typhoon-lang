@@ -67,44 +67,41 @@ int ty_io_submit(const TyIoOp* op) {
     if (w && w->io_backend) {
         TyIoBackend* be = w->io_backend;
         if (be->submit) {
-            /* Mark BLOCKED *before* the kernel can see this op, not
-             * after submit() returns. Per-worker backends can complete
-             * fast enough (io_uring especially, against data already
-             * sitting in a socket buffer — often microseconds) that
-             * another worker's ty_io_poll() can process the completion
-             * and enqueue this coroutine as RUNNABLE while it's still
-             * genuinely executing here. sched_enqueue_wake does a
-             * plain, unconditional state store with no CAS, so that
-             * race clobbers CORO_RUNNING out from under us and lets a
-             * different worker steal + resume the same coroutine while
-             * this one is still running it — two OS threads executing
-             * the same coroutine stack concurrently. Setting BLOCKED
-             * first closes the window: any completion that races in
-             * now sees a coroutine that's supposed to be blocked, which
-             * is what ty_coro_block_and_yield (via ty_io_park_coro,
-             * called right below) is built to reconcile safely.
+            /* Do NOT call be->submit() here, for ANY op type including
+             * ACCEPT. Handing the op to the kernel from inside this
+             * coroutine's own stack, before it has actually parked
+             * (ty_ctx_swap'd away), leaves a window where a completion
+             * arrives fast enough (io_uring against already-buffered
+             * loopback data, or an already-pending inbound connection,
+             * can complete in microseconds) for another worker to wake
+             * *and resume* this coroutine while this thread is still
+             * physically executing on its stack — two OS threads
+             * running the same coroutine concurrently.
              *
-             * For ACCEPT the existing callers (Listener__accept) park
-             * separately themselves and must not be double-blocked
-             * here, so this still only applies to READ/WRITE. */
-            if (op->type != TY_IO_OP_ACCEPT) {
-                ty_coro_set_blocked();
-            }
-            int rc = be->submit(be, op);
-            if (rc < 0) {
-                if (op->type != TY_IO_OP_ACCEPT) {
-                    /* Submit failed — nothing was queued with the
-                     * kernel, so nothing will ever wake this coroutine
-                     * back up. Undo the BLOCKED marking rather than
-                     * parking into a state nothing can rescue it from. */
-                    ty_coro_set_running();
-                }
-                return rc;
-            }
-            if (op->type != TY_IO_OP_ACCEPT) {
-                ty_io_park_coro((SlabArena*)ty_current_arena());
-            }
-            return rc;
+             * This used to be handled with a narrower, incomplete fix
+             * that only marked BLOCKED before submit() and special-
+             * cased ACCEPT out of it entirely (on the theory that
+             * Listener__accept's separate submit()-then-park() call
+             * sequence didn't need it) — both of those still had the
+             * exact same race, just a smaller window for READ/WRITE and
+             * the full original window for ACCEPT. Confirmed by two
+             * separate crashes: the phase2 backpressure test's lost
+             * final chunk (READ) and test_phase4_linux_1000_coroutines'
+             * SIGSEGV under real multi-worker stealing load (ACCEPT).
+             *
+             * The only fix that actually closes this for every op type
+             * is deferring the real submit until *after* this
+             * coroutine's own ty_ctx_swap has captured its context —
+             * see ty_io_park_coro_deferred() / worker_resume_coro() in
+             * scheduler.c. Mark BLOCKED, hand the op to the scheduler,
+             * and only resume here once a real result has been
+             * delivered via ty_io_wake_coro(). Callers (including
+             * Listener__accept) must NOT call ty_io_park_coro()
+             * themselves anymore — this does the full submit+park for
+             * them, for every op type. */
+            ty_coro_set_blocked();
+            ty_io_park_coro_deferred((SlabArena*)ty_current_arena(), be, (TyIoOp*)op);
+            return 0;
         }
     }
 

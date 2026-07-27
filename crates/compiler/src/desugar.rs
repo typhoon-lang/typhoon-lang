@@ -878,14 +878,15 @@ impl Desugar {
                     },
                     *span,
                 );
+                let buf_let_pattern = Pattern {
+                    node: PatternKind::Identifier(buf_id.clone()),
+                    span: *span,
+                    id: self.alloc_id(),
+                };
                 statements.push(self.mk_stmt(
                     StatementKind::LetBinding {
                         mutable: false,
-                        pattern: Pattern {
-                            node: PatternKind::Identifier(buf_id.clone()),
-                            span: *span,
-                            id: crate::ast::NodeId(self.next_id),
-                        },
+                        pattern: buf_let_pattern,
                         type_annotation: None,
                         initializer: buf_new,
                         else_block: None,

@@ -85,10 +85,10 @@ static void small_conn_coro(void* arena, void* arg) {
     TySocket* sock = (TySocket*)a[0];
     int idx = (int)(intptr_t)a[1];
 
-    TyResult_i32 read_res;
+    TyResult_i32_i32 read_res;
     char rbuf[MSG_LEN];
     __ty_rt__Socket__read(arena, sock, rbuf, MSG_LEN, &read_res);
-    if (read_res.tag == TY_RESULT_OK && read_res.ok == MSG_LEN &&
+    if (read_res.tag == 0 && read_res.value == MSG_LEN &&
         memcmp(rbuf, MSG, MSG_LEN) == 0) {
         g_small_results[idx].done = 1;
     }
@@ -99,12 +99,12 @@ static void small_accept_loop_coro(void* arena, void* arg) {
     for (int i = 0; i < 8; i++) {
         TyResult_Socket_i32 accept_res;
         __ty_rt__Listener__accept(arena, listener, &accept_res);
-        if (accept_res.tag != TY_RESULT_OK) {
+        if (accept_res.tag != 0) {
             fprintf(stderr, "small accept %d failed\n", i);
             continue;
         }
         void** spawn_args = slab_alloc_sized(arena, sizeof(void*) * 2);
-        spawn_args[0] = accept_res.ok;
+        spawn_args[0] = accept_res.value;
         spawn_args[1] = (void*)(intptr_t)i;
         ty_spawn(NULL, small_conn_coro, spawn_args); // first arg ignored by ty_spawn
     }
@@ -139,12 +139,12 @@ static int test_kqueue_accept_and_read(void) {
     snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
     TyStr addr_str = make_str(arena, addr);
     __ty_rt__Network__listen(arena, &net, &addr_str, &listen_res);
-    if (listen_res.tag != TY_RESULT_OK) {
+    if (listen_res.tag != 0) {
         fprintf(stderr, "FAIL(small): listen failed\n");
         return 0;
     }
 
-    ty_spawn(NULL, small_accept_loop_coro, listen_res.ok); // first arg ignored by ty_spawn
+    ty_spawn(NULL, small_accept_loop_coro, listen_res.value); // first arg ignored by ty_spawn
 
     pthread_t tid;
     pthread_create(&tid, NULL, small_client_thread, (void*)(intptr_t)port);
@@ -174,10 +174,10 @@ static void scale_conn_coro(void* arena, void* arg) {
     TySocket* sock = (TySocket*)a[0];
     int idx = (int)(intptr_t)a[1];
 
-    TyResult_i32 read_res;
+    TyResult_i32_i32 read_res;
     char rbuf[MSG_LEN];
     __ty_rt__Socket__read(arena, sock, rbuf, MSG_LEN, &read_res);
-    if (read_res.tag == TY_RESULT_OK && read_res.ok == MSG_LEN &&
+    if (read_res.tag == 0 && read_res.value == MSG_LEN &&
         memcmp(rbuf, MSG, MSG_LEN) == 0) {
         g_scale_results[idx].done = 1;
     }
@@ -188,9 +188,9 @@ static void scale_accept_loop_coro(void* arena, void* arg) {
     for (int i = 0; i < N_CORO; i++) {
         TyResult_Socket_i32 accept_res;
         __ty_rt__Listener__accept(arena, listener, &accept_res);
-        if (accept_res.tag != TY_RESULT_OK) continue;
+        if (accept_res.tag != 0) continue;
         void** spawn_args = slab_alloc_sized(arena, sizeof(void*) * 2);
-        spawn_args[0] = accept_res.ok;
+        spawn_args[0] = accept_res.value;
         spawn_args[1] = (void*)(intptr_t)i;
         ty_spawn(NULL, scale_conn_coro, spawn_args); // first arg ignored by ty_spawn
     }
@@ -223,12 +223,12 @@ static int test_kqueue_1000_coroutines(void) {
     snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
     TyStr addr_str = make_str(arena, addr);
     __ty_rt__Network__listen(arena, &net, &addr_str, &listen_res);
-    if (listen_res.tag != TY_RESULT_OK) {
+    if (listen_res.tag != 0) {
         fprintf(stderr, "FAIL(scale): listen failed\n");
         return 0;
     }
 
-    ty_spawn(NULL, scale_accept_loop_coro, listen_res.ok); // first arg ignored by ty_spawn
+    ty_spawn(NULL, scale_accept_loop_coro, listen_res.value); // first arg ignored by ty_spawn
 
     pthread_t tid;
     pthread_create(&tid, NULL, scale_client_thread, (void*)(intptr_t)port);

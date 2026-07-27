@@ -48,7 +48,18 @@
 
 #include <stddef.h>   /* size_t */
 #include <stdint.h>
-#include <intrin.h>
+
+#ifndef MemoryBarrier
+  #if defined(_M_AMD64) || defined(_M_X64)
+    #include <intrin.h>
+    #define MemoryBarrier() __faststorefence()
+  #elif defined(_M_ARM) || defined(_M_ARM64)
+    #include <intrin.h>
+    #define MemoryBarrier() __dmb(_ARM_BARRIER_ISH)
+  #else
+    #include <windows.h>
+  #endif
+#endif
 
 /* ── __forceinline compat ───────────────────────────────────────────────── */
 #ifndef __forceinline

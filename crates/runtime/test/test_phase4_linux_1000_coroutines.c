@@ -65,6 +65,7 @@
 #include "ty_net.h"
 #include "ty_mem.h"
 
+#define TY_RESULT_OK 0
 #define N_CORO 1000
 #define MSG "loopback-ping"
 #define MSG_LEN 13
@@ -80,6 +81,20 @@ typedef struct {
     int done; // set 1 by coroutine on success, left 0 on failure
 } PairState;
 
+// Cross-coroutine handoff data for accept_loop_coro -> conn_coro. Deliberately
+// plain malloc'd, NOT arena-allocated: accept_loop_coro's own arena (its
+// `arena` parameter, i.e. co->arena) is scoped to accept_loop_coro's own
+// lifetime and is gone once it returns, but conn_coro may not actually run
+// until well after that (it's just enqueued on some worker's deque under
+// 1,000-way fan-out) — an arena allocation here would be a use-after-free
+// for any conn_coro that runs late. Same cross-coroutine-handoff class as
+// ty_mem.c's ty_buf_new_heap (the into_chan reader -> channel -> consumer
+// handoff): plain heap allocation, freed by whichever side consumes it last.
+typedef struct {
+    TySocket* sock;
+    int idx;
+} ConnSpawnArgs;
+
 static PairState g_pairs[N_CORO];
 static int g_listen_port = 0;
 
@@ -88,13 +103,15 @@ static int g_listen_port = 0;
 // caller-supplied flag of any kind.
 static void conn_coro(void* arena, void* arg) {
     (void)arena;
-    int idx = (int)(intptr_t)((TySocket**)arg)[1];
-    TySocket* sock = ((TySocket**)arg)[0];
+    ConnSpawnArgs* args = (ConnSpawnArgs*)arg;
+    int idx = args->idx;
+    TySocket* sock = args->sock;
+    free(args); // heap-owned (see ConnSpawnArgs above), not arena-owned — free once consumed
 
-    TyResult_i32 read_res;
+    TyResult_i32_i32 read_res;
     char rbuf[MSG_LEN];
     __ty_rt__Socket__read(arena, sock, rbuf, MSG_LEN, &read_res);
-    if (read_res.tag == TY_RESULT_OK && read_res.ok == MSG_LEN &&
+    if (read_res.tag == TY_RESULT_OK && read_res.value == MSG_LEN &&
         memcmp(rbuf, MSG, MSG_LEN) == 0) {
         g_pairs[idx].done = 1;
     }
@@ -110,9 +127,9 @@ static void accept_loop_coro(void* arena, void* arg) {
             fprintf(stderr, "accept %d failed\n", i);
             continue;
         }
-        void** spawn_args = slab_alloc_sized(arena, sizeof(void*) * 2);
-        spawn_args[0] = accept_res.ok; // TySocket*
-        spawn_args[1] = (void*)(intptr_t)i;
+        ConnSpawnArgs* spawn_args = (ConnSpawnArgs*)malloc(sizeof(ConnSpawnArgs));
+        spawn_args->sock = (TySocket*)accept_res.value;
+        spawn_args->idx = i;
         ty_spawn(NULL, conn_coro, spawn_args); // first arg ignored by ty_spawn
     }
 }
@@ -163,7 +180,7 @@ int main(void) {
 
     // accept_loop runs as a coroutine so its accept() calls go through the
     // async submit/park/resume path, not the sync fallback.
-    ty_spawn(NULL, accept_loop_coro, listen_res.ok); // first arg ignored by ty_spawn
+    ty_spawn(NULL, accept_loop_coro, listen_res.value); // first arg ignored by ty_spawn
 
     pthread_t client_tid;
     pthread_create(&client_tid, NULL, client_thread, NULL);

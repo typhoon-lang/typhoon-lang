@@ -20,6 +20,7 @@
 #include "platform.h"
 #include "atomic.h"
 #include "ty_mem.h"
+#include "ty_io_backend.h"
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -118,7 +119,13 @@ typedef struct Worker {
 	/* Per-worker IO backend pointer. */
 	struct TyIoBackend* io_backend;
 	/* Per-worker fd tracking for shutdown. */
-	TyFdSet fd_set;
+	TyFdSet fd_set;/* Deferred IO submit, armed by ty_io_park_coro_deferred() and fired
+     * by worker_resume_coro() immediately after this worker's own
+     * ty_ctx_swap() has returned — i.e. only once the parked
+     * coroutine's ctx is guaranteed to hold a fully-captured,
+     * safe-to-resume snapshot. See scheduler.c: worker_resume_coro. */
+    TyIoBackend* pending_submit_be;
+    TyIoOp*      pending_submit_op;
 } Worker;
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -191,6 +198,8 @@ void ty_coro_set_running(void);
 
 /* Exit the current coroutine. Called automatically at function return. */
 void ty_coro_exit(void);
+
+void ty_io_park_coro_deferred(SlabArena* arena, struct TyIoBackend* be, TyIoOp* op);
 
 // Block current coroutine; swap back to scheduler.
 void ty_coro_block_and_yield(void);

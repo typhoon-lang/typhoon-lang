@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -119,6 +120,7 @@ pub fn compile_to_ir(input: &str, output: &str) -> std::path::PathBuf {
         &checker.specializations,
         result,
         &original_ns_by_symbol,
+        &checker.registry.enum_variants,
     );
     let ir_text = ir.to_llvm_ir();
 

@@ -67,7 +67,7 @@ int ty_io_submit(const TyIoOp* op) {
     if (w && w->io_backend) {
         TyIoBackend* be = w->io_backend;
         if (be->submit) {
-            /* Do NOT call be->submit() here, for ANY op type including
+            /* OLD: Do NOT call be->submit() here, for ANY op type including
              * ACCEPT. Handing the op to the kernel from inside this
              * coroutine's own stack, before it has actually parked
              * (ty_ctx_swap'd away), leaves a window where a completion
@@ -99,9 +99,24 @@ int ty_io_submit(const TyIoOp* op) {
              * Listener__accept) must NOT call ty_io_park_coro()
              * themselves anymore — this does the full submit+park for
              * them, for every op type. */
-            ty_coro_set_blocked();
-            ty_io_park_coro_deferred((SlabArena*)ty_current_arena(), be, (TyIoOp*)op);
-            return 0;
+            if (be->readiness_based) {
+                /* Readiness-based (kqueue, epoll): submit NOW, before parking.
+                 * The kernel needs the interest registered so poll() can
+                 * detect readiness. This is the classic pattern:
+                 * submit() -> park() -> wake -> poll() -> callback. */
+                int rc = be->submit(be, op);
+                if (rc < 0) return -1;
+                ty_coro_set_blocked();
+                ty_coro_block_and_yield();
+                return 0;
+            } else {
+                /* Completion-based (io_uring, IOCP): defer submit until after
+                 * this coroutine's context is captured by ty_ctx_swap.
+                 * See worker_resume_coro() for the actual submit. */
+                ty_coro_set_blocked();
+                ty_io_park_coro_deferred((SlabArena*)ty_current_arena(), be, (TyIoOp*)op);
+                return 0;
+            }
         }
     }
 

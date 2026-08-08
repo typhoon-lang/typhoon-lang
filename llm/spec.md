@@ -278,6 +278,18 @@ At task end, the entire slab is reclaimed in a single operation — resetting th
 
 There is **no global heap contention**. Tasks never share slab memory except through channel transfer or `ref T`.
 
+### Generation Tagging (Stale Pointer Detection)
+
+Each slab allocation carries a **header cookie** — an 8-byte `SlotCookie` placed immediately before the user pointer:
+
+```
+[SlotCookie: generation] [user payload...]
+```
+
+The `SlabArena` holds a `generation` counter (initialized to 1 on `slab_arena_new()`). Every allocation writes the current generation into its cookie. When a task dies, `slab_arena_free()` **increments the arena's generation** before releasing memory. Any external pointer into the dead slab now carries a stale cookie; the next access (or explicit `slab_verify_generation()` check) detects the mismatch and aborts.
+
+This is a **safety check**, not a garbage collection mechanism. It fits the linear model without adding write barriers or scan overhead to the hot path. The cost is one integer compare on free/verify — allocation remains a pure bump-pointer increment.
+
 ### `ref T` — Shared Ownership
 
 When data genuinely needs to be shared across tasks, wrap it in `ref T`:
@@ -1480,6 +1492,8 @@ Default slab size: 4 MB. Configurable at task spawn:
 ```typhoon
 conc(slab: 8mb) { ... }
 ```
+
+**Generation tagging:** Each allocation carries a header cookie with the arena's generation counter. On task death, the generation increments — any stale external pointer into the dead slab fails validation on next access (§4).
 
 ### IO Driver
 

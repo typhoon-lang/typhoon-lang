@@ -129,6 +129,7 @@ mod c_tests {
         test_phase4_fdset_live_worker,
         "C_TEST_PATH_TEST_PHASE4_FDSET_LIVE_WORKER"
     );
+    #[cfg(windows)]
     c_test!(
         test_phase3_file_iocp_coroutine,
         "C_TEST_PATH_TEST_PHASE3_FILE_IOCP_COROUTINE"
@@ -137,12 +138,12 @@ mod c_tests {
         test_phase4_fdset_100_sockets_asan,
         "C_TEST_PATH_TEST_PHASE4_FDSET_100_SOCKETS_ASAN"
     );
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     c_test!(
         test_phase4_linux_1000_coroutines,
         "C_TEST_PATH_TEST_PHASE4_LINUX_1000_COROUTINES"
     );
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     c_test!(
         test_phase4_macos_coroutine_loopback,
         "C_TEST_PATH_TEST_PHASE4_MACOS_COROUTINE_LOOPBACK"

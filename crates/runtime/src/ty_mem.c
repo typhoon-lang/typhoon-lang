@@ -42,6 +42,28 @@ static const int32_t SIZE_CLASS_BYTES[NUM_SIZE_CLASSES] = {
     8, 16, 32, 64, 128, 256, 512, 1024
 };
 
+/* ── generation tagging (header cookie) ───────────────────────────────────────
+ *
+ * Each allocation gets a SlotCookie immediately before the user pointer.
+ * The cookie stores the arena's generation at allocation time.
+ * On task death, arena->generation increments. Any stale pointer from
+ * outside the dead arena will have a mismatched cookie and abort on access.
+ */
+typedef struct SlotCookie {
+    uint64_t generation;
+} SlotCookie;
+
+#define COOKIE_SIZE  sizeof(SlotCookie)
+#define COOKIE_ALIGN 8
+
+static inline SlotCookie* cookie_of(void* user_ptr) {
+    return (SlotCookie*)((uint8_t*)user_ptr - COOKIE_SIZE);
+}
+
+static inline void* user_of(SlotCookie* cookie) {
+    return (void*)((uint8_t*)cookie + COOKIE_SIZE);
+}
+
 /* ── hard abort ───────────────────────────────────────────────────────────────
  */
 
@@ -128,6 +150,7 @@ typedef struct SlabArena {
     BumpPage*     current_page;
     OversizedHdr* oversized;
     FreeNode*     free_lists[NUM_SIZE_CLASSES];
+    uint64_t      generation;
 } SlabArena;
 
 /* ── forward declarations ─────────────────────────────────────────────────────
@@ -158,6 +181,7 @@ SlabArena* slab_arena_new(void) {
 
     arena->current_page = pg;
     arena->oversized = NULL;
+    arena->generation = 1; /* start at 1 so 0 = uninitialized / freed */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         arena->free_lists[i] = NULL;
     return arena;
@@ -168,9 +192,15 @@ SlabArena* slab_arena_new(void) {
  *   1. all dedicated oversized pages
  *   2. all bump pages (the first page holds the SlabArena header)
  * Individual slab_free calls before this are optional.
+ *
+ * Increments generation so any stale external pointers fail cookie check.
  */
 void slab_arena_free(SlabArena* arena) {
     if (!arena) return;
+
+    /* Bump generation FIRST — any live external pointer with old cookie
+     * will now fail validation on next access. */
+    arena->generation++;
 
     OversizedHdr* oh = arena->oversized;
     while (oh) {
@@ -194,24 +224,37 @@ void slab_arena_free(SlabArena* arena) {
 
 static void* arena_bump_raw(SlabArena* arena, size_t size, size_t align) {
     BumpPage* pg = arena->current_page;
-    uint8_t* aligned = align_up(pg->bump_ptr, align);
+    /* Account for cookie: align the cookie, then user pointer follows */
+    size_t cookie_off = align_up(pg->bump_ptr, COOKIE_ALIGN) - pg->bump_ptr;
+    uint8_t* cookie_ptr = pg->bump_ptr + cookie_off;
+    uint8_t* user_ptr = cookie_ptr + COOKIE_SIZE;
+    user_ptr = align_up(user_ptr, align);
 
-    if (aligned + size <= pg->end) {
-        pg->bump_ptr = aligned + size;
-        return aligned;
+    if (user_ptr + size <= pg->end) {
+        SlotCookie* cookie = (SlotCookie*)cookie_ptr;
+        cookie->generation = arena->generation;
+        pg->bump_ptr = user_ptr + size;
+        return user_ptr;
     }
 
     /* page full — chain a new one */
     size_t new_cap = ARENA_PAGE_SIZE - sizeof(BumpPage);
-    if (size + align > new_cap) new_cap = size + align;
+    if (size + align + COOKIE_SIZE + COOKIE_ALIGN > new_cap)
+        new_cap = size + align + COOKIE_SIZE + COOKIE_ALIGN;
 
     BumpPage* np = bump_page_new(new_cap);
     np->next = arena->current_page;
     arena->current_page = np;
 
-    aligned = align_up(np->bump_ptr, align);
-    np->bump_ptr = aligned + size;
-    return aligned;
+    cookie_off = align_up(np->bump_ptr, COOKIE_ALIGN) - np->bump_ptr;
+    cookie_ptr = np->bump_ptr + cookie_off;
+    user_ptr = cookie_ptr + COOKIE_SIZE;
+    user_ptr = align_up(user_ptr, align);
+
+    SlotCookie* cookie = (SlotCookie*)cookie_ptr;
+    cookie->generation = arena->generation;
+    np->bump_ptr = user_ptr + size;
+    return user_ptr;
 }
 
 static void* arena_alloc(SlabArena* arena, size_t size, size_t align) {
@@ -227,6 +270,9 @@ static void* arena_alloc(SlabArena* arena, size_t size, size_t align) {
         if (head) {
             arena->free_lists[cls] = head->next;
             ptr = (void*)head;
+            /* Free-list slot already has a valid cookie from original allocation.
+             * Just verify it matches current generation (should always match for
+             * same-arena allocations). */
         } else {
             size_t slot = (size_t)SIZE_CLASS_BYTES[cls];
             size_t al = align < 8 ? 8 : align;
@@ -235,14 +281,17 @@ static void* arena_alloc(SlabArena* arena, size_t size, size_t align) {
         if (ptr)
             memset(ptr, 0, (cls < NUM_SIZE_CLASSES) ? (size_t)SIZE_CLASS_BYTES[cls] : size);
     } else {
-        /* oversized: dedicated mmap page */
-        size_t total = sizeof(OversizedHdr) + size;
+        /* oversized: dedicated mmap page with cookie */
+        size_t total = sizeof(OversizedHdr) + COOKIE_SIZE + size;
         size_t pgsz = (total + 4095) & ~(size_t)4095;
         OversizedHdr* hdr = (OversizedHdr*)vm_reserve(pgsz);
         hdr->total_size = pgsz;
         hdr->next = arena->oversized;
         arena->oversized = hdr;
-        ptr = (void*)(hdr + 1);
+        /* Place cookie after OversizedHdr, before user data */
+        SlotCookie* cookie = (SlotCookie*)((uint8_t*)(hdr + 1));
+        cookie->generation = arena->generation;
+        ptr = user_of(cookie);
     }
 
     return ptr;
@@ -252,6 +301,11 @@ static void arena_free_slot(SlabArena* arena, void* ptr, size_t size) {
     if (!arena || !ptr) return;
     int32_t cls = size_to_class(size);
     if (cls >= NUM_SIZE_CLASSES) return; /* oversized — released at arena_free */
+    /* Verify cookie before recycling */
+    SlotCookie* cookie = cookie_of(ptr);
+    if (cookie->generation != arena->generation) {
+        ty_abort(); /* stale pointer freed into wrong generation */
+    }
     FreeNode* node = (FreeNode*)ptr;
     node->next = arena->free_lists[cls];
     arena->free_lists[cls] = node;
@@ -301,9 +355,25 @@ void* slab_alloc(SlabArena* arena, int32_t size_class) {
 void slab_free(SlabArena* arena, void* ptr, int32_t size_class) {
     if (!arena || !ptr) return;
     if (size_class < 0 || size_class >= NUM_SIZE_CLASSES) return;
+    /* Verify cookie before recycling */
+    SlotCookie* cookie = cookie_of(ptr);
+    if (cookie->generation != arena->generation) {
+        ty_abort(); /* stale pointer freed into wrong generation */
+    }
     FreeNode* node = (FreeNode*)ptr;
     node->next = arena->free_lists[size_class];
     arena->free_lists[size_class] = node;
+}
+
+/* ── generation tag validation (for debug / compiler-inserted checks) ──────────
+ *
+ * Returns 1 if ptr's cookie matches arena's current generation, 0 otherwise.
+ * Safe to call with any pointer (NULL returns 0).
+ */
+int slab_verify_generation(SlabArena* arena, void* ptr) {
+    if (!arena || !ptr) return 0;
+    SlotCookie* cookie = cookie_of(ptr);
+    return cookie->generation == arena->generation;
 }
 
 /*

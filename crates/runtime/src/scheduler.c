@@ -155,16 +155,18 @@ static void* deque_pop(WSDeque* dq) {
     int ebr_id = ebr_worker_id();
     ebr_enter_worker(ebr_id);
     long bot = atomic_load_explicit(&dq->bottom, memory_order_relaxed) - 1;
-    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_acquire);
-    atomic_store_explicit(&dq->bottom, bot, memory_order_relaxed);
+    atomic_store_explicit(&dq->bottom, bot, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
-    long top = atomic_load_explicit(&dq->top, memory_order_relaxed);
+    long top = atomic_load_explicit(&dq->top, memory_order_acquire);
     if (top > bot) {
         atomic_store_explicit(&dq->bottom, bot + 1, memory_order_relaxed);
         ebr_exit_worker(ebr_id);
         return NULL;
     }
-    /* Use proper atomic loads — plain field access bypasses memory model */
+    /* Load array AFTER fence — pairs with release store in deque_grow.
+     * Loading before the fence (old code) could observe a stale array pointer
+     * that a concurrent grow() has already retired and freed via EBR. */
+    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_acquire);
     size_t cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
     void** buf = atomic_load_explicit(&a->buf, memory_order_relaxed);
     void* item = buf[bot & (cap - 1)];
@@ -183,14 +185,19 @@ static void* deque_pop(WSDeque* dq) {
 static void* deque_steal(WSDeque* dq) {
     int ebr_id = ebr_worker_id();
     ebr_enter_worker(ebr_id);
-    long top = atomic_load_explicit(&dq->top, memory_order_acquire);
-    atomic_thread_fence(memory_order_seq_cst);
+    /* Use seq_cst load for top to pair with seq_cst CAS below.
+     * The acquire load + explicit fence was correct in theory but
+     * seq_cst load provides stronger guarantee: it participates in
+     * the global seq_cst order, ensuring the subsequent bottom load
+     * sees all stores before any seq_cst fence in other threads
+     * (including owner's release store to bottom + seq_cst fence). */
+    long top = atomic_load_explicit(&dq->top, memory_order_seq_cst);
     long bot = atomic_load_explicit(&dq->bottom, memory_order_acquire);
     if (top >= bot) {
         ebr_exit_worker(ebr_id);
         return NULL;
     }
-    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_consume);
+    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_acquire);
     size_t cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
     void** buf = atomic_load_explicit(&a->buf, memory_order_relaxed);
     void* item = buf[top & (cap - 1)];

@@ -504,6 +504,7 @@ TyIocpBackend* ty_iocp_backend_new(void) {
     b->base.impl = b;
     b->base.submit = iocp_submit;
     b->base.poll = iocp_poll;
+    b->base.readiness_based = 0;
 
     g_backend = b;
     g_refcount = 1;

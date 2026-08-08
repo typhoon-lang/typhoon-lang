@@ -37,6 +37,10 @@ typedef struct TyIoBackend {
   void* impl;
   int (*submit)(struct TyIoBackend* backend, const TyIoOp* op);
   int (*poll)(struct TyIoBackend* backend, TySchedWakeFn wake);
+  /* Readiness-based backends (kqueue, epoll) must submit immediately.
+   * Completion-based backends (io_uring, IOCP) defer submit until after park.
+   * 0 = completion-based (deferred), 1 = readiness-based (immediate) */
+  int readiness_based;
 } TyIoBackend;
 
 enum {

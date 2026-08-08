@@ -424,6 +424,7 @@ TyUringBackend* ty_uring_backend_new(void) {
     b->base.impl = b;
     b->base.submit = uring_submit_op;
     b->base.poll = uring_poll_op;
+    b->base.readiness_based = 0;
 
     g_backend = b;
     g_refcount = 1;

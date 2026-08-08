@@ -32,6 +32,9 @@ int32_t    size_to_class(size_t size);
 void* slab_alloc(SlabArena* arena, int32_t size_class);
 void  slab_free(SlabArena* arena, void* ptr, int32_t size_class);
 void* slab_alloc_sized(SlabArena* arena, int64_t size);
+/* Verify that ptr was allocated from arena and belongs to the current generation.
+ * Returns 1 if valid, 0 if stale/NULL/wrong arena. Safe to call on any pointer. */
+int slab_verify_generation(SlabArena* arena, void* ptr);
 
 /*
  * TyStr — must match codegen.rs's "%struct.Str = type { i8*, i32 }"

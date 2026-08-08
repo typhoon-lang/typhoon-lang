@@ -77,13 +77,32 @@ static TyStr make_str(SlabArena* a, const char* s) {
 
 // ---------- Sub-test 1: functional accept()+read() through kqueue ----------
 
+// Cross-coroutine handoff data for accept_loop_coro -> conn_coro. Deliberately
+// plain malloc'd, NOT arena-allocated: accept_loop_coro's own arena (its
+// `arena` parameter, i.e. co->arena) is scoped to accept_loop_coro's own
+// lifetime and is gone once it returns, but conn_coro may not actually run
+// until well after that (it's just enqueued on some worker's deque under
+// 1,000-way fan-out) — an arena allocation here would be a use-after-free
+// for any conn_coro that runs late. Same cross-coroutine-handoff class as
+// ty_mem.c's ty_buf_new_heap (the into_chan reader -> channel -> consumer
+// handoff): plain heap allocation, freed by whichever side consumes it last.
+typedef struct {
+    TySocket* sock;
+    int idx;
+} ConnSpawnArgs;
+
 typedef struct { int done; } ConnResult;
 static ConnResult g_small_results[8];
 
+// Per-connection coroutine body: takes an already-accepted TySocket*.
+// First param is the coroutine's own real arena (co->arena) — not a
+// caller-controlled flag of any kind.
 static void small_conn_coro(void* arena, void* arg) {
-    void** a = (void**)arg;
-    TySocket* sock = (TySocket*)a[0];
-    int idx = (int)(intptr_t)a[1];
+    (void)arena;
+    ConnSpawnArgs* args = (ConnSpawnArgs*)arg;
+    int idx = args->idx;
+    TySocket* sock = args->sock;
+    free(args); // heap-owned (see ConnSpawnArgs above), not arena-owned — free once consumed
 
     TyResult_i32_i32 read_res;
     char rbuf[MSG_LEN];
@@ -103,9 +122,9 @@ static void small_accept_loop_coro(void* arena, void* arg) {
             fprintf(stderr, "small accept %d failed\n", i);
             continue;
         }
-        void** spawn_args = slab_alloc_sized(arena, sizeof(void*) * 2);
-        spawn_args[0] = accept_res.value;
-        spawn_args[1] = (void*)(intptr_t)i;
+        ConnSpawnArgs* spawn_args = (ConnSpawnArgs*)malloc(sizeof(ConnSpawnArgs));
+        spawn_args->sock = (TySocket*)accept_res.value;
+        spawn_args->idx = i;
         ty_spawn(NULL, small_conn_coro, spawn_args); // first arg ignored by ty_spawn
     }
 }
@@ -170,9 +189,11 @@ typedef struct { int done; } ScaleResult;
 static ScaleResult g_scale_results[N_CORO];
 
 static void scale_conn_coro(void* arena, void* arg) {
-    void** a = (void**)arg;
-    TySocket* sock = (TySocket*)a[0];
-    int idx = (int)(intptr_t)a[1];
+    (void)arena;
+    ConnSpawnArgs* args = (ConnSpawnArgs*)arg;
+    int idx = args->idx;
+    TySocket* sock = args->sock;
+    free(args); // heap-owned, not arena-owned — free once consumed
 
     TyResult_i32_i32 read_res;
     char rbuf[MSG_LEN];
@@ -189,9 +210,9 @@ static void scale_accept_loop_coro(void* arena, void* arg) {
         TyResult_Socket_i32 accept_res;
         __ty_rt__Listener__accept(arena, listener, &accept_res);
         if (accept_res.tag != 0) continue;
-        void** spawn_args = slab_alloc_sized(arena, sizeof(void*) * 2);
-        spawn_args[0] = accept_res.value;
-        spawn_args[1] = (void*)(intptr_t)i;
+        ConnSpawnArgs* spawn_args = (ConnSpawnArgs*)malloc(sizeof(ConnSpawnArgs));
+        spawn_args->sock = (TySocket*)accept_res.value;
+        spawn_args->idx = i;
         ty_spawn(NULL, scale_conn_coro, spawn_args); // first arg ignored by ty_spawn
     }
 }

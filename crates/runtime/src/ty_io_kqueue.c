@@ -53,7 +53,7 @@
  * (read/write/accept alike) gets a slot from this single pool
  * regardless of which worker submitted it or which worker's poll()
  * eventually drains its completion. */
-#define POOL_CAP 256
+#define POOL_CAP 1024
 
 typedef struct {
     _Atomic(int) in_use;
@@ -248,6 +248,7 @@ TyKqBackend* ty_kq_backend_new(void) {
     b->base.impl = b;
     b->base.submit = kq_submit;
     b->base.poll = kq_poll;
+    b->base.readiness_based = 1;
 
     g_backend = b;
     g_refcount = 1;

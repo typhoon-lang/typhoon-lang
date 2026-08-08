@@ -69,7 +69,17 @@ if(BUILD_TESTS)
   )
 
   foreach(test_src ${C_TEST_SOURCES})
+    # Platform-specific test guards
     if(WIN32 AND (test_src MATCHES "linux" OR test_src MATCHES "macos"))
+        continue()
+    endif()
+    if(APPLE AND test_src MATCHES "linux")
+        continue()
+    endif()
+    if(LINUX AND test_src MATCHES "macos")
+        continue()
+    endif()
+    if(NOT WIN32 AND test_src MATCHES "iocp")
         continue()
     endif()
 

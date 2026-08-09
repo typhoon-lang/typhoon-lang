@@ -93,6 +93,34 @@
 
 #define RING_ENTRIES 256
 
+/* CQ ring sizing.
+ *
+ * Without IORING_SETUP_CQSIZE the kernel defaults cq_entries to 2x
+ * sq_entries (~512 here). This backend is shared across every worker
+ * (single reactor per process) and workers only drain it opportunistically
+ * — ty_io_poll()'s try-lock means a worker skips draining entirely rather
+ * than wait if another worker already holds it. Under load with many more
+ * concurrent single-shot ops outstanding than the CQ has room for (e.g.
+ * ~1000 parked reads in test_phase4_linux_1000_coroutines vs. a ~512-slot
+ * default ring), completions that don't fit push into the kernel's
+ * overflow tracking instead of the visible ring, and only surface later,
+ * in large delayed bursts, once a worker's poll finally catches up —
+ * confirmed against test_phase4_linux_1000_coroutines' own log, where one
+ * connection's read completion didn't get drained until ~10,000 log lines
+ * after it was submitted, arriving as part of a 17-deep batch.
+ *
+ * This alone doesn't fix that — see TY_IO_MAX_OUTSTANDING in
+ * ty_io_backend.c for the actual admission-control fix that keeps
+ * concurrent outstanding ops from exceeding the ring in the first place.
+ * Sizing the ring generously here is defense in depth on top of that: even
+ * with admission control elsewhere, a ring sized only for the "should
+ * never happen" case is one bug away from silently depending on kernel
+ * overflow-list behavior again. */
+#ifndef IORING_SETUP_CQSIZE
+#define IORING_SETUP_CQSIZE (1U << 3)
+#endif
+#define RING_CQ_ENTRIES 4096
+
 /* io_uring kernel setup/enter wrappers */
 static int uring_setup(uint32_t entries, struct io_uring_params* p) {
     return (int)syscall(SYS_io_uring_setup, entries, p);
@@ -192,11 +220,40 @@ static int uring_submit_op(TyIoBackend* base, const TyIoOp* op) {
     __sync_synchronize();
 
     int enter_rc = uring_enter(b->ring_fd, 1, 0, 0);
+    int enter_errno = enter_rc < 0 ? errno : 0;
     TY_DEBUG("[uring] submit op_type=%d fd=%d opcode=%u user_data=%p enter_rc=%d errno=%d\n",
         op->type, (int)op->fd, (unsigned)sqe->opcode, (void*)(uintptr_t)op->coro,
-        enter_rc, enter_rc < 0 ? errno : 0);
+        enter_rc, enter_errno);
 
     ty_mutex_unlock(&b->submit_lock);
+
+    if (enter_rc < 0) {
+        /* Previously always `return 0` here regardless of enter_rc, so a
+         * failed uring_enter() (EBADF/ENXIO/EINVAL/...) was silently
+         * swallowed: the caller (worker_resume_coro's deferred-submit
+         * path in scheduler.c) saw rc==0 and treated the op as
+         * successfully in flight, so the parked coroutine would then
+         * wait forever for a completion that was never actually
+         * submitted to the kernel. Propagate the failure so
+         * worker_resume_coro's existing `if (rc < 0)
+         * ty_io_wake_coro(op->coro, rc)` path actually fires and the
+         * coroutine gets woken with an error instead of hanging.
+         *
+         * Note: the SQ tail was already published above, before this
+         * call — uring_enter() failing doesn't un-publish it. The
+         * kernel just never got a chance to consume that slot this
+         * call; it remains queued and will be picked up by whatever
+         * uring_enter() call eventually submits past it. Since
+         * submit_lock serializes one op per call with to_submit=1, a
+         * failure here means that accounting is now one entry off
+         * until the ring is recreated or drained — acceptable for
+         * turning a silent hang into a visible, wake-able error, but
+         * worth knowing if enter failures turn out to be frequent
+         * rather than the rare/fatal case (bad fd, torn-down ring)
+         * this is meant to catch. */
+        TY_DEBUG("[uring] submit: uring_enter failed rc=%d errno=%d\n", enter_rc, errno);
+        return -enter_errno;
+    }
     return 0;
 }
 
@@ -367,8 +424,27 @@ TyUringBackend* ty_uring_backend_new(void) {
 
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
+    params.flags |= IORING_SETUP_CQSIZE;
+    params.cq_entries = RING_CQ_ENTRIES;
 
     int rfd = uring_setup(RING_ENTRIES, &params);
+    if (rfd < 0) {
+        /* Older kernels may reject IORING_SETUP_CQSIZE (added 5.11) or a
+         * requested cq_entries value outside what they allow. Fall back
+         * to the kernel's own default (2x sq_entries) rather than fail
+         * the whole backend over a best-effort sizing hint — a smaller
+         * ring means the delayed-completion-burst symptom this is meant
+         * to prevent can still show up, but that's strictly better than
+         * refusing to start at all. Retries unconditionally on any first
+         * failure rather than trying to distinguish "failed because of
+         * CQSIZE" from other causes — params isn't guaranteed untouched
+         * on every kernel error path, so re-inspecting params.flags here
+         * to decide whether to retry isn't reliable; a second attempt
+         * with plain defaults is cheap and if that also fails, rfd < 0
+         * falls through to the real failure path below either way. */
+        memset(&params, 0, sizeof(params));
+        rfd = uring_setup(RING_ENTRIES, &params);
+    }
     if (rfd < 0) {
         free(b);
         ty_mutex_unlock(&g_create_lock);

@@ -157,7 +157,11 @@ static void* deque_pop(WSDeque* dq) {
     long bot = atomic_load_explicit(&dq->bottom, memory_order_relaxed) - 1;
     atomic_store_explicit(&dq->bottom, bot, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
-    long top = atomic_load_explicit(&dq->top, memory_order_acquire);
+    /* Use seq_cst load for top to pair with stealer's seq_cst CAS.
+     * The acquire load was insufficient — it doesn't participate in the
+     * global seq_cst order, so owner could see a stale top while stealer's
+     * seq_cst CAS succeeds, giving both the same element (use-after-free). */
+    long top = atomic_load_explicit(&dq->top, memory_order_seq_cst);
     if (top > bot) {
         atomic_store_explicit(&dq->bottom, bot + 1, memory_order_relaxed);
         ebr_exit_worker(ebr_id);
@@ -578,8 +582,23 @@ void sched_enqueue_wake(TyCoro* co) {
     if (!coro_state_cas(co, CORO_BLOCKED, CORO_RUNNABLE, "wake_enqueue"))
         return;
     atomic_fetch_add_explicit(&dbg_woken, 1, memory_order_relaxed);
-    TY_DEBUG("[sched] enqueue(wake) coro=%p onto worker 0\n", (void*)co);
-    deque_push(&workers[0].deque, co);
+
+    /* Chase-Lev deque has one producer: its owning worker. A poll worker may
+     * wake a coroutine owned by another worker, so push onto poll worker's
+     * own deque. External callers use global_queue below. */
+    Worker* w = current_worker();
+    if (w) {
+        TY_DEBUG("[sched] enqueue(wake) coro=%p onto worker %d\n", (void*)co, w->id);
+        deque_push(&w->deque, co);
+    } else {
+        TY_DEBUG("[sched] enqueue(wake/external) coro=%p onto global queue\n", (void*)co);
+        ty_mutex_lock(&global_queue.lock);
+        co->sched_next = NULL;
+        if (global_queue.tail) global_queue.tail->sched_next = co;
+        else global_queue.head = co;
+        global_queue.tail = co;
+        ty_mutex_unlock(&global_queue.lock);
+    }
 }
 
 /* We build a steal sequence that checks "nearby" workers first (adjacent IDs
@@ -738,6 +757,8 @@ static void worker_resume_coro(Worker* w, TyCoro* co) {
     if (w->pending_submit_op) {
         TyIoBackend* be = w->pending_submit_be;
         TyIoOp* op = w->pending_submit_op;
+        TY_DEBUG("[sched] deferred: submitting pending op worker=%d op=%p type=%d coro=%p\n",
+            w->id, (void*)op, op->type, (void*)op->coro);
         w->pending_submit_be = NULL;
         w->pending_submit_op = NULL;
         int rc = be->submit(be, op);
@@ -746,7 +767,14 @@ static void worker_resume_coro(Worker* w, TyCoro* co) {
              * wake this coroutine on its own. Deliver the failure
              * through the same wake+result path a real completion
              * would use, rather than leaking a coroutine parked
-             * forever with no rescuer. */
+             * forever with no rescuer. Also release this op's
+             * TY_IO_MAX_OUTSTANDING reservation (taken back in
+             * ty_io_submit()) — sched_wake() never runs for a submit
+             * that failed before ever reaching the kernel, so without
+             * this the reservation would leak and permanently shrink
+             * the effective admission-control cap by one slot. */
+             TY_DEBUG("[sched] deferred: submit failed rc=%d, waking coro=%p\n", rc, (void*)op->coro);
+             ty_io_backend_note_submit_failed();
             ty_io_wake_coro(op->coro, (int64_t)rc);
         }
     }
@@ -1220,10 +1248,18 @@ void ty_io_park_coro_deferred(SlabArena* arena, struct TyIoBackend* be, TyIoOp* 
          * Fall back to the old, narrower-window behavior rather than
          * silently dropping the op; bare-main callers aren't part of
          * the M:N work-stealing pool this race depends on anyway. */
+        TY_DEBUG("[sched] deferred: no worker, submitting directly op=%p coro=%p\n", (void*)op, (void*)op->coro);
         be->submit(be, op);
         ty_coro_block_and_yield();
         return;
     }
+    if (w->pending_submit_op) {
+        TY_DEBUG("[sched] ERROR: pending_submit overwrite worker=%d old_op=%p new_op=%p coro=%p\n",
+            w->id, (void*)w->pending_submit_op, (void*)op, (void*)op->coro);
+        assert(!"pending deferred IO submit overwrite");
+    }
+    TY_DEBUG("[sched] deferred: setting pending_submit worker=%d op=%p type=%d coro=%p\n",
+        w->id, (void*)op, op->type, (void*)op->coro);
     w->pending_submit_be = be;
     w->pending_submit_op = op;
     ty_coro_block_and_yield();
@@ -1245,7 +1281,7 @@ void ty_coro_exit(void) {
     } else if (cur != CORO_DONE) {
         coro_state_store(co, CORO_DONE, "coro_exit");
     }
-    
+
     TY_DEBUG("[sched] coro_exit coro=%p active=%d (decrements at coro_free)\n",
         (void*)co, atomic_load_explicit(&active_coros, memory_order_relaxed));
 
@@ -1614,7 +1650,16 @@ void sched_enqueue_from_external(void* co) {
      * workers[0] only if called with no current worker (e.g. a true
      * external thread, not expected once Phase 4 backends are in use). */
     Worker* w = current_worker();
-    deque_push(&(w ? w : &workers[0])->deque, coro);
+    if (w) {
+        deque_push(&w->deque, coro);
+        return;
+    }
+    ty_mutex_lock(&global_queue.lock);
+    coro->sched_next = NULL;
+    if (global_queue.tail) global_queue.tail->sched_next = coro;
+    else global_queue.head = coro;
+    global_queue.tail = coro;
+    ty_mutex_unlock(&global_queue.lock);
 }
 
 void* ty_current_coro_raw(void) {

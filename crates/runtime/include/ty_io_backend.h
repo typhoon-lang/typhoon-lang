@@ -53,6 +53,13 @@ enum {
 int ty_io_submit(const TyIoOp* op);
 int ty_io_poll(void);
 
+/* Internal: scheduler.c's worker_resume_coro() calls this when a deferred
+ * per-worker-backend submit fails (be->submit() returned <0), so the
+ * TY_IO_MAX_OUTSTANDING admission-control counter in ty_io_backend.c stays
+ * accurate even for ops that never reach sched_wake()'s normal completion
+ * path. Not part of the public dispatcher surface for other callers. */
+void ty_io_backend_note_submit_failed(void);
+
 /* Testing/mock helpers */
 void ty_io_backend_use_mock(int use);
 int ty_io_mock_count(void);

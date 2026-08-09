@@ -72,14 +72,22 @@ void ty_io_wake_coro(void* coro, int64_t result)
 {
   if (!coro)
     return;
-  TY_DEBUG("[io] wake coro=%p result=%lld\n",
-    coro, (long long)result);
+  CoroState before = atomic_load_explicit(&((TyCoro*)coro)->state, memory_order_acquire);
+  TY_DEBUG("[io] wake coro=%p result=%lld state_before=%d\n",
+    coro, (long long)result, (int)before);
+  if (before == CORO_DONE) {
+    TY_DEBUG("[io] wake drop coro=%p reason=done\n", coro);
+    return;
+  }
   ty_coro_set_io_result(coro, result);
+  TY_DEBUG("[io] wake stored result coro=%p\n", coro);
   sched_enqueue_wake(coro); /* defined in scheduler.c */
 }
 
 int64_t ty_io_take_result(void* coro)
 {
+  if (!coro) return 0;
+  TY_DEBUG("[io] take_result coro=%p\n", coro);
   return ty_coro_get_io_result(coro);
 }
 

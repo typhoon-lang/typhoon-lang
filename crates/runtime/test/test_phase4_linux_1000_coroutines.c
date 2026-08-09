@@ -108,12 +108,49 @@ static void conn_coro(void* arena, void* arg) {
     TySocket* sock = args->sock;
     free(args); // heap-owned (see ConnSpawnArgs above), not arena-owned — free once consumed
 
-    TyResult_i32_i32 read_res;
+    // Accumulate until MSG_LEN bytes are read.
+    //
+    // The original version here did a single __ty_rt__Socket__read call
+    // for exactly MSG_LEN bytes and treated anything other than
+    // read_res.value == MSG_LEN as a silent failure with no diagnostic.
+    // That's not a safe assumption for a stream socket: read()/recv()
+    // (and io_uring READV against a stream fd underneath
+    // __ty_rt__Socket__read) are allowed to return fewer bytes than
+    // requested whenever only part of the data has arrived by the time
+    // the kernel services the call — the caller is responsible for
+    // looping until it has everything it expects, not assuming one call
+    // always returns the whole message. 46/1000 connections came back
+    // short under CI load in a run against this exact scheduler/backend
+    // (see /mnt/user-data/uploads/cargo-test-ubuntu-latest.log), with no
+    // way to tell from the aggregate FAIL line alone whether that was
+    // short reads, a real error, or something else — hence the
+    // per-connection diagnostics below alongside the loop itself.
     char rbuf[MSG_LEN];
-    __ty_rt__Socket__read(arena, sock, rbuf, MSG_LEN, &read_res);
-    if (read_res.tag == TY_RESULT_OK && read_res.value == MSG_LEN &&
-        memcmp(rbuf, MSG, MSG_LEN) == 0) {
+    int total = 0;
+    while (total < MSG_LEN) {
+        TyResult_i32_i32 read_res;
+        __ty_rt__Socket__read(arena, sock, rbuf + total, MSG_LEN - total, &read_res);
+        if (read_res.tag != TY_RESULT_OK) {
+            fprintf(stderr, "conn %d: read error, tag=%d value=%d after %d/%d bytes\n",
+                    idx, read_res.tag, read_res.value, total, MSG_LEN);
+            return;
+        }
+        if (read_res.value <= 0) {
+            /* 0 = EOF (peer closed before sending the rest); negative
+             * shouldn't happen when tag == TY_RESULT_OK, but guard it
+             * rather than loop forever or read out of bounds if it does. */
+            fprintf(stderr, "conn %d: %s after %d/%d bytes\n", idx,
+                    read_res.value == 0 ? "EOF" : "unexpected negative read result",
+                    total, MSG_LEN);
+            return;
+        }
+        total += read_res.value;
+    }
+
+    if (memcmp(rbuf, MSG, MSG_LEN) == 0) {
         g_pairs[idx].done = 1;
+    } else {
+        fprintf(stderr, "conn %d: content mismatch after reading full %d bytes\n", idx, total);
     }
 }
 

@@ -204,6 +204,13 @@ static void order_client_coro(void* task, void* arg) {
 #if defined(_WIN32)
   shutdown(c, SD_SEND);
   Sleep(50);
+#else
+  /* Linux/macOS: shutdown(SHUT_WR) ensures all buffered data is sent
+   * and the FIN is transmitted before close(). Without this, close()
+   * may race with kernel TCP send buffers, truncating the stream
+   * before the server's read side sees all data. */
+  shutdown(c, SHUT_WR);
+  usleep(50000);
 #endif
   fprintf(stderr, "[phase2] client: close\n");
   close_test_sock(c); /* triggers EOF on the server's read side */
@@ -322,6 +329,13 @@ static void bp_client_coro(void* task, void* arg) {
     sent += (size_t)n;
   }
 
+#if defined(_WIN32)
+  shutdown(c, SD_SEND);
+  Sleep(50);
+#else
+  shutdown(c, SHUT_WR);
+  usleep(50000);
+#endif
   close_test_sock(c);
 }
 
